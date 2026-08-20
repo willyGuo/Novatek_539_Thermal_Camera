@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #if defined(__LINUX)
 #include <fcntl.h>
 #endif
@@ -316,12 +318,41 @@ unsigned int bpr_get_runtime_threshold(void)
 	return g_runtime_bpr_threshold;
 }
 
+static int dpc_make_output_dir(void)
+{
+	struct stat dir_stat;
+
+	if (mkdir(VENDOR_DPC_DIR, 0755) == 0) {
+		printf("create DPC table directory: %s\r\n", VENDOR_DPC_DIR);
+		return 0;
+	}
+
+	if (errno != EEXIST) {
+		printf("create DPC table directory (%s) fail: %s\r\n",
+		       VENDOR_DPC_DIR, strerror(errno));
+		return -1;
+	}
+
+	if (stat(VENDOR_DPC_DIR, &dir_stat) != 0 ||
+	    !S_ISDIR(dir_stat.st_mode)) {
+		printf("DPC table path is not a directory: %s\r\n",
+		       VENDOR_DPC_DIR);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int dpc_save_bin(UINT32 *dp_buf)
 {
 	FILE *fp = NULL;
 	size_t write_size;
 	const size_t expected_size = 4096U * sizeof(UINT32);
 	int saved_errno;
+
+	if (dpc_make_output_dir() != 0) {
+		return -1;
+	}
 
 	fp = fopen(VENDOR_DPC_BIN_TEMP_PATH, "wb");
 	if (fp == NULL) {
