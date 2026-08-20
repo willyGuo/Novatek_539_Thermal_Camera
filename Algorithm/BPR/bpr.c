@@ -3,6 +3,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#if defined(__LINUX)
+#include <fcntl.h>
+#endif
 
 #include "dpc_lib.h"
 #include "vendor_isp.h"
@@ -14,8 +18,9 @@
 #include "bpr.h"
 #include "../../Config/hardware_config.h"
 
-#define VENDOR_DPC_ISP_CFG_PATH "/mnt/app/isp/isp_rtd6122c_0.cfg"
-#define VENDOR_DPC_BIN_PATH "/mnt/app/isp/dpc_table.bin"
+#define VENDOR_DPC_DIR "/mnt/sd/thermal_op"
+#define VENDOR_DPC_BIN_PATH VENDOR_DPC_DIR "/dpc_table.bin"
+#define VENDOR_DPC_BIN_TEMP_PATH VENDOR_DPC_BIN_PATH ".new"
 #define BPR_MAX_DP_COUNT 4095U
 
 unsigned int dpc_get_sensor_info(int sensor_id, ISPT_SENSOR_MODE_INFO *p_sensor_mode_info);
@@ -24,7 +29,7 @@ unsigned int dpc_get_raw(int sensor_id, ISPT_RAW_INFO *final_raw_info, UINT32 *r
 
 // DPC 壞點校正範例：
 // 從 ISP 抓 RAW，呼叫 vendor 壞點演算法產生 DPC table，
-// 再透過重新載入 ISP cfg 或開關 DPC 來套用補償。
+// 再透過直接載入 DPC table 或開關 DPC 來套用補償。
 
 /*
  * 從終端機讀取一個 unsigned int。
@@ -62,14 +67,20 @@ static int wait_enter_before_raw(const char *stage_name)
 		key = getchar();
 	} while (key != '\n' && key != '\r' && key != EOF);
 
-	printf("%s: Press Enter key after exposure is stable...\n", stage_name);
+	printf("\r\n");
+	printf("============================================================\r\n");
+	printf("[USER ACTION REQUIRED] %s calibration\r\n", stage_name);
+	printf("Wait until the blackbody exposure is stable.\r\n");
+	printf("Press ENTER to capture the %s RAW frame...\r\n", stage_name);
+	printf("============================================================\r\n");
+	fflush(stdout);
 	key = getchar();
 	if (key == '\n' || key == '\r') {
-		printf("Enter key pressed, continue...\n");
+		printf("%s: ENTER received. Capturing RAW now...\r\n", stage_name);
 		return 0;
 	}
 
-	printf("Invalid key pressed, break...\n");
+	printf("%s: Invalid key received. Calibration aborted.\r\n", stage_name);
 	return -1;
 }
 
@@ -110,7 +121,7 @@ void bpr_bind_calibration_state_callback(
 void bpr_set_threshold(unsigned int threshold)
 {
 	g_bpr_threshold = threshold;
-	printf("BPR threshold=%u%%\n", g_bpr_threshold);
+	printf("BPR threshold=%u RAW8 DN\n", g_bpr_threshold);
 }
 
 unsigned int bpr_get_threshold(void)
@@ -147,6 +158,140 @@ int bpr_is_enabled(void)
 	return g_bpr_enabled;
 }
 
+int bpr_load_table(void)
+{
+	FILE *fp = NULL;
+	UINT32 *table_buf = NULL;
+	IQT_DPC_PARAM *verify_param = NULL;
+	size_t read_size;
+	const size_t table_size = sizeof(dpc_param.dpc.table);
+	size_t mismatch_word;
+	int original_enable = 0;
+	int enable_state_valid = 0;
+	int restore_ret;
+	int ret = -1;
+
+	table_buf = (UINT32 *)malloc(table_size);
+	verify_param = (IQT_DPC_PARAM *)calloc(1, sizeof(*verify_param));
+	if (table_buf == NULL || verify_param == NULL) {
+		printf("allocate DPC table verification buffer fail!\r\n");
+		goto exit;
+	}
+
+	fp = fopen(VENDOR_DPC_BIN_PATH, "rb");
+	if (fp == NULL) {
+		printf("open DPC table fail: %s\r\n", VENDOR_DPC_BIN_PATH);
+		goto exit;
+	}
+
+	read_size = fread(table_buf, 1, table_size, fp);
+	if (fclose(fp) != 0) {
+		printf("close DPC table fail: %s\r\n", VENDOR_DPC_BIN_PATH);
+		fp = NULL;
+		goto exit;
+	}
+	fp = NULL;
+	if (read_size != table_size) {
+		printf("invalid DPC table size=%u, expected=%u\r\n",
+		       (unsigned int)read_size, (unsigned int)table_size);
+		goto exit;
+	}
+
+	dpc_param.id = g_thermal_pipeline_id;
+	ret = vendor_isp_get_iq(IQT_ITEM_DPC_PARAM, &dpc_param);
+	if (ret < 0) {
+		printf("GET IQT_ITEM_DPC_PARAM fail!\n");
+		goto exit;
+	}
+	original_enable = dpc_param.dpc.enable ? 1 : 0;
+	enable_state_valid = 1;
+
+	if (original_enable) {
+		dpc_param.dpc.enable = 0;
+		ret = vendor_isp_set_iq(IQT_ITEM_DPC_PARAM, &dpc_param);
+		if (ret < 0) {
+			printf("temporarily disable BPR before DPC reload fail!\r\n");
+			goto restore_enable;
+		}
+		printf("DPC reload: BPR temporarily off\r\n");
+		usleep(100000);
+	}
+
+	memcpy(dpc_param.dpc.table, table_buf, table_size);
+	dpc_param.dpc.enable = 0;
+	ret = vendor_isp_set_iq(IQT_ITEM_DPC_PARAM, &dpc_param);
+	if (ret < 0) {
+		printf("SET IQT_ITEM_DPC_PARAM fail!\n");
+		goto restore_enable;
+	}
+	usleep(100000);
+
+	verify_param->id = g_thermal_pipeline_id;
+	ret = vendor_isp_get_iq(IQT_ITEM_DPC_PARAM, verify_param);
+	if (ret < 0) {
+		printf("GET IQT_ITEM_DPC_PARAM read-back fail!\r\n");
+		goto restore_enable;
+	}
+	if (memcmp(table_buf, verify_param->dpc.table, table_size) != 0) {
+		for (mismatch_word = 0;
+		     mismatch_word < table_size / sizeof(UINT32);
+		     mismatch_word++) {
+			if (table_buf[mismatch_word] !=
+			    verify_param->dpc.table[mismatch_word]) {
+				break;
+			}
+		}
+		printf("DPC table read-back mismatch at word %u: file=0x%08x, ISP=0x%08x\r\n",
+		       (unsigned int)mismatch_word,
+		       table_buf[mismatch_word],
+		       verify_param->dpc.table[mismatch_word]);
+		ret = -1;
+		goto restore_enable;
+	}
+	printf("DPC table read-back verified: %u bytes\r\n",
+	       (unsigned int)table_size);
+	ret = 0;
+
+restore_enable:
+	if (enable_state_valid) {
+		dpc_param.id = g_thermal_pipeline_id;
+		memcpy(dpc_param.dpc.table, table_buf, table_size);
+		dpc_param.dpc.enable = original_enable;
+		restore_ret = vendor_isp_set_iq(IQT_ITEM_DPC_PARAM, &dpc_param);
+		if (restore_ret < 0) {
+			printf("restore BPR state after DPC reload fail!\r\n");
+			ret = restore_ret;
+		} else {
+			usleep(100000);
+			memset(verify_param, 0, sizeof(*verify_param));
+			verify_param->id = g_thermal_pipeline_id;
+			restore_ret = vendor_isp_get_iq(
+				IQT_ITEM_DPC_PARAM, verify_param);
+			if (restore_ret < 0 ||
+			    memcmp(table_buf, verify_param->dpc.table,
+			           table_size) != 0 ||
+			    (verify_param->dpc.enable ? 1 : 0) != original_enable) {
+				printf("final DPC table/state verification fail!\r\n");
+				ret = (restore_ret < 0) ? restore_ret : -1;
+			}
+		}
+	}
+
+	if (ret == 0) {
+		printf("DPC table loaded: %s, size=%u, BPR=%s\r\n",
+		       VENDOR_DPC_BIN_PATH, (unsigned int)table_size,
+		       original_enable ? "on" : "off");
+	}
+
+exit:
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	free(verify_param);
+	free(table_buf);
+	return ret;
+}
+
 void bpr_set_runtime_enabled(int enable)
 {
 	g_runtime_bpr_enabled = enable ? 1 : 0;
@@ -162,7 +307,7 @@ int bpr_is_runtime_enabled(void)
 void bpr_set_runtime_threshold(unsigned int threshold)
 {
 	g_runtime_bpr_threshold = threshold;
-	printf("Runtime BPR threshold=%u%%\n",
+	printf("Runtime BPR threshold=%u RAW8 DN\n",
 	       g_runtime_bpr_threshold);
 }
 
@@ -171,73 +316,84 @@ unsigned int bpr_get_runtime_threshold(void)
 	return g_runtime_bpr_threshold;
 }
 
-static int dpc_load_cfg(IQT_CFG_INFO *cfg_info)
-{
-	int ret;
-	int dpc_restore_ret;
-	int gamma_restore_ret;
-	int enabled = g_bpr_enabled;
-	IQT_GAMMA_PARAM saved_gamma = {0};
-
-	saved_gamma.id = cfg_info->id;
-	ret = vendor_isp_get_iq(IQT_ITEM_GAMMA_PARAM, &saved_gamma);
-	if (ret < 0) {
-		printf("get Gamma before DPC cfg reload fail!\n");
-		return ret;
-	}
-
-	strncpy(cfg_info->path, VENDOR_DPC_ISP_CFG_PATH, CFG_NAME_LENGTH);
-	cfg_info->path[CFG_NAME_LENGTH - 1] = '\0';
-
-	ret = vendor_isp_set_iq(IQT_ITEM_RLD_CONFIG, cfg_info);
-	if (ret < 0) {
-		printf("SET IQT_ITEM_RLD_CONFIG fail!\n");
-		return ret;
-	}
-
-	dpc_restore_ret = bpr_set_enabled(enabled);
-	if (dpc_restore_ret < 0) {
-		printf("restore DPC enable fail!\n");
-	}
-
-	gamma_restore_ret = vendor_isp_set_iq(
-		IQT_ITEM_GAMMA_PARAM, &saved_gamma);
-	if (gamma_restore_ret < 0) {
-		printf("restore Gamma after DPC cfg reload fail!\n");
-	}
-
-	if (dpc_restore_ret < 0) {
-		return dpc_restore_ret;
-	}
-	if (gamma_restore_ret < 0) {
-		return gamma_restore_ret;
-	}
-
-	printf("DPC cfg reload done: %s\r\n", VENDOR_DPC_ISP_CFG_PATH);
-	return 0;
-}
-
 static int dpc_save_bin(UINT32 *dp_buf)
 {
-	FILE *fp;
+	FILE *fp = NULL;
 	size_t write_size;
+	const size_t expected_size = 4096U * sizeof(UINT32);
+	int saved_errno;
 
-	fp = fopen(VENDOR_DPC_BIN_PATH, "wb");
+	fp = fopen(VENDOR_DPC_BIN_TEMP_PATH, "wb");
 	if (fp == NULL) {
-		printf("open %s fail\r\n", VENDOR_DPC_BIN_PATH);
+		printf("open %s fail: %s\r\n",
+		       VENDOR_DPC_BIN_TEMP_PATH, strerror(errno));
 		return -1;
 	}
 
-	write_size = fwrite(dp_buf, 1, 4096 * sizeof(UINT32), fp);
-	fflush(fp);
-	fclose(fp);
-	if (write_size != 4096 * sizeof(UINT32)) {
-		printf("write %s fail, size=%u\r\n", VENDOR_DPC_BIN_PATH, (unsigned int)write_size);
-		return -1;
+	write_size = fwrite(dp_buf, 1, expected_size, fp);
+	if (write_size != expected_size || ferror(fp)) {
+		printf("write %s fail, size=%u expect=%u\r\n",
+		       VENDOR_DPC_BIN_TEMP_PATH,
+		       (unsigned int)write_size, (unsigned int)expected_size);
+		goto fail;
 	}
+	if (fflush(fp) != 0) {
+		printf("flush %s fail: %s\r\n",
+		       VENDOR_DPC_BIN_TEMP_PATH, strerror(errno));
+		goto fail;
+	}
+#if defined(__LINUX)
+	if (fsync(fileno(fp)) != 0) {
+		printf("sync %s fail: %s\r\n",
+		       VENDOR_DPC_BIN_TEMP_PATH, strerror(errno));
+		goto fail;
+	}
+#endif
+	if (fclose(fp) != 0) {
+		fp = NULL;
+		printf("close %s fail: %s\r\n",
+		       VENDOR_DPC_BIN_TEMP_PATH, strerror(errno));
+		goto fail;
+	}
+	fp = NULL;
+
+	if (rename(VENDOR_DPC_BIN_TEMP_PATH, VENDOR_DPC_BIN_PATH) != 0) {
+		printf("replace %s fail: %s\r\n",
+		       VENDOR_DPC_BIN_PATH, strerror(errno));
+		goto fail;
+	}
+
+#if defined(__LINUX)
+	{
+		int dir_fd = open(VENDOR_DPC_DIR, O_RDONLY);
+
+		if (dir_fd < 0) {
+			printf("warning: open DPC table directory fail: %s\r\n",
+			       strerror(errno));
+		} else {
+			if (fsync(dir_fd) != 0) {
+				printf("warning: sync DPC table directory fail: %s\r\n",
+				       strerror(errno));
+			}
+			close(dir_fd);
+		}
+	}
+#endif
 
 	printf("save DPC table: %s, dp_buf:%lx\r\n", VENDOR_DPC_BIN_PATH, (ULONG)dp_buf);
 	return 0;
+
+fail:
+	saved_errno = errno;
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	if (remove(VENDOR_DPC_BIN_TEMP_PATH) != 0 && errno != ENOENT) {
+		printf("remove incomplete %s fail: %s\r\n",
+		       VENDOR_DPC_BIN_TEMP_PATH, strerror(errno));
+	}
+	errno = saved_errno;
+	return -1;
 }
 
 static int dpc_alloc_buf(unsigned int raw_size, UINT32 max_cnt,
@@ -284,6 +440,113 @@ static void dpc_free_buf(char **raw_buf, char **tmp_buf, UINT32 **dp_buf)
 		free(*dp_buf);
 		*dp_buf = NULL;
 	}
+}
+
+/*
+ * DP_PARAM_CHGFMT_AUTO sorts the detected coordinates and converts them to
+ * the SIE table format:
+ *
+ *   0x8000 | y, x0, x1, ..., 0x8000 | next_y, ..., 0xFFFF, 0x0000
+ *
+ * Bright and Dark calibration can detect the same physical pixel.  The
+ * vendor conversion keeps both X entries, but SIE stops applying later rows
+ * after it encounters the duplicated coordinate.  Remove adjacent duplicate
+ * X values after the vendor sort/format conversion and before saving.
+ */
+static int dpc_deduplicate_sie_table(UINT32 *dp_buf, UINT32 max_cnt,
+	CAL_ALG_DP_RST *dp_rst)
+{
+	UINT16 *table = (UINT16 *)dp_buf;
+	UINT32 buffer_bytes = (max_cnt + 1U) * sizeof(UINT32);
+	UINT32 buffer_words = buffer_bytes / sizeof(UINT16);
+	UINT32 input_words;
+	UINT32 read_word;
+	UINT32 write_word = 0;
+	UINT32 original_pixel_cnt;
+	UINT32 unique_pixel_cnt = 0;
+	UINT16 last_x = 0;
+	int have_row = 0;
+	int have_x = 0;
+	int found_terminator = 0;
+
+	if (dp_buf == NULL || dp_rst == NULL ||
+	    dp_rst->data_length < 2U * sizeof(UINT16) ||
+	    dp_rst->data_length > buffer_bytes ||
+	    (dp_rst->data_length % sizeof(UINT16)) != 0) {
+		printf("invalid DPC SIE table length=%u, buffer=%u\r\n",
+		       dp_rst != NULL ? dp_rst->data_length : 0,
+		       buffer_bytes);
+		return -1;
+	}
+
+	original_pixel_cnt = dp_rst->pixel_cnt;
+	input_words = dp_rst->data_length / sizeof(UINT16);
+	for (read_word = 0; read_word < input_words; read_word++) {
+		UINT16 value = table[read_word];
+
+		if (value == 0xFFFFU) {
+			if (write_word + 2U > buffer_words) {
+				printf("DPC SIE table terminator overflow\r\n");
+				return -1;
+			}
+			table[write_word++] = 0xFFFFU;
+			table[write_word++] = 0x0000U;
+			found_terminator = 1;
+			break;
+		}
+
+		if ((value & 0x8000U) != 0) {
+			table[write_word++] = value;
+			have_row = 1;
+			have_x = 0;
+			continue;
+		}
+
+		if (!have_row) {
+			printf("invalid DPC SIE table: X before Y at word %u\r\n",
+			       read_word);
+			return -1;
+		}
+		if (have_x && value < last_x) {
+			printf("invalid DPC SIE table: unsorted X at word %u\r\n",
+			       read_word);
+			return -1;
+		}
+		if (have_x && value == last_x) {
+			continue;
+		}
+
+		table[write_word++] = value;
+		last_x = value;
+		have_x = 1;
+		unique_pixel_cnt++;
+	}
+
+	if (!found_terminator) {
+		printf("invalid DPC SIE table: terminator not found\r\n");
+		return -1;
+	}
+	if (unique_pixel_cnt > max_cnt) {
+		printf("deduplicated DPC count overflow: count=%u, max=%u\r\n",
+		       unique_pixel_cnt, max_cnt);
+		return -1;
+	}
+	if (unique_pixel_cnt > original_pixel_cnt) {
+		printf("invalid DPC SIE table: unique count=%u exceeds result count=%u\r\n",
+		       unique_pixel_cnt, original_pixel_cnt);
+		return -1;
+	}
+
+	dp_rst->pixel_cnt = unique_pixel_cnt;
+	dp_rst->data_length = write_word * sizeof(UINT16);
+	memset((char *)dp_buf + dp_rst->data_length, 0,
+	       buffer_bytes - dp_rst->data_length);
+
+	printf("DPC table dedup: before=%u, after=%u, removed=%u, data_length=%u\r\n",
+	       original_pixel_cnt, unique_pixel_cnt,
+	       original_pixel_cnt - unique_pixel_cnt,
+	       dp_rst->data_length);
+	return 0;
 }
 
 static int dpc_run_raw(const char *step_name, unsigned int sensor_id,
@@ -350,6 +613,11 @@ static int dpc_run_raw(const char *step_name, unsigned int sensor_id,
 		       step_name, dp_rst->pixel_cnt, max_cnt);
 		return -1;
 	}
+	if (chg_fmt != DP_PARAM_CHGFMT_SKIP &&
+	    dpc_deduplicate_sie_table(dp_buf, max_cnt, dp_rst) != 0) {
+		printf("%s DPC table dedup fail\r\n", step_name);
+		return -1;
+	}
 
 	return 0;
 }
@@ -358,7 +626,6 @@ int bpr_run_runtime_calibration(void)
 {
 	ISPT_RAW_INFO raw_info = {0};
 	ISPT_SENSOR_MODE_INFO sensor_mode_info;
-	IQT_CFG_INFO cfg_info = {0};
 	CAL_ALG_DP_RST dp_rst;
 	char *raw_buf = NULL;
 	char *tmp_buf = NULL;
@@ -378,7 +645,7 @@ int bpr_run_runtime_calibration(void)
 	raw_size = sensor_mode_info.info.crp_size.w *
 		sensor_mode_info.info.crp_size.h;
 	print_sensor_crop_setting(&sensor_mode_info);
-	printf("Runtime BPR start: threshold=%u%%, raw_size=%u\r\n",
+	printf("Runtime BPR start: threshold=%u RAW8 DN, raw_size=%u\r\n",
 	       g_runtime_bpr_threshold, raw_size);
 
 	if (dpc_alloc_buf(raw_size, BPR_MAX_DP_COUNT,
@@ -399,8 +666,7 @@ int bpr_run_runtime_calibration(void)
 		goto exit;
 	}
 
-	cfg_info.id = g_thermal_pipeline_id;
-	if (dpc_load_cfg(&cfg_info) != 0) {
+	if (bpr_load_table() != 0) {
 		goto exit;
 	}
 
@@ -440,7 +706,7 @@ static int dpc_run_bright_dark(unsigned int sensor_id, unsigned int dpc_th, UINT
 		calibration_state("BPR", 1);
 	}
 
-	printf("BPR cfg threshold = %u%%\r\n\r\n", dpc_th);
+	printf("BPR cfg threshold = %u RAW8 DN\r\n\r\n", dpc_th);
 
 	printf("\n Bright Pixel: blackbody calibration.\r\n\n");
 	if (wait_enter_before_raw("Bright Pixel") != 0) {
@@ -455,7 +721,7 @@ static int dpc_run_bright_dark(unsigned int sensor_id, unsigned int dpc_th, UINT
 	}
 
 	printf("\n Dark Pixel: blackbody calibration.\r\n");
-	printf("Dark Pixel: reuse dpc threshold = %u%%\r\n", dpc_th);
+	printf("Dark Pixel: reuse dpc threshold = %u RAW8 DN\r\n", dpc_th);
 	if (wait_enter_before_raw("Dark Pixel") != 0) {
 		goto exit;
 	}
@@ -589,8 +855,8 @@ static char* dbg_file_path = NULL;
  *   如果 ISP 抓出來是 RAW16，就先轉成 8-bit 再丟給 cal_dp_process()。
  *
  * 格式：
- *   每個 RAW16 pixel 佔 2 bytes，取出高 8 bits（bit 15..8）作為
- *   DPC calibration 使用的 RAW8。
+ *   TY640 RAW14 以 LSB 對齊方式存放在 RAW16 container 的 bit 13..0。
+ *   保留 bit 13..6，轉成 DPC calibration 使用的 RAW8。
  */
 void convert_16bit_to_8bit(const UINT16 *src_addr, UINT8 *dest_addr,
 	unsigned int width, unsigned int height)
@@ -600,7 +866,7 @@ void convert_16bit_to_8bit(const UINT16 *src_addr, UINT8 *dest_addr,
 	static UINT32 cnt = 0;
 
 	for (i = 0; i < pixel_count; i++) {
-		dest_addr[i] = (UINT8)(src_addr[i] >> 8);
+		dest_addr[i] = (UINT8)((src_addr[i] & 0x3FFFU) >> 6);
 	}
 
 	if (g_dbg_print && dbg_file_path != NULL) {
@@ -814,7 +1080,7 @@ cleanup:
  *      最後把兩種壞點合併到同一份 DPC table。
  *
  *   2. load DPC table
- *      重新載入 ISP cfg，讓 cfg 中設定的 DPC table 有機會被 ISP 載入。
+ *      從 SD 卡讀取 DPC table，直接套用到 ISP。
  *
  *   3. Dbg mode on/off
  *      開關 DPC library debug log，並可把 RAW dump 到 /mnt/sd/。
@@ -825,8 +1091,6 @@ int bpr_menu_run(void)
 
 	unsigned int dpc_th = g_bpr_threshold;
 	unsigned int dbg_en = 0;
-	IQT_CFG_INFO cfg_info = {0};
-
 	int ret = 0;
 	static char dbg_raw_file_path[64] = "/mnt/sd/";
 
@@ -835,7 +1099,6 @@ int bpr_menu_run(void)
 	printf("----------------------------------------\n");
 	printf("sample 2.10, lib: %x\r\n",get_dpc_lib_version());
 	printf("thermal_pipeline_id=%u\r\n", g_thermal_pipeline_id);
-	cfg_info.id = g_thermal_pipeline_id;
 	dpc_param.id = g_thermal_pipeline_id;
 
 
@@ -848,7 +1111,8 @@ int bpr_menu_run(void)
 		printf(" 3. BPR debug on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: BPR=%s, threshold=%u%%, Runtime BPR=%s, threshold=%u%%\r\n",
+		printf("runtime: BPR=%s, threshold=%u RAW8 DN, "
+		       "Runtime BPR=%s, threshold=%u RAW8 DN\r\n",
 		       bpr_is_enabled() ? "on" : "off",
 		       bpr_get_threshold(),
 		       bpr_is_runtime_enabled() ? "on" : "off",
@@ -876,8 +1140,8 @@ int bpr_menu_run(void)
 
 
 		case 2:
-			// 重新載入 ISP cfg，讓 cfg 裡設定的 DPC table 路徑可以生效。
-			ret = dpc_load_cfg(&cfg_info);
+			// 從 SD 卡重新讀取 DPC table，直接套用到 ISP。
+			ret = bpr_load_table();
 			//printf("dpc_param 0x%x 0x%x\e\n",dpc_param.dpc.table[0],dpc_param.dpc.table[1]);
 			break;
 

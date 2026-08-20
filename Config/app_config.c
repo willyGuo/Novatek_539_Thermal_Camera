@@ -9,6 +9,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#if defined(__LINUX)
+#include <fcntl.h>
+#endif
+
 #include "../Algorithm/BPR/bpr.h"
 #include "../Algorithm/FFC/ffc.h"
 #include "../Algorithm/NUC/nuc.h"
@@ -18,6 +22,7 @@
 
 #define APP_CONFIG_DIR "/mnt/sd"
 #define APP_CONFIG_PATH "/mnt/sd/tiffany_thermal.cfg"
+#define APP_CONFIG_TEMP_PATH APP_CONFIG_PATH ".new"
 #define APP_CONFIG_SENSOR_TEMP_POINT_COUNT 5U
 #define MENU_OPTION_REFRESH (-2)
 
@@ -510,41 +515,85 @@ int app_config_get_boot_load(void)
 
 static int app_config_show_file(void)
 {
-	FILE *fp;
-	char line[256];
-	int has_content = 0;
-	int last_char = '\n';
+	char key[32];
+	unsigned int point;
 
-	fp = fopen(APP_CONFIG_PATH, "r");
-	if (fp == 0) {
-		printf("open config (%s) fail\n", APP_CONFIG_PATH);
-		return -1;
+	cfg_initialize_from_runtime();
+
+	printf("============================================================\n");
+	printf("Current CFG\n");
+	printf("Path : %s\n", APP_CONFIG_PATH);
+	printf("============================================================\n");
+
+	printf("\n[General]\n");
+	printf("  1. %-31s = %d (%s)\n", "cfg_boot_load",
+	       g_app_config.boot_load,
+	       g_app_config.boot_load ? "on" : "off");
+
+	printf("\n[Liveview]\n");
+	printf("  1. %-31s = %u (%s)\n", "output_mode",
+	       g_app_config.output_mode,
+	       g_app_config.output_mode == 1U ? "RTSP" : "UVC");
+	printf("  2. %-31s = %u fps\n", "fps", g_app_config.fps);
+	printf("  3. %-31s = %u frames\n", "startup_skip_frames",
+	       g_app_config.startup_skip_frames);
+	printf("  4. %-31s = %u frames\n", "runtime_skip_frames",
+	       g_app_config.runtime_skip_frames);
+
+	printf("\n[BPR]\n");
+	printf("  1. %-31s = %d (%s)\n", "bpr_correction",
+	       g_app_config.bpr_correction,
+	       g_app_config.bpr_correction ? "on" : "off");
+	printf("  2. %-31s = %u RAW8 DN\n", "bpr_threshold",
+	       g_app_config.bpr_threshold);
+	printf("  3. %-31s = %d (%s)\n", "runtime_bpr_enable",
+	       g_app_config.runtime_bpr_enable,
+	       g_app_config.runtime_bpr_enable ? "on" : "off");
+	printf("  4. %-31s = %u RAW8 DN\n", "runtime_bpr_threshold",
+	       g_app_config.runtime_bpr_threshold);
+
+	printf("\n[Shutter / FFC]\n");
+	printf("  1. %-31s = %d (%s)\n", "ffc_correction",
+	       g_app_config.ffc_correction,
+	       g_app_config.ffc_correction ? "on" : "off");
+	printf("  2. %-31s = %u sec\n", "shutter_interval_sec",
+	       g_app_config.shutter_interval_sec);
+	printf("  3. %-31s = %u ms\n", "shutter_close_wait_ms",
+	       g_app_config.shutter_close_wait_ms);
+
+	printf("\n[NUC]\n");
+	printf("  1. %-31s = %d (%s)\n", "nuc_correction",
+	       g_app_config.nuc_correction,
+	       g_app_config.nuc_correction ? "on" : "off");
+	printf("  2. %-31s = %u sec\n", "nuc_sensor_temp_interval_sec",
+	       g_app_config.nuc_sensor_temp_interval_sec);
+	for (point = 0; point < APP_CONFIG_SENSOR_TEMP_POINT_COUNT; point++) {
+		snprintf(key, sizeof(key), "nuc_sensor_temp_point%u",
+			 point + 1U);
+		printf("  %u. %-31s = %.4f C\n", point + 3U, key,
+		       g_app_config.nuc_sensor_temp_points[point]);
 	}
 
-	printf("----------------------------------------\n");
-	printf("Current CFG: %s\n", APP_CONFIG_PATH);
-	while (fgets(line, sizeof(line), fp) != 0) {
-		size_t length = strlen(line);
+	printf("\n[TDC]\n");
+	printf("  1. %-31s = %d (%s)\n", "tdc_correction",
+	       g_app_config.tdc_correction,
+	       g_app_config.tdc_correction ? "on" : "off");
+	printf("  2. %-31s = %u sec\n", "tdc_interval_sec",
+	       g_app_config.tdc_interval_sec);
 
-		fputs(line, stdout);
-		has_content = 1;
-		if (length > 0) {
-			last_char = (unsigned char)line[length - 1];
-		}
-	}
-	if (ferror(fp)) {
-		printf("read config (%s) fail\n", APP_CONFIG_PATH);
-		fclose(fp);
-		return -1;
-	}
-	fclose(fp);
+	printf("\n[Gamma]\n");
+	printf("  1. %-31s = %d (%s)\n", "gamma_correction",
+	       g_app_config.gamma_correction,
+	       g_app_config.gamma_correction ? "on" : "off");
+	printf("  2. %-31s = %d (%s)\n", "gamma_load_bin",
+	       g_app_config.gamma_load_bin,
+	       g_app_config.gamma_load_bin ? "on" : "off");
+	printf("  3. %-31s = %u\n", "gamma_mode",
+	       g_app_config.gamma_mode);
+	printf("  4. %-31s = %u\n", "gamma_auto_sel",
+	       g_app_config.gamma_auto_sel);
 
-	if (!has_content) {
-		printf("(empty)\n");
-	} else if (last_char != '\n') {
-		printf("\n");
-	}
-	printf("----------------------------------------\n");
+	printf("\n");
 	return 0;
 }
 
@@ -689,16 +738,18 @@ static int app_config_bpr_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("BPR setting\n");
 		printf(" 1. BPR on/off\n");
-		printf(" 2. Bright/Dark BPR threshold\n");
+		printf(" 2. Bright/Dark BPR threshold (RAW8 DN)\n");
 		printf(" 3. Runtime BPR on/off\n");
-		printf(" 4. Runtime BPR threshold\n");
+		printf(" 4. Runtime BPR threshold (RAW8 DN)\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: BPR=%s, threshold=%u%%, Runtime BPR=%s, threshold=%u%%\n",
+		printf("runtime: BPR=%s, threshold=%u RAW8 DN, "
+		       "Runtime BPR=%s, threshold=%u RAW8 DN\n",
 		       bpr_is_enabled() ? "on" : "off", bpr_get_threshold(),
 		       bpr_is_runtime_enabled() ? "on" : "off",
 		       bpr_get_runtime_threshold());
-		printf("pending CFG: BPR=%s, threshold=%u%%, Runtime BPR=%s, threshold=%u%%\n",
+		printf("pending CFG: BPR=%s, threshold=%u RAW8 DN, "
+		       "Runtime BPR=%s, threshold=%u RAW8 DN\n",
 		       g_app_config.bpr_correction ? "on" : "off",
 		       g_app_config.bpr_threshold,
 		       g_app_config.runtime_bpr_enable ? "on" : "off",
@@ -714,7 +765,7 @@ static int app_config_bpr_menu_run(void)
 			ret = app_config_prompt_int("Bright/Dark BPR threshold",
 				"bpr_threshold",
 				(int)g_app_config.bpr_threshold,
-				0, 100, "%");
+				0, 100, " RAW8 DN");
 			break;
 		case 3:
 			ret = app_config_prompt_bool("Runtime BPR",
@@ -725,7 +776,7 @@ static int app_config_bpr_menu_run(void)
 			ret = app_config_prompt_int("Runtime BPR threshold",
 				"runtime_bpr_threshold",
 				(int)g_app_config.runtime_bpr_threshold,
-				0, 100, "%");
+				0, 100, " RAW8 DN");
 			break;
 		case 0:
 		case -1:
@@ -967,7 +1018,7 @@ int app_config_menu_run(void)
 		printf("CFG Setting\n");
 		printf(" 1. Liveview setting\n");
 		printf(" 2. BPR setting\n");
-		printf(" 3. Shutter / FFC setting\n");
+		printf(" 3. FFC setting / Shutter\n");
 		printf(" 4. NUC setting\n");
 		printf(" 5. TDC setting\n");
 		printf(" 6. Gamma setting\n");
@@ -1031,17 +1082,25 @@ int app_config_menu_run(void)
 
 int app_config_save(void)
 {
-	FILE *fp;
+	FILE *fp = NULL;
 	unsigned int point;
+#if defined(__LINUX)
+	int dir_fd;
+#endif
 
 	cfg_initialize_from_runtime();
 	if (cfg_make_dir() != 0) {
 		return -1;
 	}
 
-	fp = fopen(APP_CONFIG_PATH, "w");
+	/*
+	 * Keep the current config intact until a complete replacement has been
+	 * written and synchronized on the same filesystem.
+	 */
+	fp = fopen(APP_CONFIG_TEMP_PATH, "w");
 	if (fp == 0) {
-		printf("open config (%s) fail\n", APP_CONFIG_PATH);
+		printf("open config temp (%s) fail: %s\n",
+		       APP_CONFIG_TEMP_PATH, strerror(errno));
 		return -1;
 	}
 
@@ -1080,8 +1139,69 @@ int app_config_save(void)
 	fprintf(fp, "gamma_mode=%u\n", g_app_config.gamma_mode);
 	fprintf(fp, "gamma_auto_sel=%u\n", g_app_config.gamma_auto_sel);
 	fprintf(fp, "gamma_load_bin=%d\n", g_app_config.gamma_load_bin);
-	fclose(fp);
+
+	if (ferror(fp)) {
+		printf("write config temp (%s) fail\n", APP_CONFIG_TEMP_PATH);
+		goto save_fail;
+	}
+	if (fflush(fp) != 0) {
+		printf("flush config temp (%s) fail: %s\n",
+		       APP_CONFIG_TEMP_PATH, strerror(errno));
+		goto save_fail;
+	}
+
+#if defined(__LINUX)
+	if (fsync(fileno(fp)) != 0) {
+		printf("sync config temp (%s) fail: %s\n",
+		       APP_CONFIG_TEMP_PATH, strerror(errno));
+		goto save_fail;
+	}
+#endif
+
+	if (fclose(fp) != 0) {
+		fp = NULL;
+		printf("close config temp (%s) fail: %s\n",
+		       APP_CONFIG_TEMP_PATH, strerror(errno));
+		goto save_fail;
+	}
+	/* fclose() has consumed the stream even when it reports an error. */
+	fp = NULL;
+
+	if (rename(APP_CONFIG_TEMP_PATH, APP_CONFIG_PATH) != 0) {
+		printf("replace config (%s) fail: %s\n",
+		       APP_CONFIG_PATH, strerror(errno));
+		goto save_fail;
+	}
+
+#if defined(__LINUX)
+	/* Best effort: persist the directory entry created by rename(). */
+	dir_fd = open(APP_CONFIG_DIR, O_RDONLY);
+	if (dir_fd < 0) {
+		printf("open config directory (%s) for sync fail: %s\n",
+		       APP_CONFIG_DIR, strerror(errno));
+	} else {
+		if (fsync(dir_fd) != 0) {
+			printf("sync config directory (%s) fail: %s\n",
+			       APP_CONFIG_DIR, strerror(errno));
+		}
+		if (close(dir_fd) != 0) {
+			printf("close config directory (%s) fail: %s\n",
+			       APP_CONFIG_DIR, strerror(errno));
+		}
+	}
+#endif
 
 	printf("config saved: %s\n", APP_CONFIG_PATH);
 	return 0;
+
+save_fail:
+	if (fp != NULL && fclose(fp) != 0) {
+		printf("close failed config temp (%s) fail: %s\n",
+		       APP_CONFIG_TEMP_PATH, strerror(errno));
+	}
+	if (remove(APP_CONFIG_TEMP_PATH) != 0 && errno != ENOENT) {
+		printf("remove config temp (%s) fail: %s\n",
+		       APP_CONFIG_TEMP_PATH, strerror(errno));
+	}
+	return -1;
 }

@@ -1,4 +1,5 @@
 #include <limits.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,6 +8,9 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#if defined(__LINUX)
+#include <fcntl.h>
+#endif
 #include "tdc.h"
 #include <inttypes.h>
 #include "../../Device/sensor_temp.h"
@@ -400,9 +404,10 @@ static int tdc_save_temperature_table(const char *calibration_name,
 				      const float *temperature_k)
 {
 	char temporary_path[128];
-	FILE *fp;
+	FILE *fp = NULL;
 	UINT32 slope_table_size = tdc_slope_table_size();
 	UINT32 write_size;
+	int saved_errno;
 
 	if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp",
 		     table_path) >= (int)sizeof(temporary_path)) {
@@ -422,27 +427,67 @@ static int tdc_save_temperature_table(const char *calibration_name,
 
 	write_size = (UINT32)fwrite(temperature_k, 1,
 				    slope_table_size, fp);
-
-	if (fclose(fp) != 0) {
-		printf("close %s TDC table fail\n", calibration_name);
-		remove(temporary_path);
-		return -1;
-	}
-	if (write_size != slope_table_size) {
+	if (write_size != slope_table_size || ferror(fp)) {
 		printf("write %s TDC table size error, write=%u expect=%u\n",
 		       calibration_name, write_size,
 		       slope_table_size);
-		remove(temporary_path);
-		return -1;
+		goto fail;
 	}
+	if (fflush(fp) != 0) {
+		printf("flush %s TDC table fail: %s\n",
+		       calibration_name, strerror(errno));
+		goto fail;
+	}
+#if defined(__LINUX)
+	if (fsync(fileno(fp)) != 0) {
+		printf("sync %s TDC table fail: %s\n",
+		       calibration_name, strerror(errno));
+		goto fail;
+	}
+#endif
+	if (fclose(fp) != 0) {
+		fp = NULL;
+		printf("close %s TDC table fail: %s\n",
+		       calibration_name, strerror(errno));
+		goto fail;
+	}
+	fp = NULL;
 	if (rename(temporary_path, table_path) != 0) {
-		printf("replace %s TDC table (%s) fail\n",
-		       calibration_name, table_path);
-		remove(temporary_path);
-		return -1;
+		printf("replace %s TDC table (%s) fail: %s\n",
+		       calibration_name, table_path, strerror(errno));
+		goto fail;
 	}
 
+#if defined(__LINUX)
+	{
+		int dir_fd = open(TDC_DIR, O_RDONLY);
+
+		if (dir_fd < 0) {
+			printf("warning: open TDC table directory fail: %s\n",
+			       strerror(errno));
+		} else {
+			if (fsync(dir_fd) != 0) {
+				printf("warning: sync TDC table directory fail: %s\n",
+				       strerror(errno));
+			}
+			close(dir_fd);
+		}
+	}
+#endif
+
 	return 0;
+
+fail:
+	saved_errno = errno;
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	if (remove(temporary_path) != 0 && errno != ENOENT) {
+		printf("remove incomplete %s TDC table fail: %s\n",
+		       calibration_name, strerror(errno));
+	}
+	errno = saved_errno;
+	return -1;
 }
 
 static int tdc_temperature_calibrate(

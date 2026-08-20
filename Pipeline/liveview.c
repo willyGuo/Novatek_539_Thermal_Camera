@@ -89,6 +89,8 @@
 
 #define SNAPSHOT_DIR                  "/mnt/sd"
 #define SNAPSHOT_PREFIX               "snapshot_"
+#define SNAPSHOT_FRAME_BYTES          \
+	((size_t)RAW_ACTIVE_W * RAW_ACTIVE_H * sizeof(UINT16))
 
 #define FFC_AVERAGE_FRAME_COUNT 4U
 #define FFC_AVERAGE_SHIFT       2U
@@ -594,6 +596,7 @@ typedef struct {
 	int module_open_attempted;
 	int cap_thread_created;
 	int proc_thread_created;
+	int snapshot_writer_started;
 	int proc_bound;
 	int cap_started;
 	int proc_started;
@@ -601,11 +604,30 @@ typedef struct {
 	int proc_diag_started;
 } LIVEVIEW_CONTEXT;
 
+typedef struct {
+	pthread_t thread_id;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	unsigned char *input_buffer;
+	unsigned char *corrected_buffer;
+	UINT32 snapshot_id;
+	int final_is_input;
+	int thread_created;
+	int exit_requested;
+	int pending;
+	int busy;
+} SNAPSHOT_WRITER;
+
 static LIVEVIEW_CONTEXT g_liveview;
 static UINT32 g_snapshot_count = 0;
+static SNAPSHOT_WRITER g_snapshot_writer = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.cond = PTHREAD_COND_INITIALIZER,
+};
 static pthread_mutex_t g_liveview_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_liveview_fault_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_shutter_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_manual_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_liveview_shutter_fault = 0;
 static int g_liveview_stop_request = 0;
 static int g_liveview_fault_stop_worker_active = 0;
@@ -709,6 +731,7 @@ static void liveview_on_manual_calibration_state(const char *name, int active)
 	const char *calibration_name = name != NULL ? name : "manual";
 
 	pthread_mutex_lock(&g_shutter_calibration_lock);
+	pthread_mutex_lock(&g_manual_calibration_lock);
 	shutter_calibration_enabled =
 		ffc_is_enabled() || bpr_is_runtime_enabled();
 	if (active) {
@@ -726,6 +749,7 @@ static void liveview_on_manual_calibration_state(const char *name, int active)
 			       calibration_name);
 		}
 	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
 }
 
@@ -742,16 +766,17 @@ static int liveview_prepare_shutter_interval(int enabled)
 		}
 		g_shutter_reschedule_after_manual_calibration = 0;
 	}
+	pthread_mutex_lock(&g_manual_calibration_lock);
 	paused = g_manual_calibration_active;
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
 
 	return paused;
 }
 
-static int save_active_raw_frame(const HD_VIDEO_FRAME *p_video_frame,
-	const char *file_path)
+static int copy_active_raw_frame(const HD_VIDEO_FRAME *p_video_frame,
+	unsigned char *dst, size_t dst_size)
 {
-	FILE *fp = NULL;
 	UINTPTR blk_pa;
 	UINTPTR map_va;
 	UINTPTR raw_va;
@@ -760,9 +785,9 @@ static int save_active_raw_frame(const HD_VIDEO_FRAME *p_video_frame,
 	UINT32 plane_height;
 	UINT32 map_size;
 	UINT32 y;
-	int ret = -1;
 
-	if (p_video_frame == NULL || file_path == NULL || p_video_frame->blk == 0) {
+	if (p_video_frame == NULL || dst == NULL ||
+	    dst_size < SNAPSHOT_FRAME_BYTES || p_video_frame->blk == 0) {
 		return -1;
 	}
 	/* HDAL loff is normally bytes. Keep compatibility with a pixel-count loff. */
@@ -800,17 +825,37 @@ static int save_active_raw_frame(const HD_VIDEO_FRAME *p_video_frame,
 	raw_va = map_va + (p_video_frame->phy_addr[0] - blk_pa) +
 		RAW_ACTIVE_Y * stride + RAW_ACTIVE_X * 2;
 
+	for (y = 0; y < RAW_ACTIVE_H; y++) {
+		memcpy(dst + (size_t)y * row_bytes,
+		       (void *)(raw_va + y * stride), row_bytes);
+	}
+	hd_common_mem_munmap((void *)map_va, map_size);
+	return 0;
+}
+
+static int save_raw_buffer(const unsigned char *raw_buffer,
+	size_t raw_size, const char *file_path)
+{
+	FILE *fp = NULL;
+	size_t write_size;
+	int ret = -1;
+
+	if (raw_buffer == NULL || raw_size == 0 || file_path == NULL) {
+		return -1;
+	}
+
 	fp = fopen(file_path, "wb");
 	if (fp == NULL) {
 		printf("snapshot open %s fail\n", file_path);
 		goto exit;
 	}
 
-	for (y = 0; y < RAW_ACTIVE_H; y++) {
-		if (fwrite((void *)(raw_va + y * stride), 1, row_bytes, fp) != row_bytes) {
-			printf("snapshot write %s fail at row %u\n", file_path, y);
-			goto exit;
-		}
+	write_size = fwrite(raw_buffer, 1, raw_size, fp);
+	if (write_size != raw_size || ferror(fp)) {
+		printf("snapshot write %s fail, size=%u expected=%u\n",
+		       file_path, (unsigned int)write_size,
+		       (unsigned int)raw_size);
+		goto exit;
 	}
 
 	if (fflush(fp) != 0) {
@@ -841,7 +886,6 @@ exit:
 	if (fp != NULL) {
 		fclose(fp);
 	}
-	hd_common_mem_munmap((void *)map_va, map_size);
 	return ret;
 }
 
@@ -1116,34 +1160,212 @@ static int snapshot_get_next_id(UINT32 *p_snapshot_id)
 	return 0;
 }
 
-static void save_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
-	HD_VIDEO_FRAME *p_final_frame,
-	int final_is_input)
+static int snapshot_write_job(UINT32 snapshot_id, int final_is_input)
 {
 	char file_path[160];
-	UINT32 snapshot_id;
-
-	if (snapshot_get_next_id(&snapshot_id) != 0) {
-		return;
-	}
+	int ret = 0;
 
 	if (final_is_input) {
 		snprintf(file_path, sizeof(file_path),
 			 SNAPSHOT_DIR "/snapshot_%04u_raw16_%ux%u.raw",
 			 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
-		save_active_raw_frame(p_input_frame, file_path);
-		return;
+		return save_raw_buffer(g_snapshot_writer.input_buffer,
+			SNAPSHOT_FRAME_BYTES, file_path);
 	}
 
 	snprintf(file_path, sizeof(file_path),
 		 SNAPSHOT_DIR "/snapshot_%04u_input_raw16_%ux%u.raw",
 		 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
-	save_active_raw_frame(p_input_frame, file_path);
+	if (save_raw_buffer(g_snapshot_writer.input_buffer,
+			    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
+		ret = -1;
+	}
 
 	snprintf(file_path, sizeof(file_path),
 		 SNAPSHOT_DIR "/snapshot_%04u_corrected_raw16_%ux%u.raw",
 		 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
-	save_active_raw_frame(p_final_frame, file_path);
+	if (save_raw_buffer(g_snapshot_writer.corrected_buffer,
+			    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
+		ret = -1;
+	}
+
+	return ret;
+}
+
+static void *snapshot_writer_thread(void *arg)
+{
+	UINT32 snapshot_id;
+	int final_is_input;
+	int write_ret;
+
+	(void)arg;
+	for (;;) {
+		pthread_mutex_lock(&g_snapshot_writer.lock);
+		while (!g_snapshot_writer.pending &&
+		       !g_snapshot_writer.exit_requested) {
+			pthread_cond_wait(&g_snapshot_writer.cond,
+					  &g_snapshot_writer.lock);
+		}
+		if (!g_snapshot_writer.pending &&
+		    g_snapshot_writer.exit_requested) {
+			pthread_mutex_unlock(&g_snapshot_writer.lock);
+			break;
+		}
+
+		snapshot_id = g_snapshot_writer.snapshot_id;
+		final_is_input = g_snapshot_writer.final_is_input;
+		g_snapshot_writer.pending = 0;
+		pthread_mutex_unlock(&g_snapshot_writer.lock);
+
+		write_ret = snapshot_write_job(snapshot_id, final_is_input);
+		printf("Snapshot %04u background save %s\n",
+		       snapshot_id, write_ret == 0 ? "done" : "failed");
+
+		pthread_mutex_lock(&g_snapshot_writer.lock);
+		g_snapshot_writer.busy = 0;
+		pthread_cond_broadcast(&g_snapshot_writer.cond);
+		pthread_mutex_unlock(&g_snapshot_writer.lock);
+	}
+
+	return NULL;
+}
+
+static int snapshot_writer_start(void)
+{
+	int ret;
+
+	if (g_snapshot_writer.thread_created) {
+		return 0;
+	}
+
+	g_snapshot_writer.input_buffer =
+		(unsigned char *)malloc(SNAPSHOT_FRAME_BYTES);
+	g_snapshot_writer.corrected_buffer =
+		(unsigned char *)malloc(SNAPSHOT_FRAME_BYTES);
+	if (g_snapshot_writer.input_buffer == NULL ||
+	    g_snapshot_writer.corrected_buffer == NULL) {
+		printf("allocate snapshot writer buffers fail\n");
+		free(g_snapshot_writer.corrected_buffer);
+		free(g_snapshot_writer.input_buffer);
+		g_snapshot_writer.corrected_buffer = NULL;
+		g_snapshot_writer.input_buffer = NULL;
+		return -1;
+	}
+
+	g_snapshot_writer.exit_requested = 0;
+	g_snapshot_writer.pending = 0;
+	g_snapshot_writer.busy = 0;
+	ret = pthread_create(&g_snapshot_writer.thread_id, NULL,
+			     snapshot_writer_thread, NULL);
+	if (ret != 0) {
+		printf("create snapshot_writer_thread failed=%d\n", ret);
+		free(g_snapshot_writer.corrected_buffer);
+		free(g_snapshot_writer.input_buffer);
+		g_snapshot_writer.corrected_buffer = NULL;
+		g_snapshot_writer.input_buffer = NULL;
+		return -1;
+	}
+	g_snapshot_writer.thread_created = 1;
+	printf("Snapshot background writer ready\n");
+	return 0;
+}
+
+static void snapshot_writer_stop(void)
+{
+	int was_busy;
+
+	if (!g_snapshot_writer.thread_created) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	was_busy = g_snapshot_writer.busy;
+	g_snapshot_writer.exit_requested = 1;
+	pthread_cond_signal(&g_snapshot_writer.cond);
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	if (was_busy) {
+		printf("Waiting for background snapshot save to finish...\n");
+	}
+	pthread_join(g_snapshot_writer.thread_id, NULL);
+
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	g_snapshot_writer.thread_created = 0;
+	g_snapshot_writer.exit_requested = 0;
+	g_snapshot_writer.pending = 0;
+	g_snapshot_writer.busy = 0;
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+
+	free(g_snapshot_writer.corrected_buffer);
+	free(g_snapshot_writer.input_buffer);
+	g_snapshot_writer.corrected_buffer = NULL;
+	g_snapshot_writer.input_buffer = NULL;
+}
+
+static int snapshot_writer_reserve_request(void)
+{
+	int ret = 0;
+
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (!g_snapshot_writer.thread_created ||
+	    g_snapshot_writer.exit_requested || g_snapshot_writer.busy) {
+		ret = -1;
+	} else {
+		g_snapshot_writer.busy = 1;
+	}
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	return ret;
+}
+
+static void snapshot_writer_cancel_request(void)
+{
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (!g_snapshot_writer.pending) {
+		g_snapshot_writer.busy = 0;
+	}
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+}
+
+static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
+	HD_VIDEO_FRAME *p_final_frame, int final_is_input)
+{
+	UINT32 snapshot_id;
+
+	if (snapshot_get_next_id(&snapshot_id) != 0) {
+		snapshot_writer_cancel_request();
+		return -1;
+	}
+	if (copy_active_raw_frame(p_input_frame,
+				  g_snapshot_writer.input_buffer,
+				  SNAPSHOT_FRAME_BYTES) != 0) {
+		printf("snapshot input frame copy fail\n");
+		snapshot_writer_cancel_request();
+		return -1;
+	}
+	if (!final_is_input &&
+	    copy_active_raw_frame(p_final_frame,
+				  g_snapshot_writer.corrected_buffer,
+				  SNAPSHOT_FRAME_BYTES) != 0) {
+		printf("snapshot corrected frame copy fail\n");
+		snapshot_writer_cancel_request();
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (!g_snapshot_writer.thread_created ||
+	    g_snapshot_writer.exit_requested) {
+		g_snapshot_writer.busy = 0;
+		pthread_mutex_unlock(&g_snapshot_writer.lock);
+		printf("snapshot writer stopped before queue\n");
+		return -1;
+	}
+	g_snapshot_writer.snapshot_id = snapshot_id;
+	g_snapshot_writer.final_is_input = final_is_input;
+	g_snapshot_writer.pending = 1;
+	pthread_cond_signal(&g_snapshot_writer.cond);
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+
+	printf("Snapshot %04u copied; background save queued\n", snapshot_id);
+	return 0;
 }
 
 static int copy_videoframe_raw(HD_VIDEO_FRAME *p_video_frame, UINTPTR dst_va, UINT32 dst_size)
@@ -1622,6 +1844,22 @@ static void liveview_update_temperature_tables_if_needed(
 {
 	UINT64 now_ms = liveview_get_time_ms();
 
+	/*
+	 * Manual BPR/NUC calibration owns the correction tables while it is
+	 * active. Keep the periodic NUC/TDC loaders out of the same buffers and
+	 * postpone their next check until one full interval after calibration.
+	 */
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	if (g_manual_calibration_active) {
+		*nuc_next_update_ms =
+			now_ms +
+			(UINT64)nuc_get_sensor_temp_interval_sec() * 1000U;
+		*tdc_next_update_ms =
+			now_ms + (UINT64)tdc_get_interval_sec() * 1000U;
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+		return;
+	}
+
 	if (nuc_is_enabled() && now_ms >= *nuc_next_update_ms) {
 		nuc_update_sensor_temp_table();
 		*nuc_next_update_ms =
@@ -1636,6 +1874,7 @@ static void liveview_update_temperature_tables_if_needed(
 		*tdc_next_update_ms =
 			now_ms + (UINT64)tdc_get_interval_sec() * 1000U;
 	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 }
 
 static int liveview_run_ffc_calibration(
@@ -1786,10 +2025,13 @@ static int liveview_run_shutter_calibration_cycle(
 	int shutter_result = 0;
 
 	pthread_mutex_lock(&g_shutter_calibration_lock);
+	pthread_mutex_lock(&g_manual_calibration_lock);
 	if (g_manual_calibration_active) {
+		pthread_mutex_unlock(&g_manual_calibration_lock);
 		pthread_mutex_unlock(&g_shutter_calibration_lock);
 		return SHUTTER_CALIBRATION_PAUSED;
 	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 
 	if (gpio_shutter_close() != 0) {
 		printf("Shutter calibration close shutter fail\n");
@@ -1833,6 +2075,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	HD_VIDEO_FRAME *current_frame = &vcap_video_frame;
 	int current_frame_is_vcap = 1;
 	int raw_copy_handled = 0;
+	int correction_lock_held = 0;
 	HD_RESULT ret;
 	HD_RESULT push_ret;
 
@@ -1856,8 +2099,17 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		raw_copy_handled = 1;
 	}
 
+	/*
+	 * A calibration callback first waits for any in-flight correction here,
+	 * then marks manual calibration active. While active, keep pulling VCAP
+	 * frames for calibration RAW requests but bypass TDC/NUC/FFC so none of
+	 * them reads a table buffer that calibration may be replacing.
+	 */
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	correction_lock_held = 1;
+
 	/* Pipeline: VCAP -> optional TDC -> optional NUC -> optional FFC -> VideoProc. */
-	if (tdc_is_enabled()) {
+	if (!g_manual_calibration_active && tdc_is_enabled()) {
 		ret = tdc_apply(current_frame,
 				&tdc_video_frame,
 				p_stream0->thermal_tdc_out_pa,
@@ -1873,7 +2125,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		current_frame_is_vcap = 0;
 	}
 
-	if (nuc_is_enabled()) {
+	if (!g_manual_calibration_active && nuc_is_enabled()) {
 		ret = nuc_apply(current_frame,
 				&nuc_video_frame,
 				p_stream0->thermal_k_frame_pa,
@@ -1891,7 +2143,8 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		current_frame_is_vcap = 0;
 	}
 
-	if (ffc_is_enabled() && ffc_table_is_ready()) {
+	if (!g_manual_calibration_active &&
+	    ffc_is_enabled() && ffc_table_is_ready()) {
 		ret = ffc_apply(current_frame,
 				&ffc_video_frame,
 				p_stream0->thermal_ffc_k_frame_pa,
@@ -1909,10 +2162,15 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		current_frame_is_vcap = 0;
 	}
 
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	correction_lock_held = 0;
+
 	if (p_stream0->cap_snap) {
 		p_stream0->cap_snap = 0;
-		save_pipeline_snapshot(&vcap_video_frame, current_frame,
-				       current_frame_is_vcap);
+		if (queue_pipeline_snapshot(&vcap_video_frame, current_frame,
+					    current_frame_is_vcap) != 0) {
+			printf("Snapshot frame queue failed\n");
+		}
 	}
 
 	/* A processed frame no longer depends on the held VCAP buffer. */
@@ -1955,6 +2213,9 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	return;
 
 release_vcap_frame:
+	if (correction_lock_held) {
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+	}
 	ret = hd_videocap_release_out_buf(
 		p_stream0->cap_path, &vcap_video_frame);
 	if (ret != HD_OK) {
@@ -2131,6 +2392,12 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		printf("ISP IQ reload ok: %s\n", cfg_info.path);
 	}
 
+	ret = bpr_load_table();
+	if (ret != 0) {
+		printf("load BPR table from SD failed=%d; keep ISP cfg table\n", ret);
+		ret = HD_OK;
+	}
+
 	ret = gamma_init_from_isp();
 	if (ret != HD_OK) {
 		printf("init Gamma from ISP failed=%d, keep ISP cfg Gamma\n", ret);
@@ -2243,6 +2510,12 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		goto exit;
 	}
 
+	if (snapshot_writer_start() != 0) {
+		printf("start snapshot background writer failed\n");
+		goto exit;
+	}
+	ctx->snapshot_writer_started = 1;
+
 	// create raw_pipeline_thread (VCAP -> TDC -> NUC -> FFC -> VideoProc)
 	ret = pthread_create(&stream[0].cap_thread_id, NULL, raw_pipeline_thread, (void *)stream);
 	if (ret != 0) {
@@ -2338,6 +2611,10 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		ctx->proc_thread_created = 0;
 		stream[0].proc_thread_id = 0;
 	}
+	if (ctx->snapshot_writer_started) {
+		snapshot_writer_stop();
+		ctx->snapshot_writer_started = 0;
+	}
 
 
 	ret = video_output_stop(&stream[0].video_output);
@@ -2384,9 +2661,13 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 	g_raw_copy_done = 0;
 	g_yuv_stats_pending = 0;
 	g_proc_input_format_logged = 0;
+	pthread_mutex_lock(&g_shutter_calibration_lock);
+	pthread_mutex_lock(&g_manual_calibration_lock);
 	g_shutter_next_calibration_ms = 0;
 	g_manual_calibration_active = 0;
 	g_shutter_reschedule_after_manual_calibration = 0;
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	pthread_mutex_unlock(&g_shutter_calibration_lock);
 
 	if (ctx->thermal_frame_created) {
 		ret = exit_thermal_frame(&stream[0]);
@@ -2533,6 +2814,10 @@ static int liveview_request_snapshot(void)
 	}
 	if (g_liveview.stream[0].cap_snap) {
 		printf("Snapshot request is already pending\n");
+		return -1;
+	}
+	if (snapshot_writer_reserve_request() != 0) {
+		printf("Snapshot background writer is busy\n");
 		return -1;
 	}
 

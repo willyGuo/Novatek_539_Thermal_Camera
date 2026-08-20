@@ -8,6 +8,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__LINUX)
+#include <fcntl.h>
+#endif
 
 #include "../../Config/app_config.h"
 #include "../../Device/sensor_temp.h"
@@ -52,6 +55,24 @@ typedef struct {
 static NUC_CONTEXT g_nuc;
 static UINT32 g_nuc_sensor_temp_interval_sec =
 	NUC_SENSOR_TEMP_DEFAULT_INTERVAL_SEC;
+
+static void nuc_sync_sensor_temp_dir(void)
+{
+#if defined(__LINUX)
+	int dir_fd = open(NUC_SENSOR_TEMP_DIR, O_RDONLY);
+
+	if (dir_fd < 0) {
+		printf("warning: open NUC table directory fail: %s\n",
+		       strerror(errno));
+		return;
+	}
+	if (fsync(dir_fd) != 0) {
+		printf("warning: sync NUC table directory fail: %s\n",
+		       strerror(errno));
+	}
+	close(dir_fd);
+#endif
+}
 
 static int nuc_read_option(void)
 {
@@ -111,8 +132,9 @@ static int nuc_read_file_to_mem(const char *path, void *addr, UINT32 size)
 
 static int nuc_write_mem_to_file(const char *path, const void *addr, UINT32 size)
 {
-	FILE *fp;
+	FILE *fp = NULL;
 	UINT32 write_len;
+	int saved_errno;
 
 	fp = fopen(path, "wb");
 	if (fp == 0) {
@@ -121,15 +143,41 @@ static int nuc_write_mem_to_file(const char *path, const void *addr, UINT32 size
 	}
 
 	write_len = (UINT32)fwrite(addr, 1, size, fp);
-	fclose(fp);
-
-	if (write_len != size) {
+	if (write_len != size || ferror(fp)) {
 		printf("write file (%s) len error, write=%u expect=%u\n",
 		       path, write_len, size);
-		return -1;
+		goto fail;
 	}
+	if (fflush(fp) != 0) {
+		printf("flush file (%s) fail: %s\n", path, strerror(errno));
+		goto fail;
+	}
+#if defined(__LINUX)
+	if (fsync(fileno(fp)) != 0) {
+		printf("sync file (%s) fail: %s\n", path, strerror(errno));
+		goto fail;
+	}
+#endif
+	if (fclose(fp) != 0) {
+		fp = NULL;
+		printf("close file (%s) fail: %s\n", path, strerror(errno));
+		goto fail;
+	}
+	fp = NULL;
 
 	return 0;
+
+fail:
+	saved_errno = errno;
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	if (remove(path) != 0 && errno != ENOENT) {
+		printf("remove incomplete file (%s) fail: %s\n",
+		       path, strerror(errno));
+	}
+	errno = saved_errno;
+	return -1;
 }
 
 static int nuc_validate_table_file(const char *path)
@@ -198,14 +246,156 @@ static int nuc_cleanup_staged_sensor_temp_tables(void)
 	NUC_TABLE_TRANSACTION_FILE files[NUC_TABLE_FILE_COUNT];
 	UINT32 i;
 	int ret = 0;
+	int changed = 0;
 
 	nuc_prepare_table_transaction(files);
 	for (i = 0; i < NUC_TABLE_FILE_COUNT; i++) {
-		if (remove(files[i].stage_path) != 0 && errno != ENOENT) {
+		if (remove(files[i].stage_path) == 0) {
+			changed = 1;
+		} else if (errno != ENOENT) {
 			printf("remove staged NUC table fail: %s\n",
 			       files[i].stage_path);
 			ret = -1;
 		}
+	}
+	if (changed) {
+		nuc_sync_sensor_temp_dir();
+	}
+
+	return ret;
+}
+
+static int nuc_restore_table_backup(
+	const NUC_TABLE_TRANSACTION_FILE *file)
+{
+	void *table = NULL;
+	int ret = -1;
+
+	table = malloc(g_nuc.table_size);
+	if (table == NULL) {
+		printf("allocate NUC table recovery buffer fail\n");
+		return -1;
+	}
+	if (nuc_read_file_to_mem(file->backup_path, table,
+				 g_nuc.table_size) != 0) {
+		goto exit;
+	}
+	if (nuc_write_mem_to_file(file->stage_path, table,
+				  g_nuc.table_size) != 0) {
+		goto exit;
+	}
+	if (rename(file->stage_path, file->final_path) != 0) {
+		printf("restore NUC table backup fail: %s, %s\n",
+		       file->final_path, strerror(errno));
+		goto exit;
+	}
+
+	ret = 0;
+
+exit:
+	free(table);
+	return ret;
+}
+
+static int nuc_recover_sensor_temp_tables(void)
+{
+	NUC_TABLE_TRANSACTION_FILE files[NUC_TABLE_FILE_COUNT];
+	int stage_exists[NUC_TABLE_FILE_COUNT] = {0};
+	int backup_exists[NUC_TABLE_FILE_COUNT] = {0};
+	UINT32 i;
+	int stage_found = 0;
+	int backup_found = 0;
+	int interrupted = 0;
+	int changed = 0;
+	int ret = 0;
+
+	if (access(NUC_SENSOR_TEMP_DIR, F_OK) != 0) {
+		if (errno == ENOENT) {
+			return 0;
+		}
+		printf("check NUC table directory fail: %s\n", strerror(errno));
+		return -1;
+	}
+
+	nuc_prepare_table_transaction(files);
+	for (i = 0; i < NUC_TABLE_FILE_COUNT; i++) {
+		if (access(files[i].stage_path, F_OK) == 0) {
+			stage_exists[i] = 1;
+			stage_found = 1;
+		} else if (errno != ENOENT) {
+			printf("check staged NUC table fail: %s\n",
+			       files[i].stage_path);
+			return -1;
+		}
+		if (access(files[i].backup_path, F_OK) == 0) {
+			backup_exists[i] = 1;
+			backup_found = 1;
+		} else if (errno != ENOENT) {
+			printf("check NUC table backup fail: %s\n",
+			       files[i].backup_path);
+			return -1;
+		}
+	}
+	interrupted = stage_found && backup_found;
+
+	if (interrupted) {
+		printf("Interrupted NUC table update found, restoring previous tables\n");
+		for (i = 0; i < NUC_TABLE_FILE_COUNT; i++) {
+			if (backup_exists[i]) {
+				if (nuc_restore_table_backup(&files[i]) != 0) {
+					ret = -1;
+				}
+				changed = 1;
+			} else if (!stage_exists[i]) {
+				/* Installed during the interrupted update without an old file. */
+				if (remove(files[i].final_path) == 0) {
+					changed = 1;
+				} else if (errno != ENOENT) {
+					printf("remove incomplete NUC table fail: %s\n",
+					       files[i].final_path);
+					ret = -1;
+				}
+			}
+		}
+		if (ret != 0) {
+			if (changed) {
+				nuc_sync_sensor_temp_dir();
+			}
+			return -1;
+		}
+	} else if (stage_found) {
+		/* Calibration stopped before any final table was backed up. */
+		printf("Incomplete staged NUC tables found, discarding stages\n");
+	}
+
+	if (nuc_cleanup_staged_sensor_temp_tables() != 0) {
+		ret = -1;
+	}
+	for (i = 0; i < NUC_TABLE_FILE_COUNT; i++) {
+		if (!backup_exists[i]) {
+			continue;
+		}
+
+		if (!interrupted && access(files[i].final_path, F_OK) != 0) {
+			if (errno != ENOENT ||
+			    nuc_restore_table_backup(&files[i]) != 0) {
+				ret = -1;
+				continue;
+			}
+		}
+		if (remove(files[i].backup_path) == 0) {
+			changed = 1;
+		} else if (errno != ENOENT) {
+			printf("remove stale NUC table backup fail: %s\n",
+			       files[i].backup_path);
+			ret = -1;
+		}
+	}
+	if (changed) {
+		nuc_sync_sensor_temp_dir();
+	}
+	if (interrupted && ret == 0) {
+		printf("Previous NUC Sensor Temperature tables restored\n");
 	}
 
 	return ret;
@@ -480,6 +670,7 @@ static int nuc_stage_sensor_temp_table(UINT32 point)
 				  g_nuc.table_size) != 0) {
 		return -1;
 	}
+	nuc_sync_sensor_temp_dir();
 
 	printf("Sensor temperature point %u K/B table staged\n", point + 1);
 	return 0;
@@ -499,6 +690,7 @@ static int nuc_commit_staged_sensor_temp_tables(const float *temperatures)
 			goto rollback;
 		}
 	}
+	nuc_sync_sensor_temp_dir();
 
 	for (i = 0; i < NUC_TABLE_FILE_COUNT; i++) {
 		if (access(files[i].final_path, F_OK) == 0) {
@@ -509,6 +701,7 @@ static int nuc_commit_staged_sensor_temp_tables(const float *temperatures)
 				goto rollback;
 			}
 			files[i].had_original = 1;
+			nuc_sync_sensor_temp_dir();
 		} else if (errno != ENOENT) {
 			printf("check NUC table fail: %s\n",
 			       files[i].final_path);
@@ -521,6 +714,7 @@ static int nuc_commit_staged_sensor_temp_tables(const float *temperatures)
 			goto rollback;
 		}
 		files[i].installed = 1;
+		nuc_sync_sensor_temp_dir();
 	}
 
 	if (app_config_update_sensor_temp_points(
@@ -539,6 +733,7 @@ static int nuc_commit_staged_sensor_temp_tables(const float *temperatures)
 			       files[i].backup_path);
 		}
 	}
+	nuc_sync_sensor_temp_dir();
 
 	printf("All NUC Sensor Temperature K/B tables committed\n");
 	return 0;
@@ -557,8 +752,10 @@ rollback:
 			printf("restore old NUC table fail: %s\n",
 			       file->final_path);
 		}
+		nuc_sync_sensor_temp_dir();
 	}
 	nuc_cleanup_staged_sensor_temp_tables();
+	nuc_sync_sensor_temp_dir();
 	return ret;
 }
 
@@ -937,6 +1134,10 @@ exit:
 
 int nuc_init_table(void)
 {
+	if (nuc_recover_sensor_temp_tables() != 0) {
+		printf("NUC table recovery failed, disable NUC\n");
+		return -1;
+	}
 	if (nuc_reload_table() != 0) {
 		printf("NUC table not found or invalid, disable NUC\n");
 		return -1;

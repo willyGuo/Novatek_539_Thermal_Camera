@@ -261,9 +261,9 @@ gamma_load_bin=0
 | `nuc_sensor_temp_interval_sec` | Sensor Temperature NUC table 的檢查間隔 |
 | `nuc_sensor_temp_point1` ... `point5` | 五點 Sensor Temperature NUC 的溫度點 |
 | `bpr_correction` | ISP DPC/BPR runtime on/off |
-| `bpr_threshold` | BPR calibration threshold，預設 `15%` |
+| `bpr_threshold` | BPR calibration threshold，單位為 RAW8 DN，預設 `15` |
 | `runtime_bpr_enable` | Runtime BPR on/off，預設 `0`；可獨立依共用 shutter interval 執行 |
-| `runtime_bpr_threshold` | Runtime BPR calibration threshold，預設 `15%` |
+| `runtime_bpr_threshold` | Runtime BPR calibration threshold，單位為 RAW8 DN，預設 `15` |
 | `ffc_correction` | FFC runtime on/off，程式預設為 `1`；啟動後等待第一個 interval 到期才校正 |
 | `shutter_interval_sec` | FFC 與 Runtime BPR 共用的關快門間隔，接受任意大於 `0` 的秒數，預設 `60` |
 | `shutter_close_wait_ms` | 快門關閉後開始 FFC／Runtime BPR 前的等待時間，預設 `200` ms |
@@ -284,7 +284,7 @@ BPR 使用 Novatek DPC library 找出 bright/dark bad pixels，產生 ISP runtim
 
 ```text
 ISP cfg : /mnt/app/isp/isp_rtd6122c_0.cfg
-DPC bin : /mnt/app/isp/dpc_table.bin
+DPC bin : /mnt/sd/thermal_op/dpc_table.bin
 ```
 
 BPR 選單：
@@ -300,14 +300,14 @@ BPR menu
 功能說明：
 
 - `Bright/Dark BPR calibration`：依序取得 bright 與 dark calibration RAW，產生並保存 `dpc_table.bin`。
-- `Reload BPR table`：重新載入 ISP cfg，使 cfg 內指定的 DPC table 生效。
+- `Reload BPR table`：從 SD 卡重新讀取 DPC table，直接套用到 ISP。
 - `BPR debug on/off`：控制 DPC library log 與 `/mnt/sd/` RAW dump。
 
 BPR/Runtime BPR enable 與 threshold 已集中到 `CFG Setting -> BPR setting`；共用 shutter interval 位於 `CFG Setting -> Shutter / FFC setting`。
 
 手動 `Bright/Dark BPR calibration` 開始前會先等待正在執行的自動 shutter cycle 完成，接著暫停 interval 關快門；成功或失敗離開時都會恢復，並從完整的 `shutter_interval_sec` 重新計時。`Runtime BPR` 不會暫停 interval，因為它本身就是共用 shutter cycle 的一部分。
 
-BPR calibration 產生 table；runtime 是否補點則由 `bpr_correction` 控制。RAW16 每個 pixel 以 2 bytes 儲存；在 DPC table 產生流程中會取 RAW16 的 bit 15..8 轉成 RAW8，供 calibration library 使用，但 liveview runtime RAW pipeline 仍維持 RAW16，並不因此改成 RAW8。
+BPR calibration 產生 table；runtime 是否補點則由 `bpr_correction` 控制。TY640 RAW14 以 LSB 對齊方式存放在 RAW16 container，每個 pixel 佔 2 bytes；DPC table 產生流程會取有效資料的 bit 13..6 轉成 RAW8，供 calibration library 使用，但 liveview runtime RAW pipeline 仍維持 RAW16，並不因此改成 RAW8。
 
 ## NUC
 
@@ -419,7 +419,7 @@ interval 時間到
   -> 關閉 shutter
   -> 等待 shutter_close_wait_ms
   -> FFC 啟用時取得四張 VCAP RAW 並更新 offset table
-  -> Runtime BPR 啟用時執行 BPR calibration 並 reload ISP cfg
+  -> Runtime BPR 啟用時執行 BPR calibration 並直接套用新的 DPC table
   -> 開啟 shutter
   -> 安排下一次 shutter cycle
 ```
@@ -484,8 +484,8 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 | 路徑 | 用途 | 產生／載入時機 |
 |---|---|---|
 | `/mnt/sd/tiffany_thermal.cfg` | 使用者設定 | 設定時立即保存；Liveview Start／Restart 或開機時載入 |
-| `/mnt/app/isp/isp_rtd6122c_0.cfg` | ISP cfg | Liveview/BPR reload |
-| `/mnt/app/isp/dpc_table.bin` | BPR/DPC table | Bright/Dark BPR 或共用 shutter cycle 內的 Runtime BPR 產生；ISP cfg 載入 |
+| `/mnt/app/isp/isp_rtd6122c_0.cfg` | ISP cfg | Liveview 啟動時載入 |
+| `/mnt/sd/thermal_op/dpc_table.bin` | BPR/DPC table | Bright/Dark BPR 或共用 shutter cycle 內的 Runtime BPR 產生；Tiffany 直接載入 ISP |
 | `/mnt/sd/thermal_op/sensor_temp/point1_K.bin` ... `point5_K.bin` | NUC gain tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
 | `/mnt/sd/thermal_op/sensor_temp/point1_B.bin` ... `point5_B.bin` | NUC offset tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
 | FFC DDR buffer | FFC offset table | shutter frame 更新；不寫檔 |
@@ -497,7 +497,7 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 3. 若啟用 NUC，確認 log 出現 Sensor Temperature K/B table loaded；否則 NUC 會保持 off。
 4. 若啟用 FFC，確認依序出現 shutter close、`FFC dark frame mean`、`FFC table updated`、shutter open。
 5. 驗證 FFC signed offset，至少確認 `2000 + (-10) = 1990`。
-6. BPR calibration 後確認 `/mnt/app/isp/dpc_table.bin` 存在，並執行 reload BPR table。
+6. BPR calibration 後確認 `/mnt/sd/thermal_op/dpc_table.bin` 為 16384 bytes，並執行 reload BPR table。
 7. 停止或離開程式時確認 `raw_pipeline_thread` 正常 join，並檢查 ISP/HDAL cleanup log。
 
 ## 已知注意事項
