@@ -314,7 +314,7 @@ BPR 使用 Novatek DPC library 找出 bright/dark bad pixels，產生 ISP runtim
 固定路徑：
 
 ```text
-ISP cfg : /mnt/app/isp/isp_rtd6122c_0.cfg
+ISP cfg : /mnt/sd/isp_ty640_0.cfg
 DPC bin : /mnt/sd/thermal_op/dpc_table.bin
 ```
 
@@ -549,8 +549,8 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 | 路徑 | 用途 | 產生／載入時機 |
 |---|---|---|
 | `/mnt/sd/tiffany_thermal.cfg` | 使用者設定 | 設定時立即保存；Liveview Start／Restart 或開機時載入 |
-| `/mnt/app/isp/isp_rtd6122c_0.cfg` | ISP cfg | Liveview 啟動時載入 |
-| `/mnt/sd/thermal_op/dpc_table.bin` | BPR/DPC table | Bright/Dark BPR 或共用 shutter cycle 內的 Runtime BPR 產生；Tiffany 直接載入 ISP |
+| `/mnt/sd/isp_ty640_0.cfg` | ISP cfg | Liveview 啟動時載入 |
+| `/mnt/sd/thermal_op/dpc_table.bin` | BPR/DPC table | Liveview 啟動時由 Tiffany 直接載入 ISP；Bright/Dark BPR 或 Runtime BPR 產生新表後，也可直接更新 ISP |
 | `/mnt/sd/thermal_op/sensor_temp/point1_K.bin` ... `point5_K.bin` | NUC gain tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
 | `/mnt/sd/thermal_op/sensor_temp/point1_B.bin` ... `point5_B.bin` | NUC offset tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
 | FFC DDR buffer | FFC offset table | shutter frame 更新；不寫檔 |

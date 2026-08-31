@@ -4,12 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../Driver/SPI/spi.h"
 
 #define MENU_OPTION_REFRESH (-2)
 #define FOS_VALUE_MIN       0U
 #define FOS_VALUE_MAX       63U
 #define FOS_SEARCH_LIMIT    7U
 #define FOS_RAW14_MASK      0x3FFFU
+
+#define SPI_SIZE 4U		// SPI transfer size(byte)
 
 typedef struct {
 	UINT16 target_raw14;
@@ -46,6 +49,20 @@ static int fos_sensor_read_value(UINT8 *fos_value)
 	 *   2. Extract FOS<5:0> into *fos_value.
 	 *   3. Return 0 only after the received value has been validated.
 	 */
+
+	uint8_t tx[SPI_SIZE] = {
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+	};
+	uint8_t rx[SPI_SIZE] = {0};
+
+	if (spi3_1_transfer(tx, rx, SPI_SIZE) != 0) {
+		return -1;
+	}
+
+
 	(void)fos_value;
 	printf("FOS SPI read is not connected yet\n");
 	return -1;
@@ -62,6 +79,19 @@ static int fos_sensor_write_value(UINT8 fos_value)
 	 * Perform a read-modify-write of FOCC FOS<5:0> through Driver/SPI and
 	 * preserve every non-FOS bit. Read the value back before returning 0.
 	 */
+
+	uint8_t tx[SPI_SIZE] = {
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+	};
+	uint8_t rx[SPI_SIZE] = {0};
+
+	if (spi3_1_transfer(tx, rx, SPI_SIZE) != 0) {
+		return -1;
+	}
+
 	(void)fos_value;
 	printf("FOS SPI write is not connected yet\n");
 	return -1;

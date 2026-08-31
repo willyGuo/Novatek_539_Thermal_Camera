@@ -5,7 +5,7 @@
 #include "Pipeline/menu.h"
 #include "Pipeline/liveview.h"
 
-static const char g_app_version[] = "v3.1.0";
+static const char g_app_version[] = "v3.1.1";
 
 const char *app_get_version(void)
 {
@@ -14,15 +14,22 @@ const char *app_get_version(void)
 
 int app_init(void)
 {
+	if (spi5_1_init() != 0) {
+		return -1;
+	}
+	if (spi3_1_init() != 0) {
+		return -1;
+	}
 	if (spi1_3_init() != 0) {
 		return -1;
 	}
-	// Tim Add
+
 	if (I2C_0_Init() != 0) {
+		spi5_1_deinit();
+		spi3_1_deinit();
 		spi1_3_deinit();
 		return -1;
 	}
-	// Tim End
 
 	if (liveview_init() != 0) {
 		I2C_0_Deinit();

@@ -3895,7 +3895,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	vendor_isp_set_common(ISPT_ITEM_C_GAIN, &cgain);
 
 	cfg_info.id = g_thermal_pipeline_id;
-	strncpy(cfg_info.path, "/mnt/app/isp/isp_rtd6122c_0.cfg", CFG_NAME_LENGTH);
+	strncpy(cfg_info.path, "/mnt/sd/isp_ty640_0.cfg", CFG_NAME_LENGTH);
 	ret = vendor_isp_set_iq(IQT_ITEM_RLD_CONFIG, &cfg_info);
 	if (ret != HD_OK) {
 		printf("ISP IQ reload failed=%d, path=%s\n", ret, cfg_info.path);

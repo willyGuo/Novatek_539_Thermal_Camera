@@ -17,10 +17,10 @@
 int sensor_temp_read(float *temp_c)
 {
 	uint8_t tx[SENSOR_TEMP_FRAME_SIZE] = {
-		0x85,
+		0xC4,			// 0xC4: Continuous mode; 0xC5: single-shot mode
 		0x8B,
-		0x00,
-		0x00,
+		0xC4,
+		0x8B,
 	};
 	uint8_t rx[SENSOR_TEMP_FRAME_SIZE] = {0};
 	uint16_t raw_value;
@@ -29,7 +29,7 @@ int sensor_temp_read(float *temp_c)
 	if (temp_c == 0)
 		return -1;
 
-	if (spi1_3_transfer(tx, rx, SENSOR_TEMP_FRAME_SIZE) != 0) {
+	if (spi5_1_transfer(tx, rx, SENSOR_TEMP_FRAME_SIZE) != 0) {
 		return -1;
 	}
 
