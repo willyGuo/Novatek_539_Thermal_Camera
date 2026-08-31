@@ -1,7 +1,11 @@
 #include "uvc_output.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(__LINUX)
+#include <unistd.h>
+#endif
 
 #include "UVAC.h"
 #include "kwrap/error_no.h"
@@ -14,9 +18,13 @@
 #define UVC_MJPEG_ENCODER_BUF_MS    3000U
 #define UVC_MJPEG_QUALITY           75U
 #define UVC_MJPEG_MAX_FRAME_SIZE    (2U * 1024U * 1024U)
+#define UVC_DIAGNOSTIC_PATH_SIZE    192U
 
 /* UVAC callbacks do not carry an application pointer. Only one UVC output is used. */
 static UVC_OUTPUT *g_uvc_output;
+static pthread_mutex_t g_uvc_diagnostic_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_uvc_mjpeg_snapshot_pending;
+static char g_uvc_mjpeg_snapshot_path[UVC_DIAGNOSTIC_PATH_SIZE];
 
 static UVAC_VID_RESO g_uvc_mjpg_resolution[] = {
 	{640, 512, 1, 30, 0, 0},
@@ -153,9 +161,106 @@ static HD_RESULT uvc_encoder_configure(HD_PATH_ID enc_path,
 	return ret;
 }
 
+static int uvc_mjpeg_snapshot_is_pending(void)
+{
+	int pending;
+
+	pthread_mutex_lock(&g_uvc_diagnostic_lock);
+	pending = g_uvc_mjpeg_snapshot_pending;
+	pthread_mutex_unlock(&g_uvc_diagnostic_lock);
+	return pending;
+}
+
+static int uvc_take_mjpeg_snapshot_path(char *file_path, size_t path_size)
+{
+	size_t copy_length;
+	int pending = 0;
+
+	if (file_path == NULL || path_size == 0) {
+		return 0;
+	}
+
+	pthread_mutex_lock(&g_uvc_diagnostic_lock);
+	if (g_uvc_mjpeg_snapshot_pending) {
+		copy_length = strlen(g_uvc_mjpeg_snapshot_path);
+		if (copy_length >= path_size) {
+			copy_length = path_size - 1U;
+		}
+		memcpy(file_path, g_uvc_mjpeg_snapshot_path, copy_length);
+		file_path[copy_length] = '\0';
+		g_uvc_mjpeg_snapshot_pending = 0;
+		g_uvc_mjpeg_snapshot_path[0] = '\0';
+		pending = 1;
+	}
+	pthread_mutex_unlock(&g_uvc_diagnostic_lock);
+	return pending;
+}
+
+static void uvc_cancel_mjpeg_snapshot(void)
+{
+	pthread_mutex_lock(&g_uvc_diagnostic_lock);
+	g_uvc_mjpeg_snapshot_pending = 0;
+	g_uvc_mjpeg_snapshot_path[0] = '\0';
+	pthread_mutex_unlock(&g_uvc_diagnostic_lock);
+}
+
+static int uvc_save_mjpeg_snapshot(uintptr_t frame_va, UINT32 frame_size,
+	UINT64 timestamp)
+{
+	char file_path[UVC_DIAGNOSTIC_PATH_SIZE];
+	FILE *fp = NULL;
+	size_t write_size;
+	int ret = -1;
+
+	if (!uvc_take_mjpeg_snapshot_path(file_path, sizeof(file_path))) {
+		return 0;
+	}
+
+	fp = fopen(file_path, "wb");
+	if (fp == NULL) {
+		printf("UVC MJPEG diagnostic open %s fail: %s\n",
+		       file_path, strerror(errno));
+		goto exit;
+	}
+	write_size = fwrite((const void *)frame_va, 1, frame_size, fp);
+	if (write_size != frame_size || ferror(fp)) {
+		printf("UVC MJPEG diagnostic write %s fail, size=%u expected=%u\n",
+		       file_path, (unsigned int)write_size,
+		       (unsigned int)frame_size);
+		goto exit;
+	}
+	if (fflush(fp) != 0) {
+		printf("UVC MJPEG diagnostic flush %s fail\n", file_path);
+		goto exit;
+	}
+#if defined(__LINUX)
+	if (fsync(fileno(fp)) != 0) {
+		printf("UVC MJPEG diagnostic sync %s fail: %s\n",
+		       file_path, strerror(errno));
+		goto exit;
+	}
+#endif
+	if (fclose(fp) != 0) {
+		fp = NULL;
+		printf("UVC MJPEG diagnostic close %s fail\n", file_path);
+		goto exit;
+	}
+	fp = NULL;
+	printf("UVC MJPEG diagnostic saved: %s (%u bytes, timestamp=%llu)\n",
+	       file_path, (unsigned int)frame_size,
+	       (unsigned long long)timestamp);
+	ret = 0;
+
+exit:
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	return ret;
+}
+
 static HD_RESULT uvc_copy_and_send_mjpeg(UVC_OUTPUT *output,
 	const HD_VIDEOENC_BUFINFO *encoder_buffer, uintptr_t encoder_va,
-	const HD_VIDEOENC_BS *bitstream)
+	const HD_VIDEOENC_BS *bitstream, int send_to_host)
 {
 	UVAC_STRM_FRM stream_frame = {0};
 	UINT32 total_size = 0;
@@ -190,16 +295,20 @@ static HD_RESULT uvc_copy_and_send_mjpeg(UVC_OUTPUT *output,
 	}
 
 	hd_common_mem_flush_cache((void *)output->frame_va, total_size);
-	stream_frame.path = UVAC_STRM_VID;
-	stream_frame.addr = output->frame_pa;
-	stream_frame.size = total_size;
-	stream_frame.pStrmHdr = 0;
-	stream_frame.strmHdrSize = 0;
-	stream_frame.va = output->frame_va;
-	stream_frame.timestamp = bitstream->timestamp;
-	stream_frame.frame_type = UVAC_VIDEO_FRM_NORMAL;
-	UVAC_SetEachStrmInfo(&stream_frame);
-	UVAC_WaitStrmDone(UVAC_STRM_VID);
+	if (send_to_host) {
+		stream_frame.path = UVAC_STRM_VID;
+		stream_frame.addr = output->frame_pa;
+		stream_frame.size = total_size;
+		stream_frame.pStrmHdr = 0;
+		stream_frame.strmHdrSize = 0;
+		stream_frame.va = output->frame_va;
+		stream_frame.timestamp = bitstream->timestamp;
+		stream_frame.frame_type = UVAC_VIDEO_FRM_NORMAL;
+		UVAC_SetEachStrmInfo(&stream_frame);
+		UVAC_WaitStrmDone(UVAC_STRM_VID);
+	}
+	uvc_save_mjpeg_snapshot(output->frame_va, total_size,
+		bitstream->timestamp);
 	return HD_OK;
 }
 
@@ -236,10 +345,13 @@ static void *uvc_output_thread(void *arg)
 		}
 
 		/* Always drain the encoder so it cannot fill before the host opens UVC. */
-		if (output->host_streaming &&
-		    output->host_format == UVAC_VIDEO_FORMAT_MJPG) {
+		if ((output->host_streaming &&
+		     output->host_format == UVAC_VIDEO_FORMAT_MJPG) ||
+		    uvc_mjpeg_snapshot_is_pending()) {
 			uvc_copy_and_send_mjpeg(output, &encoder_buffer,
-				encoder_va, &bitstream);
+				encoder_va, &bitstream,
+				output->host_streaming &&
+				output->host_format == UVAC_VIDEO_FORMAT_MJPG);
 		}
 
 		ret = hd_videoenc_release_out_buf(output->enc_path, &bitstream);
@@ -261,6 +373,39 @@ static void uvc_output_reset(UVC_OUTPUT *output)
 	memset(output, 0, sizeof(*output));
 }
 
+HD_RESULT uvc_output_request_mjpeg_snapshot(UVC_OUTPUT *output,
+	const char *file_path)
+{
+	size_t path_length;
+	HD_RESULT ret = HD_OK;
+
+	if (output == NULL || file_path == NULL || output != g_uvc_output ||
+	    !output->thread_started || !output->encoder_started) {
+		return HD_ERR_NG;
+	}
+	path_length = strlen(file_path);
+	if (path_length == 0 || path_length >= UVC_DIAGNOSTIC_PATH_SIZE) {
+		printf("UVC MJPEG diagnostic path is invalid\n");
+		return HD_ERR_NG;
+	}
+
+	pthread_mutex_lock(&g_uvc_diagnostic_lock);
+	if (g_uvc_mjpeg_snapshot_pending) {
+		ret = HD_ERR_NG;
+	} else {
+		memcpy(g_uvc_mjpeg_snapshot_path, file_path, path_length + 1U);
+		g_uvc_mjpeg_snapshot_pending = 1;
+	}
+	pthread_mutex_unlock(&g_uvc_diagnostic_lock);
+
+	if (ret != HD_OK) {
+		printf("UVC MJPEG diagnostic request is already pending\n");
+	} else {
+		printf("UVC MJPEG diagnostic requested: %s\n", file_path);
+	}
+	return ret;
+}
+
 HD_RESULT uvc_output_open(UVC_OUTPUT *output, UINT32 width, UINT32 height,
 	UINT32 fps, UINT32 isp_id)
 {
@@ -280,6 +425,7 @@ HD_RESULT uvc_output_open(UVC_OUTPUT *output, UINT32 width, UINT32 height,
 		return HD_ERR_NG;
 	}
 
+	uvc_cancel_mjpeg_snapshot();
 	uvc_output_reset(output);
 	output->width = width;
 	output->height = height;
@@ -448,6 +594,7 @@ HD_RESULT uvc_output_stop(UVC_OUTPUT *output)
 
 	output->host_streaming = 0;
 	output->host_format = 0;
+	uvc_cancel_mjpeg_snapshot();
 	output->thread_exit = 1;
 	if (output->thread_started) {
 		pthread_join(output->thread_id, NULL);

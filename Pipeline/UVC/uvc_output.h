@@ -31,5 +31,7 @@ HD_RESULT uvc_output_open(UVC_OUTPUT *output, UINT32 width, UINT32 height,
 HD_RESULT uvc_output_start(UVC_OUTPUT *output);
 HD_RESULT uvc_output_stop(UVC_OUTPUT *output);
 HD_RESULT uvc_output_close(UVC_OUTPUT *output);
+HD_RESULT uvc_output_request_mjpeg_snapshot(UVC_OUTPUT *output,
+	const char *file_path);
 
 #endif

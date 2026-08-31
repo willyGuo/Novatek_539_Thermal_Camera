@@ -49,15 +49,24 @@ SRC += \
 	Pipeline/Output/video_output.c \
 	Pipeline/UVC/uvc_output.c \
 	Pipeline/RTSP/rtsp_output.c \
-	Algorithm/BPR/bpr.c \
-	Algorithm/NUC/nuc.c \
-	Algorithm/FFC/ffc.c \
-	Algorithm/TDC/tdc.c \
+	Correction/BPR/bpr.c \
+	Correction/NUC/nuc.c \
+	Correction/FFC/ffc.c \
+	Correction/TDC/tdc.c \
+	Enhancement/AGC/agc_mode.c \
+	Enhancement/AGC/agc_fieldscale.c \
+	Enhancement/AGC/agc_histogram_p1_p99.c \
+	Enhancement/AGC/agc_min_max_tone_curve.c \
 	Enhancement/Gamma/gamma.c \
+	Enhancement/ISP/videoproc_isp.c \
+	Diagnostics/diagnostics_menu.c \
+	Diagnostics/ISP/isp_ob_runtime_diagnostic.c \
+	Diagnostics/ISP/isp_raw_to_y_step_diagnostic.c \
 	Driver/GPIO/gpio_control.c \
 	Driver/SPI/spi.c \
 	Driver/I2C/i2c.c \
-	Device/sensor_temp.c
+	Device/FOS/fos.c \
+	Device/SensorTemp/sensor_temp.c
 
 ###############################################################################
 # rtos Makefile                                                               #

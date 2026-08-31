@@ -126,3 +126,22 @@ HD_RESULT video_output_close(VIDEO_OUTPUT *output)
 	memset(output, 0, sizeof(*output));
 	return ret;
 }
+
+HD_RESULT video_output_request_encoded_snapshot(VIDEO_OUTPUT *output,
+	const char *file_path)
+{
+	if (output == NULL || !output->opened || file_path == NULL) {
+		return HD_ERR_NG;
+	}
+
+	switch (output->mode) {
+	case VIDEO_OUTPUT_MODE_UVC:
+		return uvc_output_request_mjpeg_snapshot(&output->backend.uvc,
+			file_path);
+	case VIDEO_OUTPUT_MODE_RTSP:
+		printf("Encoded JPEG diagnostic is unavailable in RTSP mode\n");
+		return HD_ERR_NG;
+	default:
+		return HD_ERR_NG;
+	}
+}

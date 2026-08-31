@@ -15,6 +15,7 @@ typedef struct {
 	UINTPTR b_va;
 	UINT32 table_size;
 	UINT32 shutter_interval_sec;
+	FFC_TEST_CB run_test;
 	int enabled;
 	int table_ready;
 } FFC_CONTEXT;
@@ -66,6 +67,23 @@ static UINT16 ffc_store_b(INT32 value)
 	}
 
 	return (UINT16)(short)value;
+}
+
+static UINT16 ffc_clip_output(long long value)
+{
+	if (value <= 0) {
+		return 0;
+	}
+	if (value > 65535) {
+		return 65535;
+	}
+
+	return (UINT16)value;
+}
+
+void ffc_bind_test_callback(FFC_TEST_CB run_test)
+{
+	g_ffc.run_test = run_test;
 }
 
 void ffc_bind_runtime(UINTPTR b_va, UINT32 table_size)
@@ -181,6 +199,83 @@ int ffc_table_is_ready(void)
 	return g_ffc.table_ready;
 }
 
+int ffc_compare_gfx_samples(UINTPTR input_va,
+			    UINTPTR k_va,
+			    UINTPTR output_va,
+			    UINT32 lineoffset,
+			    UINT32 active_x,
+			    UINT32 active_y,
+			    UINT32 active_w,
+			    UINT32 active_h,
+			    UINT32 sample_count)
+{
+	UINT16 *input;
+	UINT16 *k_tbl;
+	UINT16 *b_tbl;
+	UINT16 *output;
+	UINT32 raw_width;
+	UINT32 active_pixels;
+	UINT32 sample;
+	UINT32 pass_count = 0;
+
+	if (input_va == 0 || k_va == 0 || output_va == 0 ||
+	    lineoffset == 0 || (lineoffset & 1U) != 0 ||
+	    active_w == 0 || active_h == 0 || sample_count == 0) {
+		printf("FFC GFX sample buffer or layout is invalid\n");
+		return -1;
+	}
+	if (g_ffc.b_va == 0 || g_ffc.table_size == 0 ||
+	    !g_ffc.table_ready) {
+		printf("FFC table is not ready for GFX sample compare\n");
+		return -1;
+	}
+
+	raw_width = lineoffset / sizeof(UINT16);
+	if (active_x >= raw_width || active_w > raw_width - active_x ||
+	    (active_y + active_h) * lineoffset > g_ffc.table_size) {
+		printf("FFC GFX sample active area is invalid\n");
+		return -1;
+	}
+
+	active_pixels = active_w * active_h;
+	if (sample_count > active_pixels) {
+		sample_count = active_pixels;
+	}
+
+	input = (UINT16 *)input_va;
+	k_tbl = (UINT16 *)k_va;
+	b_tbl = (UINT16 *)g_ffc.b_va;
+	output = (UINT16 *)output_va;
+
+	printf("FFC GFX test samples (first %u active pixels)\n", sample_count);
+	printf(" idx  (x,y)  avg_input  K(Q8)  B(s16)  expected  actual_gfx  diff  result\n");
+	for (sample = 0; sample < sample_count; sample++) {
+		UINT32 x = active_x + sample % active_w;
+		UINT32 y = active_y + sample / active_w;
+		UINT32 pixel = y * raw_width + x;
+		UINT16 input_value = input[pixel];
+		UINT16 k_value = k_tbl[pixel];
+		INT16 b_value = (INT16)b_tbl[pixel];
+		long long scaled = (long long)k_value *
+			((long long)input_value - (long long)b_value);
+		UINT16 expected = ffc_clip_output(
+			scaled > 0 ? scaled >> FFC_GAIN_SHIFT : scaled);
+		UINT16 actual = output[pixel];
+		INT32 diff = (INT32)actual - (INT32)expected;
+		int pass = diff == 0;
+
+		if (pass) {
+			pass_count++;
+		}
+		printf(" %3u  (%u,%u)  %9u  %5u  %6d  %8u  %10u  %4d  %s\n",
+		       sample, x, y, input_value, k_value, b_value,
+		       expected, actual, diff, pass ? "PASS" : "FAIL");
+	}
+
+	printf("FFC GFX compare: %u/%u PASS\n", pass_count, sample_count);
+	return pass_count == sample_count ? 0 : -1;
+}
+
 HD_RESULT ffc_accumulate_frame(UINTPTR raw_pa,
 			       UINTPTR sum_pa,
 			       UINTPTR out_pa,
@@ -227,6 +322,7 @@ int ffc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("FFC status\n");
+		printf(" 1. Run FFC test\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: %s, table=%s, shutter interval=%u sec\n",
@@ -237,6 +333,16 @@ int ffc_menu_run(void)
 
 		option = ffc_read_option();
 		switch (option) {
+		case 1:
+			if (g_ffc.run_test == 0) {
+				printf("Run FFC test unavailable\n");
+				break;
+			}
+			printf("Run FFC test requested\n");
+			printf("Run FFC test %s\n",
+			       g_ffc.run_test() == 0 ? "PASS" : "FAIL");
+			break;
+
 		case 0:
 		case -1:
 			running = 0;

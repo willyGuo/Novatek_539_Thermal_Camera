@@ -25,7 +25,7 @@ Tiffany_thermal/
 │  └─ liveview.c                 HDAL、ISP、VCAP、NUC、FFC 與輸出 pipeline
 ├─ Config/
 │  └─ app_config.c               tiffany_thermal.cfg 讀寫
-├─ Algorithm/
+├─ Correction/
 │  ├─ BPR/bpr.c                  DPC table 產生、載入與 runtime enable
 │  ├─ NUC/nuc.c                  NUC K/B table 校正、載入與套用
 │  └─ FFC/ffc.c                  shutter offset table 產生與套用
@@ -47,7 +47,7 @@ make clean
 make
 ```
 
-`Algorithm/BPR/bpr.c` 只提供 BPR 功能，ISP lifecycle 由 `Pipeline/liveview.c` 統一管理。
+`Correction/BPR/bpr.c` 只提供 BPR 功能，ISP lifecycle 由 `Pipeline/liveview.c` 統一管理。
 
 目前 Windows checkout 沒有 SDK `make` 環境，最終編譯與上板測試需在 Novatek SDK Linux 環境執行。
 
@@ -114,7 +114,10 @@ Thermal menu
  4. NUC
  5. FFC
  6. TDC
- 7. Gamma
+ 7. AGC
+ 8. FOS
+ 9. VideoProc / ISP
+10. Image Pipeline Diagnostics
  q. Quit
 ```
 
@@ -133,6 +136,7 @@ Liveview menu
  3. Shutter control
  4. Snapshot RAW
  5. Show current RAW statistics
+ 6. Show current YUV statistics
  0. Back
 ```
 
@@ -155,14 +159,22 @@ FPS、startup skip 與 runtime skip 都移到 `CFG Setting -> Liveview setting`�
 
 自動 FFC 或 Runtime BPR shutter-closed calibration 執行期間，`Shutter open` 與 `Shutter close` 指令會立即被拒絕，不會等待校正結束後再執行。
 
-`Snapshot RAW` 會在下一張正常 frame 完成 NUC／FFC 後寫入 `/mnt/sd/`。檔案只保留有效影像區 `640x512`，每個 pixel 為 little-endian 16-bit container：
+`Snapshot RAW` 會在下一張正常 frame 完成 TDC／NUC／FFC 後寫入 `/mnt/sd/`。檔案只保留有效影像區 `640x512`，每個 pixel 為 little-endian 16-bit container：
 
-- NUC／FFC 都未套用：`snapshot_NNNN_raw14_640x512.raw`
-- 有套用 NUC 或 FFC：同時保存 `snapshot_NNNN_input_raw14_640x512.raw` 與 `snapshot_NNNN_corrected_raw16_640x512.raw`
+- TDC／NUC／FFC 都未套用：`snapshot_NNNN_raw14_640x512.raw`
+- 有套用 TDC、NUC 或 FFC：同時保存 `snapshot_NNNN_input_raw14_640x512.raw` 與 `snapshot_NNNN_corrected_raw16_640x512.raw`
+- Histogram P1/P99 AGC (CPU) 成功時：另外保存同一張 frame 在 VideoProc 前的 `snapshot_NNNN_agc_output_raw16_640x512.raw`
 
-每個檔案大小為 `640 * 512 * 2 = 655360 bytes`。寫檔由 RAW pipeline thread 同步完成，因此快照當下可能短暫影響即時輸出幀率。
+每個檔案大小為 `640 * 512 * 2 = 655360 bytes`。RAW pipeline thread 先複製同一張 frame 的各階段資料，再由背景 writer 寫入 SD 卡；快照當下仍會增加一次或多次 frame copy 的負擔。
 
 `Show current RAW statistics` 會要求 RAW pipeline 對下一張 VCAP 輸入 frame 計算並顯示格式、尺寸、stride、最低值、最高值、平均值與 pixel 數量。統計對象是套用 TDC／NUC／FFC 前的 Sensor RAW14；選單執行緒不會自行 pull 或 release VCAP buffer。
+
+`Show current YUV statistics` 會對下一張 VideoProc diagnostic OUT1 的 Y plane 顯示 min／max／mean、P1／P50／P99、unique value 數量、Y=0／Y=255 的 pixel 數量與比例，以及可能被 limited-range 顯示截斷的 Y<=16／Y>=235 比例，並在 `/mnt/sd/` 保存：
+
+- `display_diag_NNNN_videoproc_y8_640x512.raw`：VideoProc 後、JPEG 前的 8-bit Y plane，固定為 `640 * 512 = 327680 bytes`
+- `display_diag_NNNN_uvc_mjpeg_640x512.jpg`：UVC encoder 產生、送往 USB 前的單張 MJPEG bitstream；檔案大小依影像內容而變動
+
+兩個檔案共用相同的 `NNNN` 診斷編號且不覆蓋既有檔案。OUT1 YUV 與 OUT0 encoder 由不同執行緒取得，因此是同一次請求附近的 frame，不保證為硬體鎖定的相同 timestamp。RTSP mode 只保存 Y8，沒有 JPEG 診斷檔。
 
 即時 RAW pipeline：
 
@@ -188,9 +200,11 @@ CFG Setting
  4. NUC setting
  5. TDC setting
  6. Gamma setting
- 7. Show current tiffany_thermal.cfg
- 8. Generate tiffany_thermal.cfg
- 9. Use CFG on next boot/restart on/off
+ 7. AGC setting (mutually exclusive)
+ 8. VideoProc / ISP setting
+ 9. Show current tiffany_thermal.cfg
+10. Generate tiffany_thermal.cfg
+11. Use CFG on next boot/restart on/off
  0. Back
 pending CFG: boot load on/off
 ```
@@ -203,6 +217,8 @@ pending CFG: boot load on/off
 - `NUC setting`：NUC enable 與 Sensor Temperature table interval。五點 Sensor 溫度由 NUC calibration 自動寫入，不提供手動修改。
 - `TDC setting`：TDC enable 與 update interval。
 - `Gamma setting`：Gamma enable、Gamma bin、mode 與 auto selection。
+- `AGC setting`：Histogram P1/P99 CPU AGC 與 Min/Max ISP Tone Curve AGC，兩者互斥。
+- `VideoProc / ISP setting`：AF、WDR、DEFOG、3DNR 個別開關，以及全開／全關。
 - `Show current tiffany_thermal.cfg`：直接顯示 SD 卡上的完整 cfg。
 - `Generate tiffany_thermal.cfg`：將 pending CFG 寫入設定檔。
 - `Use CFG on next boot/restart on/off`：控制 `cfg_boot_load=1/0`。
@@ -225,6 +241,7 @@ pending CFG: boot load on/off
 # Tiffany thermal user settings
 cfg_boot_load=1
 fps=30
+output_mode=0
 startup_skip_frames=30
 runtime_skip_frames=0
 nuc_correction=1
@@ -243,6 +260,13 @@ shutter_interval_sec=60
 shutter_close_wait_ms=200
 tdc_correction=1
 tdc_interval_sec=60
+agc_histogram_p1_p99_enable=0
+agc_min_max_tone_curve_enable=0
+agc_fieldscale_enable=0
+videoproc_af_enable=1
+videoproc_wdr_enable=1
+videoproc_defog_enable=1
+videoproc_3dnr_enable=1
 gamma_correction=1
 gamma_mode=0
 gamma_auto_sel=2
@@ -269,6 +293,13 @@ gamma_load_bin=0
 | `shutter_close_wait_ms` | 快門關閉後開始 FFC／Runtime BPR 前的等待時間，預設 `200` ms |
 | `tdc_correction` | TDC runtime on/off |
 | `tdc_interval_sec` | TDC 更新間隔 |
+| `agc_histogram_p1_p99_enable` | Histogram P1/P99 CPU AGC on/off；三種 AGC 只能擇一開啟 |
+| `agc_min_max_tone_curve_enable` | Min/Max ISP Tone Curve AGC on/off；三種 AGC 只能擇一開啟 |
+| `agc_fieldscale_enable` | Fieldscale 8x8 Local Adaptive CPU AGC on/off；三種 AGC 只能擇一開啟 |
+| `videoproc_af_enable` | VideoProc AF flag on/off，預設 `1` |
+| `videoproc_wdr_enable` | VideoProc WDR flag on/off，預設 `1` |
+| `videoproc_defog_enable` | VideoProc DEFOG flag on/off，預設 `1` |
+| `videoproc_3dnr_enable` | VideoProc 3DNR 與 3DNR statistics flag on/off，預設 `1` |
 | `gamma_correction` | Gamma on/off |
 | `gamma_mode` | Gamma mode |
 | `gamma_auto_sel` | Gamma auto set 選擇 |
@@ -320,18 +351,34 @@ K table : /mnt/sd/thermal_op/sensor_temp/point1_K.bin ... point5_K.bin
 B table : /mnt/sd/thermal_op/sensor_temp/point1_B.bin ... point5_B.bin
 ```
 
+Blackbody Temperature 五點保存路徑：
+
+```text
+Reference RAW : /mnt/sd/thermal_op/blackbody_temp/point1_RAW.bin ... point5_RAW.bin
+K table : /mnt/sd/thermal_op/blackbody_temp/point1_K.bin ... point5_K.bin
+B table : /mnt/sd/thermal_op/blackbody_temp/point1_B.bin ... point5_B.bin
+```
+
 NUC 選單：
 
 ```text
 NUC menu
  1. 5 point Sensor Temperature NUC calibration
- 2. Reload Sensor Temperature K/B table
+ 2. 5 point Blackbody Temperature NUC calibration (save RAW/K/B)
+ 3. Toggle per-pixel Blackbody Dynamic NUC
+ 4. Reload Sensor Temperature K/B table
  0. Back
 ```
 
 NUC enable 與 Sensor Temperature table interval 已集中到 `CFG Setting -> NUC setting`。
 
 `5 point Sensor Temperature NUC calibration` 量測五個 Sensor 溫度點。每個溫度點的 Low 與 High 都連續擷取 4 張 RAW，由 CPU 對 `640x512` 做平均，再產生獨立的 K/B table；runtime 依目前 Sensor 溫度選擇最接近的 table。完整 K/B table 為 `640x512`，對應板端 VCAP 實際回傳的 active-only RAW frame。校正過程先將五點 K/B table 寫入 `.new` 暫存檔，全部成功且大小正確後才替換正式檔案；任一點失敗都會放棄本次結果，保留原本五點 table。啟用 NUC 前，point1 到 point5 的 K/B 檔案必須全部存在且大小正確。
+
+`5 point Blackbody Temperature NUC calibration (save RAW/K/B)` 必須由低溫到高溫依序量測五個黑體爐點，每點連續擷取 4 張 RAW 並平均。每點會保存該張 `pointN_RAW.bin` 參考影像，並建立一組 one-point offset table：所有 K 都是 Q8 的 `256`，B 為 `pixel_average - frame_average`，因此 GFX 公式會把校正點的均勻黑體影像拉回該張影像的全畫面平均值。五組 RAW/K/B 先寫入 `.new`，15 個檔案全部完成且大小正確後才替換 `blackbody_temp` 內的正式檔案；失敗時保留上一批結果。此校正選項本身只產生及保存檔案，不更新 Sensor Temperature CFG、不自動切換 runtime 模式。point1 到 point5 的實際黑體爐溫度值由操作者記錄，firmware 目前不保存溫度 metadata。
+
+`Toggle per-pixel Blackbody Dynamic NUC` 開啟時會一次載入五組 K/B，並由五張 reference RAW 預先計算每個 Pixel 的四個相鄰中點。每張即時 RAW 送進 NUC 前，CPU 對 `640x512` 每個 Pixel 比較四個中點，選出 point1 到 point5，將該點同座標的 K/B 複製到目前的 DDR K/B table，再交給 `VENDOR_GRPH_CMD_Non_uni_correction`。等於中點時選較高 point。若某 Pixel 的五個 reference RAW 不是嚴格遞增，該 Pixel 改用五張 reference RAW 的全畫面平均中點，並在開啟時列出 fallback Pixel 數量。為了暫時進行板端效能測試，目前即使五個全畫面平均不是由低到高也只會印出警告並繼續啟用；此時只可使用 CPU／GFX／FPS 數據，校正畫質與 point distribution 不具判定意義。
+
+Dynamic NUC 逐幀不讀 SD 卡。常駐 CPU heap 為五組 K/B `6,553,600` bytes，加四組 UINT16 threshold `2,621,440` bytes，共 `9,175,040` bytes；現有 GFX DDR 動態 K/B buffer 另為 `1,310,720` bytes。每 60 張會列出 mmap/cache、CPU 選表、K/B cache flush、三者合計的 `CPU added`、GFX 與 NUC 總耗時平均值、最大值、pipeline FPS，以及 P1 到 P5 的 Pixel 分布。`CPU added` 是相對原本固定 table NUC 新增的主要 CPU 成本；30 FPS 的單幀時間預算約為 `33.3 ms`。關閉 Dynamic NUC 時會釋放來源 table/threshold，並重新載入 Sensor Temperature table；Dynamic NUC 開啟期間不執行週期性的 Sensor Temperature table 更新。
 
 NUC 校正開始前會先等待正在執行的自動 shutter cycle 完成；接著暫停 interval 觸發的 FFC／Runtime BPR 關快門，讓 Low／High RAW 擷取期間保持快門開啟。校正成功或失敗離開時都會恢復自動 shutter cycle，並從完整的 `shutter_interval_sec` 重新計時。
 
@@ -455,9 +502,27 @@ offset         = -10
 expected output = 1990
 ```
 
+## VideoProc / ISP
+
+主選單選擇 `9. VideoProc / ISP`，或選擇 `CFG Setting -> VideoProc / ISP setting`：
+
+```text
+VideoProc / ISP setting
+ 1. AF on/off
+ 2. WDR on/off
+ 3. DEFOG on/off
+ 4. 3DNR + 3DNR statistics on/off
+ 5. All on
+ 6. All off
+ 7. Gamma status
+ 0. Back
+```
+
+個別項目會要求明確輸入 `0: off` 或 `1: on`；`All on`／`All off` 會將四個 CFG 欄位一次交易式寫入。選單同時顯示目前 runtime 與 pending CFG，設定必須執行 `Liveview Restart` 才套用。3DNR 關閉後不會建立、設定或啟動 `HD_VIDEOPROC_0_OUT_4` reference path；開啟時會同時加入 `HD_VIDEOPROC_FUNC_3DNR` 與 `HD_VIDEOPROC_FUNC_3DNR_STA`。
+
 ## Gamma
 
-Gamma 選單只保留 runtime 狀態：
+Gamma 入口已整合至 `VideoProc / ISP -> Gamma status`，只保留 runtime 狀態：
 
 ```text
 Gamma status

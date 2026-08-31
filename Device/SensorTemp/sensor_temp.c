@@ -2,8 +2,8 @@
 
 #include <stdint.h>
 
-#include "../Driver/SPI/spi.h"
-#include "../Driver/I2C/i2c.h"
+#include "../../Driver/SPI/spi.h"
+#include "../../Driver/I2C/i2c.h"
 
 #define SENSOR_TEMP_FRAME_SIZE 4U
 #define SENSOR_TEMP_ADC_SCALE 0.0000625f

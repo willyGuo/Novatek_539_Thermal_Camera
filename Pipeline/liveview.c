@@ -24,18 +24,26 @@
 #if defined(__LINUX)
 #include <dirent.h>
 #include <errno.h>
+#include <sys/stat.h>
 #endif
 #include "hdal.h"
 #include "vendor_videocapture.h"
 #include "vendor_videoprocess.h"
 #include "../Config/app_config.h"
 #include "../Config/hardware_config.h"
+#include "../Device/FOS/fos.h"
 #include "vendor_isp.h"
-#include "../Algorithm/BPR/bpr.h"
-#include "../Algorithm/FFC/ffc.h"
-#include "../Algorithm/NUC/nuc.h"
-#include "../Algorithm/TDC/tdc.h" 
+#include "../Correction/BPR/bpr.h"
+#include "../Correction/FFC/ffc.h"
+#include "../Correction/NUC/nuc.h"
+#include "../Correction/TDC/tdc.h"
+#include "../Enhancement/AGC/agc_fieldscale.h"
+#include "../Enhancement/AGC/agc_histogram_p1_p99.h"
+#include "../Enhancement/AGC/agc_min_max_tone_curve.h"
+#include "../Enhancement/AGC/agc_mode.h"
 #include "../Enhancement/Gamma/gamma.h"
+#include "../Enhancement/ISP/videoproc_isp.h"
+#include "../Diagnostics/ISP/isp_raw_to_y_step_diagnostic.h"
 #include "../Driver/GPIO/gpio_control.h"
 #include "Output/video_output.h"
 
@@ -86,14 +94,27 @@
 #define SHUTTER_CALIBRATION_PAUSED    1
 #define RAW_STATS_WAIT_TIMEOUT_MS     1000U
 #define YUV_STATS_WAIT_TIMEOUT_MS     1000U
+#define ISP_STEP_TEST_WAIT_TIMEOUT_SEC 30U
 
-#define SNAPSHOT_DIR                  "/mnt/sd"
+#define THERMAL_SNAPSHOT_DIR          "/mnt/sd/thermal_snapshot"
+#define RAW_SNAPSHOT_DIR              THERMAL_SNAPSHOT_DIR "/raw"
+#define DISPLAY_DIAG_DIR              THERMAL_SNAPSHOT_DIR "/display_diag"
 #define SNAPSHOT_PREFIX               "snapshot_"
+#define DISPLAY_DIAG_PREFIX           "display_diag_"
 #define SNAPSHOT_FRAME_BYTES          \
 	((size_t)RAW_ACTIVE_W * RAW_ACTIVE_H * sizeof(UINT16))
 
 #define FFC_AVERAGE_FRAME_COUNT 4U
 #define FFC_AVERAGE_SHIFT       2U
+#define FFC_TEST_SAMPLE_COUNT   10U
+
+#if (AGC_MIN_MAX_TONE_CURVE_LEFT_LUT_COUNT != IQ_TONE_LEFT_NUM)
+#error "Min/Max Tone Curve AGC left LUT size does not match the ISP SDK"
+#endif
+
+#if (AGC_MIN_MAX_TONE_CURVE_RIGHT_LUT_COUNT != IQ_TONE_RIGHT_NUM)
+#error "Min/Max Tone Curve AGC right LUT size does not match the ISP SDK"
+#endif
 
 #if (FFC_AVERAGE_FRAME_COUNT != 4U)
 #error "FFC averaging currently supports exactly 4 frames"
@@ -133,7 +154,6 @@
 #define RTSP_OUTPUT_BITRATE_BPS  (4U * 1024U * 1024U)
 
 #define VIDEOCAP_ALG_FUNC 0//HD_VIDEOCAP_FUNC_AE | HD_VIDEOCAP_FUNC_AWB
-#define VIDEOPROC_ALG_FUNC HD_VIDEOPROC_FUNC_AF | HD_VIDEOPROC_FUNC_WDR | HD_VIDEOPROC_FUNC_DEFOG | HD_VIDEOPROC_FUNC_3DNR | HD_VIDEOPROC_FUNC_3DNR_STA
 
 static UINT32 g_fps = 30;
 static VIDEO_OUTPUT_MODE g_output_mode = VIDEO_OUTPUT_MODE_UVC;
@@ -150,11 +170,65 @@ static UINTPTR g_raw_copy_dst_va = 0;
 static UINT32 g_raw_copy_size = 0;
 static volatile int g_raw_stats_pending = 1;
 static volatile int g_yuv_stats_pending = 0;
+static UINT32 g_yuv_diag_id = 0;
+static UINT32 g_display_diag_count = 0;
+static VIDEO_OUTPUT *g_diagnostic_video_output = NULL;
 static int g_proc_input_format_logged = 0;
 static UINT64 g_shutter_next_calibration_ms = 0;
 static int g_manual_calibration_active = 0;
 static int g_shutter_reschedule_after_manual_calibration = 0;
+static int display_diag_get_next_id(UINT32 *p_diag_id);
 ///////////////////////////////////////////////////////////////////////////////
+
+static int liveview_prepare_output_directories(void)
+{
+#if defined(__LINUX)
+	const char *directories[] = {
+		THERMAL_SNAPSHOT_DIR,
+		RAW_SNAPSHOT_DIR,
+		DISPLAY_DIAG_DIR,
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+		struct stat path_stat;
+
+		if (mkdir(directories[i], 0775) == 0) {
+			continue;
+		}
+		if (errno == EEXIST && stat(directories[i], &path_stat) == 0 &&
+		    S_ISDIR(path_stat.st_mode)) {
+			continue;
+		}
+		printf("create output directory %s fail: %s\n",
+		       directories[i], strerror(errno));
+		return -1;
+	}
+#endif
+
+	return 0;
+}
+
+static UINT32 liveview_get_videoproc_alg_func(void)
+{
+	UINT32 func = 0;
+
+	if (videoproc_isp_is_af_enabled()) {
+		func |= HD_VIDEOPROC_FUNC_AF;
+	}
+	if (videoproc_isp_is_wdr_enabled()) {
+		func |= HD_VIDEOPROC_FUNC_WDR;
+	}
+	if (videoproc_isp_is_defog_enabled()) {
+		func |= HD_VIDEOPROC_FUNC_DEFOG;
+	}
+	if (videoproc_isp_is_3dnr_enabled()) {
+		func |= HD_VIDEOPROC_FUNC_3DNR |
+			HD_VIDEOPROC_FUNC_3DNR_STA;
+	}
+
+	return func;
+}
 
 static int liveview_request_raw_copy(UINTPTR dst_va, UINT32 size)
 {
@@ -224,6 +298,9 @@ static int liveview_request_raw_statistics(void)
 static int liveview_request_yuv_statistics(void)
 {
 	UINT32 wait_count = 0;
+	UINT32 diag_id;
+	char mjpeg_path[192];
+	HD_RESULT encoded_ret = HD_ERR_NG;
 
 	if (!liveview_is_running()) {
 		printf("YUV statistics unavailable: Liveview is stopped\n");
@@ -233,8 +310,22 @@ static int liveview_request_yuv_statistics(void)
 	if (g_yuv_stats_pending) {
 		printf("YUV statistics request is already pending\n");
 	} else {
-		printf("YUV statistics requested for the next VideoProc output frame\n");
+		if (display_diag_get_next_id(&diag_id) != 0) {
+			printf("allocate display diagnostic sequence fail\n");
+			return -1;
+		}
+		g_yuv_diag_id = diag_id;
 		g_yuv_stats_pending = 1;
+		snprintf(mjpeg_path, sizeof(mjpeg_path),
+			 DISPLAY_DIAG_DIR "/display_diag_%04u_uvc_mjpeg_%ux%u.jpg",
+			 diag_id, VIDEO_OUTPUT_WIDTH, VIDEO_OUTPUT_HEIGHT);
+		if (g_diagnostic_video_output != NULL) {
+			encoded_ret = video_output_request_encoded_snapshot(
+				g_diagnostic_video_output, mjpeg_path);
+		}
+		printf("Display diagnostic %04u requested for the next VideoProc "
+		       "Y frame; MJPEG=%s\n", diag_id,
+		       encoded_ret == HD_OK ? "requested" : "unavailable");
 	}
 
 	while (g_yuv_stats_pending && wait_count < YUV_STATS_WAIT_TIMEOUT_MS) {
@@ -257,6 +348,18 @@ static UINT64 liveview_get_time_ms(void)
 	}
 
 	return (UINT64)ts.tv_sec * 1000 + (UINT64)ts.tv_nsec / 1000000;
+}
+
+static UINT64 liveview_get_time_us(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0;
+	}
+
+	return (UINT64)ts.tv_sec * 1000000U +
+		(UINT64)ts.tv_nsec / 1000U;
 }
 
 static void liveview_sleep_ms(UINT32 duration_ms)
@@ -311,8 +414,8 @@ static HD_RESULT mem_init(void)
     													+VDO_LA_BUF_SIZE(LA_WIN_NUM_W, LA_WIN_NUM_H);
 
 	mem_cfg.pool_info[id].blk_size += VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
-	mem_cfg.pool_info[id].blk_cnt = 2 + 8;
-	// 8 => TDC out + NUC k + NUC b + NUC out + FFC k + FFC b + FFC out + FFC sum
+	mem_cfg.pool_info[id].blk_cnt = 2 + 10;
+	// 10 => TDC out + NUC k + NUC b + NUC out + FFC k + FFC b + FFC out + FFC sum + shared CPU AGC out + ISP step test
 	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
 
 	// config common pool (main)
@@ -432,6 +535,7 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 	HD_VIDEOPROC_CTRL video_ctrl_param = {0};
 	HD_VIDEOPROC_LL_CONFIG video_ll_param = {0};
 	HD_PATH_ID video_proc_ctrl = 0;
+	UINT32 alg_func = liveview_get_videoproc_alg_func();
 
 	ret = hd_videoproc_open(0, _out_id, &video_proc_ctrl); //open this for device control
 	if (ret != HD_OK)
@@ -440,7 +544,7 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 	if (p_max_dim != NULL ) {
 		video_cfg_param.pipe = HD_VIDEOPROC_PIPE_RAWALL;
 		video_cfg_param.isp_id = g_thermal_pipeline_id;
-		video_cfg_param.ctrl_max.func = VIDEOPROC_ALG_FUNC;
+		video_cfg_param.ctrl_max.func = alg_func;
 		video_cfg_param.in_max.func = 0;
 		video_cfg_param.in_max.dim.w = p_max_dim->w;
 		video_cfg_param.in_max.dim.h = p_max_dim->h;
@@ -470,12 +574,20 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 	}
 
 
-	video_ctrl_param.func = VIDEOPROC_ALG_FUNC;
-	video_ctrl_param.ref_path_3dnr = HD_VIDEOPROC_0_OUT_4;
+	video_ctrl_param.func = alg_func;
+	if (videoproc_isp_is_3dnr_enabled()) {
+		video_ctrl_param.ref_path_3dnr = HD_VIDEOPROC_0_OUT_4;
+	}
 	ret = hd_videoproc_set(video_proc_ctrl, HD_VIDEOPROC_PARAM_CTRL, &video_ctrl_param);
 
 	video_ll_param.delay_trig_lowlatency = 0;
 	ret = hd_videoproc_set(video_proc_ctrl, HD_VIDEOPROC_PARAM_LL_CONFIG, &video_ll_param);
+	printf("VideoProc / ISP runtime: AF=%s, WDR=%s, DEFOG=%s, 3DNR=%s, func=0x%x\n",
+	       videoproc_isp_is_af_enabled() ? "on" : "off",
+	       videoproc_isp_is_wdr_enabled() ? "on" : "off",
+	       videoproc_isp_is_defog_enabled() ? "on" : "off",
+	       videoproc_isp_is_3dnr_enabled() ? "on" : "off",
+	       alg_func);
 
 	*p_video_proc_ctrl = video_proc_ctrl;
 
@@ -517,6 +629,58 @@ static HD_RESULT set_proc_param(HD_PATH_ID video_proc_path, HD_DIM* p_dim,
 		ret = hd_videoproc_set(video_proc_path, HD_VIDEOPROC_PARAM_FUNC_CONFIG, &video_path_param);
 	}
 	return ret;
+}
+
+static HD_RESULT liveview_bypass_isp_tone_for_cpu_agc(void)
+{
+	IQT_TONE_PARAM tone = {0};
+	IQT_TONE_PARAM verify = {0};
+	HD_RESULT ret;
+	UINT32 previous_enable;
+
+	if (!agc_histogram_p1_p99_is_enabled() &&
+	    !agc_fieldscale_is_enabled()) {
+		return HD_OK;
+	}
+
+	tone.id = g_thermal_pipeline_id;
+	ret = vendor_isp_get_iq(IQT_ITEM_TONE_PARAM, &tone);
+	if (ret != HD_OK) {
+		printf("%s: get ISP Tone Curve failed=%d\n",
+		       agc_mode_name(agc_mode_get()), ret);
+		return ret;
+	}
+
+	previous_enable = tone.tone.enable;
+	if (previous_enable) {
+		tone.tone.enable = 0;
+		ret = vendor_isp_set_iq(IQT_ITEM_TONE_PARAM, &tone);
+		if (ret != HD_OK) {
+			printf("%s: disable ISP Tone Curve failed=%d\n",
+			       agc_mode_name(agc_mode_get()), ret);
+			return ret;
+		}
+
+		verify.id = g_thermal_pipeline_id;
+		ret = vendor_isp_get_iq(IQT_ITEM_TONE_PARAM, &verify);
+		if (ret != HD_OK || verify.tone.enable) {
+			printf("%s: verify ISP Tone Curve bypass "
+			       "failed, get=%d, enable=%u\n",
+			       agc_mode_name(agc_mode_get()),
+			       ret,
+			       ret == HD_OK ?
+				(unsigned int)verify.tone.enable : 1U);
+			return ret == HD_OK ? HD_ERR_NG : ret;
+		}
+	}
+
+	printf("%s: ISP Tone Curve bypassed "
+	       "(previous enable=%u, mode=%u, auto_sel=%u)\n",
+	       agc_mode_name(agc_mode_get()),
+	       previous_enable,
+	       (unsigned int)tone.tone.mode,
+	       (unsigned int)tone.tone.auto_sel);
+	return HD_OK;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -581,6 +745,22 @@ typedef struct _VIDEO_LIVEVIEW {
 	UINTPTR thermal_ffc_b_frame_pa;
 	UINTPTR thermal_ffc_b_frame_va;
 
+	HD_COMMON_MEM_VB_BLK thermal_agc_histogram_p1_p99_out_blk;
+	UINTPTR thermal_agc_histogram_p1_p99_out_pa;
+	UINTPTR thermal_agc_histogram_p1_p99_out_va;
+	uint32_t *agc_histogram_p1_p99_workspace;
+	AGC_FIELDSCALE_STATE agc_fieldscale_state;
+	UINT32 agc_histogram_p1_p99_frame_count;
+	UINT32 agc_histogram_p1_p99_error_count;
+	UINT32 agc_fieldscale_frame_count;
+	UINT32 agc_fieldscale_error_count;
+	UINT32 agc_min_max_tone_curve_frame_count;
+	UINT32 agc_min_max_tone_curve_error_count;
+
+	HD_COMMON_MEM_VB_BLK thermal_isp_step_test_blk;
+	UINTPTR thermal_isp_step_test_pa;
+	UINTPTR thermal_isp_step_test_va;
+
 } VIDEO_LIVEVIEW;
 
 typedef struct {
@@ -610,8 +790,10 @@ typedef struct {
 	pthread_cond_t cond;
 	unsigned char *input_buffer;
 	unsigned char *corrected_buffer;
+	unsigned char *agc_output_buffer;
 	UINT32 snapshot_id;
 	int final_is_input;
+	int has_agc_output;
 	int thread_created;
 	int exit_requested;
 	int pending;
@@ -628,11 +810,276 @@ static pthread_mutex_t g_liveview_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_liveview_fault_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_shutter_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_manual_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_ffc_test_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ffc_test_cond = PTHREAD_COND_INITIALIZER;
 static int g_liveview_shutter_fault = 0;
 static int g_liveview_stop_request = 0;
 static int g_liveview_fault_stop_worker_active = 0;
+static int g_ffc_test_pending = 0;
+static int g_ffc_test_running = 0;
+static int g_ffc_test_worker_active = 0;
+static int g_ffc_test_result = -1;
+static pthread_mutex_t g_isp_step_test_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_isp_step_test_cond = PTHREAD_COND_INITIALIZER;
+static int g_isp_step_test_pending = 0;
+static int g_isp_step_test_running = 0;
+static int g_isp_step_test_result = -1;
+static int g_isp_step_test_expected_valid = 0;
+static UINT32 g_isp_step_test_run_id = 0;
+static UINT32 g_isp_step_test_min_raw_dn = 0U;
+static UINT32 g_isp_step_test_max_raw_dn = ISP_RAW_TO_Y_STEP_RAW14_MAX;
+static UINT64 g_isp_step_test_expected_timestamp = 0;
+static UINT64 g_isp_step_test_expected_count = 0;
 
 static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx);
+
+static int liveview_request_ffc_test(void)
+{
+	int result;
+
+	pthread_mutex_lock(&g_ffc_test_lock);
+	if (!g_liveview.running || !g_ffc_test_worker_active) {
+		printf("Run FFC test unavailable: Liveview pipeline is not running\n");
+		pthread_mutex_unlock(&g_ffc_test_lock);
+		return -1;
+	}
+	if (g_ffc_test_pending || g_ffc_test_running) {
+		printf("Run FFC test is already pending\n");
+		pthread_mutex_unlock(&g_ffc_test_lock);
+		return -1;
+	}
+
+	g_ffc_test_result = -1;
+	g_ffc_test_pending = 1;
+	while (g_ffc_test_pending || g_ffc_test_running) {
+		pthread_cond_wait(&g_ffc_test_cond, &g_ffc_test_lock);
+	}
+	result = g_ffc_test_result;
+	pthread_mutex_unlock(&g_ffc_test_lock);
+
+	return result;
+}
+
+static int liveview_take_ffc_test_request(void)
+{
+	int requested = 0;
+
+	pthread_mutex_lock(&g_ffc_test_lock);
+	if (g_ffc_test_pending) {
+		g_ffc_test_pending = 0;
+		g_ffc_test_running = 1;
+		requested = 1;
+	}
+	pthread_mutex_unlock(&g_ffc_test_lock);
+
+	return requested;
+}
+
+static void liveview_finish_ffc_test(int result)
+{
+	pthread_mutex_lock(&g_ffc_test_lock);
+	if (g_ffc_test_pending || g_ffc_test_running) {
+		g_ffc_test_pending = 0;
+		g_ffc_test_running = 0;
+		g_ffc_test_result = result;
+		pthread_cond_broadcast(&g_ffc_test_cond);
+	}
+	pthread_mutex_unlock(&g_ffc_test_lock);
+}
+
+static void liveview_set_ffc_test_worker_active(int active)
+{
+	pthread_mutex_lock(&g_ffc_test_lock);
+	g_ffc_test_worker_active = active ? 1 : 0;
+	if (!g_ffc_test_worker_active &&
+	    (g_ffc_test_pending || g_ffc_test_running)) {
+		g_ffc_test_pending = 0;
+		g_ffc_test_running = 0;
+		g_ffc_test_result = -1;
+		pthread_cond_broadcast(&g_ffc_test_cond);
+	}
+	pthread_mutex_unlock(&g_ffc_test_lock);
+}
+
+static int liveview_run_isp_raw_to_y_step_diagnostic_range(UINT32 min_raw_dn,
+						      UINT32 max_raw_dn)
+{
+	struct timespec deadline;
+	UINT32 run_id;
+	int wait_ret = 0;
+	int result;
+	int calibration_active;
+	int ffc_test_active;
+
+	if (!liveview_is_running()) {
+		printf("ISP RAW-to-Y Step Test unavailable: Liveview is stopped\n");
+		return -1;
+	}
+	if (!agc_histogram_p1_p99_is_enabled()) {
+		printf("ISP RAW-to-Y Step Test unavailable: enable Histogram P1/P99 AGC (CPU) and restart Liveview first\n");
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	calibration_active = g_manual_calibration_active;
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	if (calibration_active) {
+		printf("ISP RAW-to-Y Step Test unavailable: calibration is active\n");
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_ffc_test_lock);
+	ffc_test_active = g_ffc_test_pending || g_ffc_test_running;
+	pthread_mutex_unlock(&g_ffc_test_lock);
+	if (ffc_test_active) {
+		printf("ISP RAW-to-Y Step Test unavailable: FFC test is active\n");
+		return -1;
+	}
+	if (g_yuv_stats_pending) {
+		printf("ISP RAW-to-Y Step Test unavailable: YUV diagnostic is pending\n");
+		return -1;
+	}
+	if (isp_raw_to_y_step_diagnostic_get_next_run_id(&run_id) != 0) {
+		return -1;
+	}
+	if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+		printf("ISP RAW-to-Y Step Test: get timeout clock fail\n");
+		return -1;
+	}
+	deadline.tv_sec += ISP_STEP_TEST_WAIT_TIMEOUT_SEC;
+
+	pthread_mutex_lock(&g_isp_step_test_lock);
+	if (g_isp_step_test_pending || g_isp_step_test_running) {
+		printf("ISP RAW-to-Y Step Test is already pending\n");
+		pthread_mutex_unlock(&g_isp_step_test_lock);
+		return -1;
+	}
+	g_isp_step_test_run_id = run_id;
+	g_isp_step_test_min_raw_dn = min_raw_dn;
+	g_isp_step_test_max_raw_dn = max_raw_dn;
+	g_isp_step_test_result = -1;
+	g_isp_step_test_expected_valid = 0;
+	g_isp_step_test_pending = 1;
+	printf("ISP RAW-to-Y Step Test %04u requested (input %u..%u); "
+	       "waiting for matching VideoProc output\n",
+	       run_id, min_raw_dn, max_raw_dn);
+	while ((g_isp_step_test_pending || g_isp_step_test_running) &&
+	       wait_ret == 0) {
+		wait_ret = pthread_cond_timedwait(&g_isp_step_test_cond,
+			&g_isp_step_test_lock, &deadline);
+	}
+	if (g_isp_step_test_pending || g_isp_step_test_running) {
+		g_isp_step_test_pending = 0;
+		g_isp_step_test_running = 0;
+		g_isp_step_test_expected_valid = 0;
+		g_isp_step_test_result = -1;
+		printf("ISP RAW-to-Y Step Test %04u timeout; matching timestamp/count was not received\n",
+		       run_id);
+	}
+	result = g_isp_step_test_result;
+	pthread_mutex_unlock(&g_isp_step_test_lock);
+
+	return result;
+}
+
+int liveview_run_isp_raw_to_y_step_diagnostic(void)
+{
+	return liveview_run_isp_raw_to_y_step_diagnostic_range(
+		0U, ISP_RAW_TO_Y_STEP_RAW14_MAX);
+}
+
+int liveview_run_isp_raw12_to_y_step_diagnostic(void)
+{
+	return liveview_run_isp_raw_to_y_step_diagnostic_range(
+		0U, ISP_RAW_TO_Y_STEP_RAW12_MAX);
+}
+
+int liveview_run_isp_raw14_fine_step_diagnostic(void)
+{
+	return liveview_run_isp_raw_to_y_step_diagnostic_range(
+		ISP_RAW_TO_Y_STEP_FINE_MIN, ISP_RAW_TO_Y_STEP_FINE_MAX);
+}
+
+static int liveview_take_isp_step_test_request(UINT32 *run_id,
+					       UINT32 *min_raw_dn,
+					       UINT32 *max_raw_dn)
+{
+	int requested = 0;
+
+	if (run_id == NULL || min_raw_dn == NULL || max_raw_dn == NULL) {
+		return 0;
+	}
+	pthread_mutex_lock(&g_isp_step_test_lock);
+	if (g_isp_step_test_pending) {
+		g_isp_step_test_pending = 0;
+		g_isp_step_test_running = 1;
+		*run_id = g_isp_step_test_run_id;
+		*min_raw_dn = g_isp_step_test_min_raw_dn;
+		*max_raw_dn = g_isp_step_test_max_raw_dn;
+		requested = 1;
+	}
+	pthread_mutex_unlock(&g_isp_step_test_lock);
+
+	return requested;
+}
+
+static void liveview_set_isp_step_test_expected(UINT32 run_id,
+						 UINT64 timestamp,
+						 UINT64 count)
+{
+	pthread_mutex_lock(&g_isp_step_test_lock);
+	if (g_isp_step_test_running && g_isp_step_test_run_id == run_id) {
+		g_isp_step_test_expected_timestamp = timestamp;
+		g_isp_step_test_expected_count = count;
+		g_isp_step_test_expected_valid =
+			(timestamp != 0U || count != 0U) ? 1 : 0;
+		printf("ISP RAW-to-Y Step Test %04u input submitted: timestamp=%llu, count=%llu\n",
+		       run_id, (unsigned long long)timestamp,
+		       (unsigned long long)count);
+	}
+	pthread_mutex_unlock(&g_isp_step_test_lock);
+}
+
+static int liveview_match_isp_step_test_output(
+	const HD_VIDEO_FRAME *frame, UINT32 *run_id,
+	UINT32 *min_raw_dn, UINT32 *max_raw_dn)
+{
+	int matched = 0;
+
+	if (frame == NULL || run_id == NULL || min_raw_dn == NULL ||
+	    max_raw_dn == NULL) {
+		return 0;
+	}
+	pthread_mutex_lock(&g_isp_step_test_lock);
+	if (g_isp_step_test_running && g_isp_step_test_expected_valid &&
+	    ((g_isp_step_test_expected_timestamp != 0U &&
+	      frame->timestamp == g_isp_step_test_expected_timestamp) ||
+	     (frame->timestamp == 0U &&
+	      g_isp_step_test_expected_count != 0U &&
+	      frame->count == g_isp_step_test_expected_count))) {
+		*run_id = g_isp_step_test_run_id;
+		*min_raw_dn = g_isp_step_test_min_raw_dn;
+		*max_raw_dn = g_isp_step_test_max_raw_dn;
+		matched = 1;
+		g_isp_step_test_expected_valid = 0;
+	}
+	pthread_mutex_unlock(&g_isp_step_test_lock);
+
+	return matched;
+}
+
+static void liveview_finish_isp_step_test(int result)
+{
+	pthread_mutex_lock(&g_isp_step_test_lock);
+	if (g_isp_step_test_pending || g_isp_step_test_running) {
+		g_isp_step_test_pending = 0;
+		g_isp_step_test_running = 0;
+		g_isp_step_test_expected_valid = 0;
+		g_isp_step_test_result = result;
+		pthread_cond_broadcast(&g_isp_step_test_cond);
+	}
+	pthread_mutex_unlock(&g_isp_step_test_lock);
+}
 
 static void liveview_set_shutter_fault(int fault)
 {
@@ -889,6 +1336,57 @@ exit:
 	return ret;
 }
 
+static int save_y8_diagnostic_buffer(const unsigned char *y_buffer,
+	size_t y_size, const char *file_path)
+{
+	FILE *fp = NULL;
+	size_t write_size;
+	int ret = -1;
+
+	if (y_buffer == NULL || y_size == 0 || file_path == NULL) {
+		return -1;
+	}
+
+	fp = fopen(file_path, "wb");
+	if (fp == NULL) {
+		printf("VideoProc Y8 diagnostic open %s fail\n", file_path);
+		goto exit;
+	}
+	write_size = fwrite(y_buffer, 1, y_size, fp);
+	if (write_size != y_size || ferror(fp)) {
+		printf("VideoProc Y8 diagnostic write %s fail, size=%u expected=%u\n",
+		       file_path, (unsigned int)write_size,
+		       (unsigned int)y_size);
+		goto exit;
+	}
+	if (fflush(fp) != 0) {
+		printf("VideoProc Y8 diagnostic flush %s fail\n", file_path);
+		goto exit;
+	}
+#if defined(__LINUX)
+	if (fsync(fileno(fp)) != 0) {
+		printf("VideoProc Y8 diagnostic sync %s fail: %s\n",
+		       file_path, strerror(errno));
+		goto exit;
+	}
+#endif
+	if (fclose(fp) != 0) {
+		fp = NULL;
+		printf("VideoProc Y8 diagnostic close %s fail\n", file_path);
+		goto exit;
+	}
+	fp = NULL;
+	printf("VideoProc Y8 diagnostic saved: %s (%u bytes)\n",
+	       file_path, (unsigned int)y_size);
+	ret = 0;
+
+exit:
+	if (fp != NULL) {
+		fclose(fp);
+	}
+	return ret;
+}
+
 static void print_requested_raw_frame_stats(const HD_VIDEO_FRAME *p_video_frame)
 {
 	UINTPTR blk_pa;
@@ -1009,6 +1507,26 @@ static void print_requested_raw_frame_stats(const HD_VIDEO_FRAME *p_video_frame)
 	g_raw_stats_pending = 0;
 }
 
+static UINT8 yuv_histogram_percentile(const UINT64 histogram[256],
+	UINT64 pixel_count, UINT32 percentile)
+{
+	UINT64 target_index;
+	UINT64 cumulative = 0;
+	UINT32 value;
+
+	if (pixel_count == 0) {
+		return 0;
+	}
+	target_index = ((pixel_count - 1U) * percentile) / 100U;
+	for (value = 0; value < 256U; value++) {
+		cumulative += histogram[value];
+		if (cumulative > target_index) {
+			return (UINT8)value;
+		}
+	}
+	return 255U;
+}
+
 static void print_requested_yuv_frame_stats(const HD_VIDEO_FRAME *p_video_frame)
 {
 	UINTPTR blk_pa;
@@ -1023,10 +1541,20 @@ static void print_requested_yuv_frame_stats(const HD_VIDEO_FRAME *p_video_frame)
 	UINT32 height;
 	UINT32 x;
 	UINT32 y;
+	UINT32 value;
 	UINT8 min_value = 0xFF;
 	UINT8 max_value = 0;
+	UINT8 p1;
+	UINT8 p50;
+	UINT8 p99;
 	UINT64 sum = 0;
 	UINT64 pixel_count;
+	UINT64 histogram[256] = {0};
+	UINT64 limited_black_count = 0;
+	UINT64 limited_white_count = 0;
+	UINT32 unique_count = 0;
+	unsigned char *y_buffer = NULL;
+	char file_path[192];
 
 	if (!g_yuv_stats_pending) {
 		return;
@@ -1073,27 +1601,145 @@ static void print_requested_yuv_frame_stats(const HD_VIDEO_FRAME *p_video_frame)
 		return;
 	}
 
+	y_buffer = (unsigned char *)malloc((size_t)width * height);
+	if (y_buffer == NULL) {
+		printf("YUV diagnostic buffer allocation failed; statistics only\n");
+	}
 	hd_common_mem_flush_cache((void *)map_va, map_size);
 	y_va = map_va + data_offset;
 	for (y = 0; y < height; y++) {
 		const UINT8 *row = (const UINT8 *)(y_va + y * stride);
+		if (y_buffer != NULL) {
+			memcpy(y_buffer + (size_t)y * width, row, width);
+		}
 
 		for (x = 0; x < width; x++) {
-			UINT8 value = row[x];
+			UINT8 y_value = row[x];
 
-			if (value < min_value) min_value = value;
-			if (value > max_value) max_value = value;
-			sum += value;
+			if (y_value < min_value) min_value = y_value;
+			if (y_value > max_value) max_value = y_value;
+			sum += y_value;
+			histogram[y_value]++;
 		}
 	}
 	pixel_count = (UINT64)width * height;
-	printf("Y plane stats: min=%u, max=%u, mean=%llu, pixels=%llu\n",
+	p1 = yuv_histogram_percentile(histogram, pixel_count, 1U);
+	p50 = yuv_histogram_percentile(histogram, pixel_count, 50U);
+	p99 = yuv_histogram_percentile(histogram, pixel_count, 99U);
+	for (value = 0; value < 256U; value++) {
+		if (histogram[value] != 0) {
+			unique_count++;
+		}
+		if (value <= 16U) {
+			limited_black_count += histogram[value];
+		}
+		if (value >= 235U) {
+			limited_white_count += histogram[value];
+		}
+	}
+	printf("Y plane stats: min=%u, max=%u, mean=%.4f, pixels=%llu\n",
 	       min_value, max_value,
-	       (unsigned long long)(sum / pixel_count),
+	       (double)sum / (double)pixel_count,
 	       (unsigned long long)pixel_count);
+	printf("Y plane distribution: P1=%u, P50=%u, P99=%u, unique=%u\n",
+	       p1, p50, p99, unique_count);
+	printf("Y plane clipping: zero=%llu (%.4f%%), full255=%llu (%.4f%%)\n",
+	       (unsigned long long)histogram[0],
+	       100.0 * (double)histogram[0] / (double)pixel_count,
+	       (unsigned long long)histogram[255],
+	       100.0 * (double)histogram[255] / (double)pixel_count);
+	printf("Y limited-range risk: Y<=16=%llu (%.4f%%), "
+	       "Y>=235=%llu (%.4f%%)\n",
+	       (unsigned long long)limited_black_count,
+	       100.0 * (double)limited_black_count / (double)pixel_count,
+	       (unsigned long long)limited_white_count,
+	       100.0 * (double)limited_white_count / (double)pixel_count);
 
 	hd_common_mem_munmap((void *)map_va, map_size);
+	if (y_buffer != NULL) {
+		snprintf(file_path, sizeof(file_path),
+			 DISPLAY_DIAG_DIR "/display_diag_%04u_videoproc_y8_%ux%u.raw",
+			 g_yuv_diag_id, width, height);
+		save_y8_diagnostic_buffer(y_buffer,
+			(size_t)width * height, file_path);
+		free(y_buffer);
+	}
 	g_yuv_stats_pending = 0;
+}
+
+static void process_requested_isp_step_test_output(
+	VIDEO_LIVEVIEW *p_stream, const HD_VIDEO_FRAME *frame)
+{
+	UINT32 run_id;
+	UINT32 min_raw_dn;
+	UINT32 max_raw_dn;
+	UINTPTR blk_pa;
+	UINTPTR map_pa;
+	UINTPTR map_va;
+	UINTPTR y_va;
+	UINT32 data_offset;
+	UINT32 stride;
+	UINT32 plane_height;
+	UINT32 map_size;
+	int result;
+
+	if (!liveview_match_isp_step_test_output(frame, &run_id,
+						 &min_raw_dn, &max_raw_dn)) {
+		return;
+	}
+	printf("ISP RAW-to-Y Step Test %04u matching output: timestamp=%llu, count=%llu\n",
+	       run_id, (unsigned long long)frame->timestamp,
+	       (unsigned long long)frame->count);
+	if (p_stream == NULL || p_stream->thermal_isp_step_test_va == 0 ||
+	    frame->phy_addr[0] == 0 || frame->dim.w != RAW_SIZE_W ||
+	    frame->dim.h != RAW_SIZE_H) {
+		printf("ISP RAW-to-Y Step Test: invalid test buffer or output frame\n");
+		liveview_finish_isp_step_test(-1);
+		return;
+	}
+
+	stride = frame->loff[0];
+	plane_height = frame->ph[0] != 0U ? frame->ph[0] : frame->dim.h;
+	if (stride < frame->dim.w || plane_height < frame->dim.h) {
+		printf("ISP RAW-to-Y Step Test: invalid Y plane stride=%u, ph=%u\n",
+		       stride, plane_height);
+		liveview_finish_isp_step_test(-1);
+		return;
+	}
+
+	blk_pa = frame->blk != 0 ? hd_common_mem_blk2pa(frame->blk) : 0;
+	if (blk_pa != 0 && frame->phy_addr[0] >= blk_pa) {
+		map_pa = blk_pa;
+		data_offset = (UINT32)(frame->phy_addr[0] - blk_pa);
+	} else {
+		map_pa = frame->phy_addr[0];
+		data_offset = 0;
+	}
+	map_size = data_offset + stride * plane_height;
+	map_va = (UINTPTR)hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE_CACHE,
+		map_pa, map_size);
+	if (map_va == 0) {
+		printf("ISP RAW-to-Y Step Test: mmap output Y fail\n");
+		liveview_finish_isp_step_test(-1);
+		return;
+	}
+	hd_common_mem_flush_cache((void *)map_va, map_size);
+	y_va = map_va + data_offset;
+	result = isp_raw_to_y_step_diagnostic_save_and_analyze(
+		run_id,
+		min_raw_dn,
+		max_raw_dn,
+		(const uint16_t *)p_stream->thermal_isp_step_test_va,
+		RAW_SIZE_W * sizeof(uint16_t),
+		(const uint8_t *)y_va,
+		stride,
+		frame->dim.w,
+		frame->dim.h);
+	if (hd_common_mem_munmap((void *)map_va, map_size) != HD_OK) {
+		printf("ISP RAW-to-Y Step Test: munmap output Y fail\n");
+		result = -1;
+	}
+	liveview_finish_isp_step_test(result);
 }
 
 static int snapshot_get_next_id(UINT32 *p_snapshot_id)
@@ -1110,9 +1756,9 @@ static int snapshot_get_next_id(UINT32 *p_snapshot_id)
 		int snapshot_found = 0;
 		const size_t prefix_len = sizeof(SNAPSHOT_PREFIX) - 1U;
 
-		dir = opendir(SNAPSHOT_DIR);
+		dir = opendir(RAW_SNAPSHOT_DIR);
 		if (dir == NULL) {
-			printf("snapshot scan %s fail\n", SNAPSHOT_DIR);
+			printf("snapshot scan %s fail\n", RAW_SNAPSHOT_DIR);
 			return -1;
 		}
 
@@ -1160,33 +1806,111 @@ static int snapshot_get_next_id(UINT32 *p_snapshot_id)
 	return 0;
 }
 
-static int snapshot_write_job(UINT32 snapshot_id, int final_is_input)
+static int display_diag_get_next_id(UINT32 *p_diag_id)
+{
+	if (p_diag_id == NULL) {
+		return -1;
+	}
+
+#if defined(__LINUX)
+	{
+		DIR *dir;
+		struct dirent *entry;
+		UINT32 max_diag_id = 0;
+		int diag_found = 0;
+		const size_t prefix_len = sizeof(DISPLAY_DIAG_PREFIX) - 1U;
+
+		dir = opendir(DISPLAY_DIAG_DIR);
+		if (dir == NULL) {
+			printf("display diagnostic scan %s fail\n",
+			       DISPLAY_DIAG_DIR);
+			return -1;
+		}
+
+		while ((entry = readdir(dir)) != NULL) {
+			char *number_end;
+			unsigned long long existing_id;
+
+			if (strncmp(entry->d_name, DISPLAY_DIAG_PREFIX,
+				    prefix_len) != 0) {
+				continue;
+			}
+
+			errno = 0;
+			existing_id = strtoull(entry->d_name + prefix_len,
+					       &number_end, 10);
+			if (errno == ERANGE ||
+			    number_end == entry->d_name + prefix_len ||
+			    *number_end != '_' || existing_id > UINT_MAX) {
+				continue;
+			}
+			if (!diag_found || existing_id > max_diag_id) {
+				max_diag_id = (UINT32)existing_id;
+				diag_found = 1;
+			}
+		}
+		closedir(dir);
+
+		if (diag_found && max_diag_id == UINT_MAX) {
+			printf("display diagnostic sequence is exhausted\n");
+			return -1;
+		}
+		if (diag_found && g_display_diag_count <= max_diag_id) {
+			g_display_diag_count = max_diag_id + 1U;
+			printf("display diagnostic sequence continues at %u\n",
+			       g_display_diag_count);
+		}
+	}
+#endif
+
+	if (g_display_diag_count == UINT_MAX) {
+		printf("display diagnostic sequence is exhausted\n");
+		return -1;
+	}
+	*p_diag_id = g_display_diag_count++;
+	return 0;
+}
+
+static int snapshot_write_job(UINT32 snapshot_id, int final_is_input,
+			      int has_agc_output)
 {
 	char file_path[160];
 	int ret = 0;
 
 	if (final_is_input) {
 		snprintf(file_path, sizeof(file_path),
-			 SNAPSHOT_DIR "/snapshot_%04u_raw16_%ux%u.raw",
+			 RAW_SNAPSHOT_DIR "/snapshot_%04u_raw16_%ux%u.raw",
 			 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
-		return save_raw_buffer(g_snapshot_writer.input_buffer,
-			SNAPSHOT_FRAME_BYTES, file_path);
+		if (save_raw_buffer(g_snapshot_writer.input_buffer,
+				    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
+			ret = -1;
+		}
+	} else {
+		snprintf(file_path, sizeof(file_path),
+			 RAW_SNAPSHOT_DIR "/snapshot_%04u_input_raw16_%ux%u.raw",
+			 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
+		if (save_raw_buffer(g_snapshot_writer.input_buffer,
+				    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
+			ret = -1;
+		}
+
+		snprintf(file_path, sizeof(file_path),
+			 RAW_SNAPSHOT_DIR "/snapshot_%04u_corrected_raw16_%ux%u.raw",
+			 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
+		if (save_raw_buffer(g_snapshot_writer.corrected_buffer,
+				    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
+			ret = -1;
+		}
 	}
 
-	snprintf(file_path, sizeof(file_path),
-		 SNAPSHOT_DIR "/snapshot_%04u_input_raw16_%ux%u.raw",
-		 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
-	if (save_raw_buffer(g_snapshot_writer.input_buffer,
-			    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
-		ret = -1;
-	}
-
-	snprintf(file_path, sizeof(file_path),
-		 SNAPSHOT_DIR "/snapshot_%04u_corrected_raw16_%ux%u.raw",
-		 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
-	if (save_raw_buffer(g_snapshot_writer.corrected_buffer,
-			    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
-		ret = -1;
+	if (has_agc_output) {
+		snprintf(file_path, sizeof(file_path),
+			 RAW_SNAPSHOT_DIR "/snapshot_%04u_agc_output_raw16_%ux%u.raw",
+			 snapshot_id, RAW_ACTIVE_W, RAW_ACTIVE_H);
+		if (save_raw_buffer(g_snapshot_writer.agc_output_buffer,
+				    SNAPSHOT_FRAME_BYTES, file_path) != 0) {
+			ret = -1;
+		}
 	}
 
 	return ret;
@@ -1196,6 +1920,7 @@ static void *snapshot_writer_thread(void *arg)
 {
 	UINT32 snapshot_id;
 	int final_is_input;
+	int has_agc_output;
 	int write_ret;
 
 	(void)arg;
@@ -1214,10 +1939,12 @@ static void *snapshot_writer_thread(void *arg)
 
 		snapshot_id = g_snapshot_writer.snapshot_id;
 		final_is_input = g_snapshot_writer.final_is_input;
+		has_agc_output = g_snapshot_writer.has_agc_output;
 		g_snapshot_writer.pending = 0;
 		pthread_mutex_unlock(&g_snapshot_writer.lock);
 
-		write_ret = snapshot_write_job(snapshot_id, final_is_input);
+		write_ret = snapshot_write_job(snapshot_id, final_is_input,
+					       has_agc_output);
 		printf("Snapshot %04u background save %s\n",
 		       snapshot_id, write_ret == 0 ? "done" : "failed");
 
@@ -1242,11 +1969,16 @@ static int snapshot_writer_start(void)
 		(unsigned char *)malloc(SNAPSHOT_FRAME_BYTES);
 	g_snapshot_writer.corrected_buffer =
 		(unsigned char *)malloc(SNAPSHOT_FRAME_BYTES);
+	g_snapshot_writer.agc_output_buffer =
+		(unsigned char *)malloc(SNAPSHOT_FRAME_BYTES);
 	if (g_snapshot_writer.input_buffer == NULL ||
-	    g_snapshot_writer.corrected_buffer == NULL) {
+	    g_snapshot_writer.corrected_buffer == NULL ||
+	    g_snapshot_writer.agc_output_buffer == NULL) {
 		printf("allocate snapshot writer buffers fail\n");
+		free(g_snapshot_writer.agc_output_buffer);
 		free(g_snapshot_writer.corrected_buffer);
 		free(g_snapshot_writer.input_buffer);
+		g_snapshot_writer.agc_output_buffer = NULL;
 		g_snapshot_writer.corrected_buffer = NULL;
 		g_snapshot_writer.input_buffer = NULL;
 		return -1;
@@ -1255,12 +1987,15 @@ static int snapshot_writer_start(void)
 	g_snapshot_writer.exit_requested = 0;
 	g_snapshot_writer.pending = 0;
 	g_snapshot_writer.busy = 0;
+	g_snapshot_writer.has_agc_output = 0;
 	ret = pthread_create(&g_snapshot_writer.thread_id, NULL,
 			     snapshot_writer_thread, NULL);
 	if (ret != 0) {
 		printf("create snapshot_writer_thread failed=%d\n", ret);
+		free(g_snapshot_writer.agc_output_buffer);
 		free(g_snapshot_writer.corrected_buffer);
 		free(g_snapshot_writer.input_buffer);
+		g_snapshot_writer.agc_output_buffer = NULL;
 		g_snapshot_writer.corrected_buffer = NULL;
 		g_snapshot_writer.input_buffer = NULL;
 		return -1;
@@ -1293,10 +2028,13 @@ static void snapshot_writer_stop(void)
 	g_snapshot_writer.exit_requested = 0;
 	g_snapshot_writer.pending = 0;
 	g_snapshot_writer.busy = 0;
+	g_snapshot_writer.has_agc_output = 0;
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 
+	free(g_snapshot_writer.agc_output_buffer);
 	free(g_snapshot_writer.corrected_buffer);
 	free(g_snapshot_writer.input_buffer);
+	g_snapshot_writer.agc_output_buffer = NULL;
 	g_snapshot_writer.corrected_buffer = NULL;
 	g_snapshot_writer.input_buffer = NULL;
 }
@@ -1326,7 +2064,8 @@ static void snapshot_writer_cancel_request(void)
 }
 
 static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
-	HD_VIDEO_FRAME *p_final_frame, int final_is_input)
+	HD_VIDEO_FRAME *p_final_frame, int final_is_input,
+	HD_VIDEO_FRAME *p_agc_output_frame, int has_agc_output)
 {
 	UINT32 snapshot_id;
 
@@ -1349,6 +2088,14 @@ static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 		snapshot_writer_cancel_request();
 		return -1;
 	}
+	if (has_agc_output &&
+	    copy_active_raw_frame(p_agc_output_frame,
+				  g_snapshot_writer.agc_output_buffer,
+				  SNAPSHOT_FRAME_BYTES) != 0) {
+		printf("snapshot AGC output frame copy fail\n");
+		snapshot_writer_cancel_request();
+		return -1;
+	}
 
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	if (!g_snapshot_writer.thread_created ||
@@ -1360,11 +2107,13 @@ static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 	}
 	g_snapshot_writer.snapshot_id = snapshot_id;
 	g_snapshot_writer.final_is_input = final_is_input;
+	g_snapshot_writer.has_agc_output = has_agc_output ? 1 : 0;
 	g_snapshot_writer.pending = 1;
 	pthread_cond_signal(&g_snapshot_writer.cond);
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 
-	printf("Snapshot %04u copied; background save queued\n", snapshot_id);
+	printf("Snapshot %04u copied; background save queued, AGC output=%s\n",
+	       snapshot_id, has_agc_output ? "yes" : "no");
 	return 0;
 }
 
@@ -1447,10 +2196,78 @@ static int liveview_update_ffc_table_from_average(VIDEO_LIVEVIEW *p_stream,
 					RAW_ACTIVE_H);
 }
 
+static int liveview_run_ffc_gfx_test(VIDEO_LIVEVIEW *p_stream,
+				     UINT32 lineoffset)
+{
+	HD_VIDEO_FRAME average_frame = {0};
+	HD_VIDEO_FRAME output_frame = {0};
+	UINT32 blk_size =
+		VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
+	HD_RESULT ret;
+
+	if (p_stream == NULL || lineoffset == 0 ||
+	    p_stream->thermal_ffc_out_pa == 0 ||
+	    p_stream->thermal_ffc_out_va == 0 ||
+	    p_stream->thermal_ffc_k_frame_pa == 0 ||
+	    p_stream->thermal_ffc_k_frame_va == 0 ||
+	    p_stream->thermal_ffc_b_frame_pa == 0 ||
+	    p_stream->thermal_ffc_sum_pa == 0 ||
+	    p_stream->thermal_ffc_sum_va == 0 ||
+	    p_stream->thermal_ffc_sum_blk == 0) {
+		printf("Run FFC test buffer is invalid\n");
+		return -1;
+	}
+
+	/*
+	 * The four-frame average ends in thermal_ffc_out.  Use the idle
+	 * accumulation buffer as a separate GFX output so input and output do
+	 * not alias during this diagnostic pass.
+	 */
+	memset((void *)p_stream->thermal_ffc_sum_va, 0, blk_size);
+	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_sum_va,
+				  blk_size);
+
+	average_frame.phy_addr[0] = p_stream->thermal_ffc_out_pa;
+	average_frame.blk = p_stream->thermal_ffc_out_blk;
+	average_frame.loff[0] = lineoffset;
+	average_frame.dim.w = RAW_SIZE_W;
+	average_frame.dim.h = RAW_SIZE_H;
+	average_frame.ph[0] = RAW_SIZE_H;
+
+	ret = ffc_apply(&average_frame,
+			&output_frame,
+			p_stream->thermal_ffc_k_frame_pa,
+			p_stream->thermal_ffc_b_frame_pa,
+			p_stream->thermal_ffc_sum_pa,
+			p_stream->thermal_ffc_sum_blk,
+			RAW_SIZE_W,
+			RAW_SIZE_H);
+	if (ret != HD_OK) {
+		printf("Run FFC test GFX apply fail=%d\n", ret);
+		return -1;
+	}
+
+	/* Follow the SDK GFX sample pattern before CPU reads a GFX output VA. */
+	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_sum_va,
+				  blk_size);
+
+	return ffc_compare_gfx_samples(
+		p_stream->thermal_ffc_out_va,
+		p_stream->thermal_ffc_k_frame_va,
+		p_stream->thermal_ffc_sum_va,
+		lineoffset,
+		RAW_ACTIVE_X,
+		RAW_ACTIVE_Y,
+		RAW_ACTIVE_W,
+		RAW_ACTIVE_H,
+		FFC_TEST_SAMPLE_COUNT);
+}
+
 static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 {
 	UINT32 i;
 	UINT32 blk_size = VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
+	size_t histogram_bins;
 
 	// init TDC output frame
 	p_stream->thermal_tdc_out_blk = hd_common_mem_get_block(
@@ -1632,6 +2449,72 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	memset((void *)p_stream->thermal_ffc_sum_va, 0, blk_size);
 	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_sum_va, blk_size);
 
+	// init shared CPU AGC output frame
+	p_stream->thermal_agc_histogram_p1_p99_out_blk =
+		hd_common_mem_get_block(
+			HD_COMMON_MEM_COMMON_POOL, blk_size, DDR_ID0);
+	if (p_stream->thermal_agc_histogram_p1_p99_out_blk == 0) {
+		printf("get shared CPU AGC output block fail\n");
+		return HD_ERR_NG;
+	}
+
+	p_stream->thermal_agc_histogram_p1_p99_out_pa =
+		hd_common_mem_blk2pa(
+			p_stream->thermal_agc_histogram_p1_p99_out_blk);
+	if (p_stream->thermal_agc_histogram_p1_p99_out_pa == 0) {
+		printf("blk2pa shared CPU AGC output block fail\n");
+		return HD_ERR_NG;
+	}
+
+	p_stream->thermal_agc_histogram_p1_p99_out_va =
+		(UINTPTR)hd_common_mem_mmap(
+			HD_COMMON_MEM_MEM_TYPE_CACHE,
+			p_stream->thermal_agc_histogram_p1_p99_out_pa,
+			blk_size);
+	if (p_stream->thermal_agc_histogram_p1_p99_out_va == 0) {
+		printf("mmap shared CPU AGC output block fail\n");
+		return HD_ERR_NG;
+	}
+	memset((void *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+	       0, blk_size);
+	hd_common_mem_flush_cache(
+		(void *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+		blk_size);
+
+	histogram_bins = agc_histogram_p1_p99_workspace_bins();
+	p_stream->agc_histogram_p1_p99_workspace =
+		(uint32_t *)calloc(histogram_bins, sizeof(uint32_t));
+	if (p_stream->agc_histogram_p1_p99_workspace == NULL) {
+		printf("allocate Histogram P1/P99 AGC workspace fail, bins=%zu\n",
+		       histogram_bins);
+		return HD_ERR_NG;
+	}
+	agc_fieldscale_state_reset(&p_stream->agc_fieldscale_state);
+
+	// init ISP RAW14-to-Y8 step-test input frame
+	p_stream->thermal_isp_step_test_blk = hd_common_mem_get_block(
+		HD_COMMON_MEM_COMMON_POOL, blk_size, DDR_ID0);
+	if (p_stream->thermal_isp_step_test_blk == 0) {
+		printf("get ISP RAW-to-Y Step Test input block fail\n");
+		return HD_ERR_NG;
+	}
+	p_stream->thermal_isp_step_test_pa = hd_common_mem_blk2pa(
+		p_stream->thermal_isp_step_test_blk);
+	if (p_stream->thermal_isp_step_test_pa == 0) {
+		printf("blk2pa ISP RAW-to-Y Step Test input block fail\n");
+		return HD_ERR_NG;
+	}
+	p_stream->thermal_isp_step_test_va = (UINTPTR)hd_common_mem_mmap(
+		HD_COMMON_MEM_MEM_TYPE_CACHE,
+		p_stream->thermal_isp_step_test_pa, blk_size);
+	if (p_stream->thermal_isp_step_test_va == 0) {
+		printf("mmap ISP RAW-to-Y Step Test input block fail\n");
+		return HD_ERR_NG;
+	}
+	memset((void *)p_stream->thermal_isp_step_test_va, 0, blk_size);
+	hd_common_mem_flush_cache((void *)p_stream->thermal_isp_step_test_va,
+		blk_size);
+
 	return HD_OK;
 }
 static HD_RESULT release_thermal_frame_buffer(UINTPTR *p_va,
@@ -1691,6 +2574,12 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		p_stream->thermal_ffc_out_blk, "FFC output");
 	RELEASE_THERMAL_BUFFER(p_stream->thermal_ffc_sum_va,
 		p_stream->thermal_ffc_sum_blk, "FFC sum");
+	RELEASE_THERMAL_BUFFER(p_stream->thermal_agc_histogram_p1_p99_out_va,
+		p_stream->thermal_agc_histogram_p1_p99_out_blk,
+		"shared CPU AGC output");
+	RELEASE_THERMAL_BUFFER(p_stream->thermal_isp_step_test_va,
+		p_stream->thermal_isp_step_test_blk,
+		"ISP RAW-to-Y Step Test input");
 
 #undef RELEASE_THERMAL_BUFFER
 
@@ -1702,6 +2591,17 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	p_stream->thermal_ffc_b_frame_pa = 0;
 	p_stream->thermal_ffc_out_pa = 0;
 	p_stream->thermal_ffc_sum_pa = 0;
+	p_stream->thermal_agc_histogram_p1_p99_out_pa = 0;
+	p_stream->thermal_isp_step_test_pa = 0;
+	free(p_stream->agc_histogram_p1_p99_workspace);
+	p_stream->agc_histogram_p1_p99_workspace = NULL;
+	p_stream->agc_histogram_p1_p99_frame_count = 0;
+	p_stream->agc_histogram_p1_p99_error_count = 0;
+	agc_fieldscale_state_reset(&p_stream->agc_fieldscale_state);
+	p_stream->agc_fieldscale_frame_count = 0;
+	p_stream->agc_fieldscale_error_count = 0;
+	p_stream->agc_min_max_tone_curve_frame_count = 0;
+	p_stream->agc_min_max_tone_curve_error_count = 0;
 
 	return ret;
 }
@@ -1770,8 +2670,13 @@ static HD_RESULT open_module(VIDEO_LIVEVIEW *p_stream, HD_DIM* p_proc_max_dim)
 		return ret;
 	if ((ret = hd_videoproc_open(HD_VIDEOPROC_0_IN_0, HD_VIDEOPROC_0_OUT_0, &p_stream->proc_path)) != HD_OK)
 		return ret;
-	if ((ret = hd_videoproc_open(HD_VIDEOPROC_0_IN_0, HD_VIDEOPROC_0_OUT_4, &p_stream->proc_path_3dnr)) != HD_OK)
-		return ret;
+	if (videoproc_isp_is_3dnr_enabled()) {
+		if ((ret = hd_videoproc_open(HD_VIDEOPROC_0_IN_0,
+			HD_VIDEOPROC_0_OUT_4,
+			&p_stream->proc_path_3dnr)) != HD_OK) {
+			return ret;
+		}
+	}
 	if ((ret = hd_videoproc_open(HD_VIDEOPROC_0_IN_0, HD_VIDEOPROC_0_OUT_1, &p_stream->proc_path_diag)) != HD_OK)
 		return ret;
 	ret = video_output_open(&p_stream->video_output, g_output_mode,
@@ -1860,8 +2765,10 @@ static void liveview_update_temperature_tables_if_needed(
 		return;
 	}
 
-	if (nuc_is_enabled() && now_ms >= *nuc_next_update_ms) {
-		nuc_update_sensor_temp_table();
+	if (nuc_is_enabled() &&
+	    !nuc_is_blackbody_dynamic_enabled() &&
+	    now_ms >= *nuc_next_update_ms) {
+		nuc_update_sensor_temp_table_periodic();
 		*nuc_next_update_ms =
 			now_ms +
 			(UINT64)nuc_get_sensor_temp_interval_sec() * 1000U;
@@ -1880,7 +2787,8 @@ static void liveview_update_temperature_tables_if_needed(
 static int liveview_run_ffc_calibration(
 	VIDEO_LIVEVIEW *p_stream0,
 	UINT64 *nuc_next_update_ms,
-	UINT64 *tdc_next_update_ms)
+	UINT64 *tdc_next_update_ms,
+	int test_mode)
 {
 	HD_VIDEO_FRAME vcap_video_frame = {0};
 	HD_VIDEO_FRAME tdc_video_frame = {0};
@@ -1913,7 +2821,8 @@ static int liveview_run_ffc_calibration(
 		if (frame > 0) {
 			liveview_update_temperature_tables_if_needed(
 				nuc_next_update_ms, tdc_next_update_ms);
-			if (!ffc_is_enabled() && !bpr_is_runtime_enabled()) {
+			if (!test_mode &&
+			    !ffc_is_enabled() && !bpr_is_runtime_enabled()) {
 				printf("Shutter calibration disabled during FFC\n");
 				return -1;
 			}
@@ -1947,7 +2856,12 @@ static int liveview_run_ffc_calibration(
 		}
 
 		if (process_ret == HD_OK && nuc_is_enabled()) {
-			process_ret = nuc_apply(calibration_frame,
+			if (nuc_prepare_blackbody_dynamic_table(
+				    calibration_frame) != 0) {
+				printf("FFC calibration dynamic NUC table build fail\n");
+				process_ret = HD_ERR_NG;
+			} else {
+				process_ret = nuc_apply(calibration_frame,
 						&nuc_video_frame,
 						p_stream0->thermal_k_frame_pa,
 						p_stream0->thermal_b_frame_pa,
@@ -1955,6 +2869,7 @@ static int liveview_run_ffc_calibration(
 						p_stream0->thermal_nuc_out_blk,
 						RAW_SIZE_W,
 						RAW_SIZE_H);
+			}
 			if (process_ret != HD_OK) {
 				printf("FFC calibration NUC error=%d\n",
 				       process_ret);
@@ -2011,6 +2926,12 @@ static int liveview_run_ffc_calibration(
 
 	if (liveview_update_ffc_table_from_average(p_stream0, lineoffset) != 0) {
 		printf("FFC update table fail\n");
+		if (test_mode) {
+			return -1;
+		}
+	} else if (test_mode &&
+		   liveview_run_ffc_gfx_test(p_stream0, lineoffset) != 0) {
+		return -1;
 	}
 
 	return final_release_failed ? -1 : 0;
@@ -2019,7 +2940,8 @@ static int liveview_run_ffc_calibration(
 static int liveview_run_shutter_calibration_cycle(
 	VIDEO_LIVEVIEW *p_stream0,
 	UINT64 *nuc_next_update_ms,
-	UINT64 *tdc_next_update_ms)
+	UINT64 *tdc_next_update_ms,
+	int test_mode)
 {
 	int calibration_ok = 1;
 	int shutter_result = 0;
@@ -2041,15 +2963,16 @@ static int liveview_run_shutter_calibration_cycle(
 
 	liveview_sleep_ms(g_shutter_close_wait_ms);
 
-	if (ffc_is_enabled()) {
+	if (test_mode || ffc_is_enabled()) {
 		if (liveview_run_ffc_calibration(p_stream0,
 						 nuc_next_update_ms,
-						 tdc_next_update_ms) != 0) {
+						 tdc_next_update_ms,
+						 test_mode) != 0) {
 			calibration_ok = 0;
 		}
 	}
 
-	if (bpr_is_runtime_enabled()) {
+	if (!test_mode && bpr_is_runtime_enabled()) {
 		if (calibration_ok) {
 			liveview_run_runtime_bpr_while_shutter_closed();
 		} else {
@@ -2063,7 +2986,371 @@ static int liveview_run_shutter_calibration_cycle(
 	}
 
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
+	if (test_mode && !calibration_ok) {
+		return -1;
+	}
 	return shutter_result;
+}
+
+static int liveview_apply_agc_histogram_p1_p99(
+	VIDEO_LIVEVIEW *p_stream,
+	const HD_VIDEO_FRAME *input_frame,
+	HD_VIDEO_FRAME *output_frame,
+	uint16_t *p1_result,
+	uint16_t *p99_result)
+{
+	UINTPTR block_pa;
+	UINTPTR map_pa;
+	UINTPTR map_va;
+	UINTPTR input_va;
+	UINT64 data_offset;
+	UINT64 map_size_64;
+	UINT32 map_size;
+	UINT32 input_stride;
+	UINT32 output_stride;
+	UINT32 plane_height;
+	UINT32 output_size;
+	size_t histogram_bins;
+	int agc_status;
+	HD_RESULT unmap_ret;
+
+	if (p_stream == NULL || input_frame == NULL || output_frame == NULL ||
+	    input_frame->phy_addr[0] == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_pa == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_va == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_blk == 0 ||
+	    p_stream->agc_histogram_p1_p99_workspace == NULL) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	if (input_frame->dim.w != RAW_SIZE_W ||
+	    input_frame->dim.h != RAW_SIZE_H) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	output_stride = RAW_SIZE_W * sizeof(uint16_t);
+	output_size = output_stride * RAW_SIZE_H;
+	input_stride = input_frame->loff[0];
+	if (input_stride < output_stride) {
+		input_stride *= sizeof(uint16_t);
+	}
+	plane_height = input_frame->ph[0] != 0 ?
+		input_frame->ph[0] : input_frame->dim.h;
+	if (input_stride < output_stride || plane_height < RAW_SIZE_H) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	block_pa = input_frame->blk != 0 ?
+		hd_common_mem_blk2pa(input_frame->blk) : 0;
+	if (block_pa != 0) {
+		if (input_frame->phy_addr[0] < block_pa) {
+			return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+		}
+		map_pa = block_pa;
+		data_offset = (UINT64)(input_frame->phy_addr[0] - block_pa);
+	} else {
+		map_pa = input_frame->phy_addr[0];
+		data_offset = 0;
+	}
+
+	map_size_64 = data_offset + (UINT64)input_stride * plane_height;
+	if (map_size_64 == 0 || map_size_64 > UINT_MAX) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+	map_size = (UINT32)map_size_64;
+	map_va = (UINTPTR)hd_common_mem_mmap(
+		HD_COMMON_MEM_MEM_TYPE_CACHE, map_pa, map_size);
+	if (map_va == 0) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	/* Synchronize the hardware/VCAP writer before the CPU reads this frame. */
+	hd_common_mem_flush_cache((void *)map_va, map_size);
+	input_va = map_va + (UINTPTR)data_offset;
+	histogram_bins = agc_histogram_p1_p99_workspace_bins();
+	agc_status = agc_histogram_p1_p99_apply_u14(
+		(const uint16_t *)input_va,
+		input_stride,
+		(uint16_t *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+		output_stride,
+		RAW_SIZE_W,
+		RAW_SIZE_H,
+		p_stream->agc_histogram_p1_p99_workspace,
+		histogram_bins,
+		p1_result,
+		p99_result);
+
+	if (agc_status >= AGC_HISTOGRAM_P1_P99_STATUS_OK) {
+		/* The CPU wrote the output; publish it before VideoProc reads it. */
+		hd_common_mem_flush_cache(
+			(void *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+			output_size);
+		memcpy(output_frame, input_frame, sizeof(*output_frame));
+		output_frame->phy_addr[0] =
+			p_stream->thermal_agc_histogram_p1_p99_out_pa;
+		output_frame->blk =
+			p_stream->thermal_agc_histogram_p1_p99_out_blk;
+		output_frame->loff[0] = output_stride;
+		output_frame->ph[0] = RAW_SIZE_H;
+	}
+
+	unmap_ret = hd_common_mem_munmap((void *)map_va, map_size);
+	if (unmap_ret != HD_OK) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	return agc_status;
+}
+
+static int liveview_apply_agc_fieldscale(
+	VIDEO_LIVEVIEW *p_stream,
+	const HD_VIDEO_FRAME *input_frame,
+	HD_VIDEO_FRAME *output_frame)
+{
+	UINTPTR block_pa;
+	UINTPTR map_pa;
+	UINTPTR map_va;
+	UINTPTR input_va;
+	UINT64 data_offset;
+	UINT64 map_size_64;
+	UINT32 map_size;
+	UINT32 input_stride;
+	UINT32 output_stride;
+	UINT32 plane_height;
+	UINT32 output_size;
+	int agc_status;
+	HD_RESULT unmap_ret;
+	AGC_FIELDSCALE_LATENCY_SAMPLE latency = {0};
+	UINT64 total_start_us = 0;
+	UINT64 map_cache_start_us = 0;
+	UINT64 map_cache_done_us = 0;
+	UINT64 core_done_us = 0;
+	UINT64 output_flush_start_us = 0;
+	UINT64 output_flush_done_us = 0;
+	UINT64 unmap_start_us = 0;
+	int measure_latency;
+
+	measure_latency = agc_fieldscale_latency_is_active();
+	if (measure_latency) {
+		total_start_us = liveview_get_time_us();
+	}
+
+	if (p_stream == NULL || input_frame == NULL || output_frame == NULL ||
+	    input_frame->phy_addr[0] == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_pa == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_va == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_blk == 0 ||
+	    input_frame->dim.w != RAW_SIZE_W ||
+	    input_frame->dim.h != RAW_SIZE_H) {
+		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
+	}
+
+	output_stride = RAW_SIZE_W * sizeof(uint16_t);
+	output_size = output_stride * RAW_SIZE_H;
+	input_stride = input_frame->loff[0];
+	if (input_stride < output_stride) {
+		input_stride *= sizeof(uint16_t);
+	}
+	plane_height = input_frame->ph[0] != 0U ?
+		input_frame->ph[0] : input_frame->dim.h;
+	if (input_stride < output_stride || plane_height < RAW_SIZE_H) {
+		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
+	}
+
+	block_pa = input_frame->blk != 0 ?
+		hd_common_mem_blk2pa(input_frame->blk) : 0;
+	if (block_pa != 0) {
+		if (input_frame->phy_addr[0] < block_pa) {
+			return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
+		}
+		map_pa = block_pa;
+		data_offset = (UINT64)(input_frame->phy_addr[0] - block_pa);
+	} else {
+		map_pa = input_frame->phy_addr[0];
+		data_offset = 0;
+	}
+
+	map_size_64 = data_offset + (UINT64)input_stride * plane_height;
+	if (map_size_64 == 0U || map_size_64 > UINT_MAX) {
+		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
+	}
+	map_size = (UINT32)map_size_64;
+	if (measure_latency) {
+		map_cache_start_us = liveview_get_time_us();
+	}
+	map_va = (UINTPTR)hd_common_mem_mmap(
+		HD_COMMON_MEM_MEM_TYPE_CACHE, map_pa, map_size);
+	if (map_va == 0) {
+		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
+	}
+
+	/* Synchronize the hardware/previous correction writer before CPU reads. */
+	hd_common_mem_flush_cache((void *)map_va, map_size);
+	if (measure_latency) {
+		map_cache_done_us = liveview_get_time_us();
+		latency.map_cache_us = map_cache_done_us - map_cache_start_us;
+	}
+	input_va = map_va + (UINTPTR)data_offset;
+	agc_status = agc_fieldscale_apply_u14(
+		(const uint16_t *)input_va,
+		input_stride,
+		(uint16_t *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+		output_stride,
+		RAW_SIZE_W,
+		RAW_SIZE_H,
+		&p_stream->agc_fieldscale_state);
+	if (measure_latency) {
+		core_done_us = liveview_get_time_us();
+		latency.core_us = core_done_us - map_cache_done_us;
+	}
+
+	if (agc_status == AGC_FIELDSCALE_STATUS_OK) {
+		if (measure_latency) {
+			output_flush_start_us = liveview_get_time_us();
+		}
+		hd_common_mem_flush_cache(
+			(void *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+			output_size);
+		if (measure_latency) {
+			output_flush_done_us = liveview_get_time_us();
+			latency.output_flush_us = output_flush_done_us -
+				output_flush_start_us;
+		}
+		memcpy(output_frame, input_frame, sizeof(*output_frame));
+		output_frame->phy_addr[0] =
+			p_stream->thermal_agc_histogram_p1_p99_out_pa;
+		output_frame->blk =
+			p_stream->thermal_agc_histogram_p1_p99_out_blk;
+		output_frame->loff[0] = output_stride;
+		output_frame->ph[0] = RAW_SIZE_H;
+	}
+	if (measure_latency) {
+		unmap_start_us = liveview_get_time_us();
+	}
+
+	unmap_ret = hd_common_mem_munmap((void *)map_va, map_size);
+	if (measure_latency) {
+		latency.completed_at_us = liveview_get_time_us();
+		latency.unmap_us = latency.completed_at_us - unmap_start_us;
+		latency.total_us = latency.completed_at_us - total_start_us;
+	}
+	if (unmap_ret != HD_OK) {
+		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
+	}
+	if (measure_latency && agc_status == AGC_FIELDSCALE_STATUS_OK) {
+		agc_fieldscale_latency_record(&latency);
+	}
+	return agc_status;
+}
+
+static int liveview_apply_agc_min_max_tone_curve(
+	const HD_VIDEO_FRAME *input_frame,
+	AGC_MIN_MAX_TONE_CURVE_LUT *lut)
+{
+	IQT_TONE_PARAM tone = {0};
+	UINTPTR block_pa;
+	UINTPTR map_pa;
+	UINTPTR map_va;
+	UINTPTR input_va;
+	UINT64 data_offset;
+	UINT64 map_size_64;
+	UINT32 map_size;
+	UINT32 input_stride;
+	UINT32 minimum_stride;
+	UINT32 plane_height;
+	UINT32 i;
+	int agc_status;
+	HD_RESULT iq_ret;
+	HD_RESULT unmap_ret;
+
+	if (input_frame == NULL || lut == NULL ||
+	    input_frame->phy_addr[0] == 0) {
+		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+	}
+	if (input_frame->dim.w != RAW_SIZE_W ||
+	    input_frame->dim.h != RAW_SIZE_H) {
+		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+	}
+
+	minimum_stride = RAW_SIZE_W * sizeof(uint16_t);
+	input_stride = input_frame->loff[0];
+	if (input_stride < minimum_stride) {
+		input_stride *= sizeof(uint16_t);
+	}
+	plane_height = input_frame->ph[0] != 0 ?
+		input_frame->ph[0] : input_frame->dim.h;
+	if (input_stride < minimum_stride || plane_height < RAW_SIZE_H) {
+		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+	}
+
+	block_pa = input_frame->blk != 0 ?
+		hd_common_mem_blk2pa(input_frame->blk) : 0;
+	if (block_pa != 0) {
+		if (input_frame->phy_addr[0] < block_pa) {
+			return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+		}
+		map_pa = block_pa;
+		data_offset = (UINT64)(input_frame->phy_addr[0] - block_pa);
+	} else {
+		map_pa = input_frame->phy_addr[0];
+		data_offset = 0;
+	}
+
+	map_size_64 = data_offset + (UINT64)input_stride * plane_height;
+	if (map_size_64 == 0 || map_size_64 > UINT_MAX) {
+		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+	}
+	map_size = (UINT32)map_size_64;
+	map_va = (UINTPTR)hd_common_mem_mmap(
+		HD_COMMON_MEM_MEM_TYPE_CACHE, map_pa, map_size);
+	if (map_va == 0) {
+		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+	}
+
+	/* Synchronize the hardware/VCAP writer before the CPU scans this frame. */
+	hd_common_mem_flush_cache((void *)map_va, map_size);
+	input_va = map_va + (UINTPTR)data_offset;
+	agc_status = agc_min_max_tone_curve_build_u14(
+		(const uint16_t *)input_va,
+		input_stride,
+		RAW_SIZE_W,
+		RAW_SIZE_H,
+		lut);
+
+	if (agc_status >= AGC_MIN_MAX_TONE_CURVE_STATUS_OK) {
+		tone.id = g_thermal_pipeline_id;
+		iq_ret = vendor_isp_get_iq(IQT_ITEM_TONE_PARAM, &tone);
+		if (iq_ret != HD_OK) {
+			agc_status = AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+		} else {
+			tone.tone.enable = 1;
+			tone.tone.mode = 1;
+			tone.tone.auto_sel = 2;
+			for (i = 0;
+			     i < AGC_MIN_MAX_TONE_CURVE_LEFT_LUT_COUNT;
+			     i++) {
+				tone.tone.manual_lut_left[i] = lut->left[i];
+			}
+			for (i = 0;
+			     i < AGC_MIN_MAX_TONE_CURVE_RIGHT_LUT_COUNT;
+			     i++) {
+				tone.tone.manual_lut_right[i] = lut->right[i];
+			}
+
+			iq_ret = vendor_isp_set_iq(IQT_ITEM_TONE_PARAM, &tone);
+			if (iq_ret != HD_OK) {
+				agc_status =
+					AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+			}
+		}
+	}
+
+	unmap_ret = hd_common_mem_munmap((void *)map_va, map_size);
+	if (unmap_ret != HD_OK) {
+		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
+	}
+
+	return agc_status;
 }
 
 static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
@@ -2072,10 +3359,28 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	HD_VIDEO_FRAME tdc_video_frame = {0};
 	HD_VIDEO_FRAME nuc_video_frame = {0};
 	HD_VIDEO_FRAME ffc_video_frame = {0};
+	HD_VIDEO_FRAME agc_histogram_p1_p99_video_frame = {0};
+	HD_VIDEO_FRAME isp_step_test_video_frame = {0};
 	HD_VIDEO_FRAME *current_frame = &vcap_video_frame;
+	HD_VIDEO_FRAME *snapshot_final_frame = NULL;
+	HD_VIDEO_FRAME *snapshot_agc_output_frame = NULL;
 	int current_frame_is_vcap = 1;
+	int snapshot_requested = 0;
+	int snapshot_final_is_input = 0;
+	int snapshot_has_agc_output = 0;
 	int raw_copy_handled = 0;
 	int correction_lock_held = 0;
+	int isp_step_test_requested = 0;
+	UINT32 isp_step_test_run_id = 0;
+	UINT32 isp_step_test_min_raw_dn = 0U;
+	UINT32 isp_step_test_max_raw_dn = ISP_RAW_TO_Y_STEP_RAW14_MAX;
+	int agc_status;
+	uint16_t agc_p1 = 0;
+	uint16_t agc_p99 = 0;
+	AGC_MIN_MAX_TONE_CURVE_LUT agc_tone_curve_lut = {0};
+	UINT64 agc_start_ms;
+	UINT64 agc_end_ms;
+	UINT64 agc_elapsed_ms;
 	HD_RESULT ret;
 	HD_RESULT push_ret;
 
@@ -2107,8 +3412,48 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	 */
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	correction_lock_held = 1;
+	if (!g_manual_calibration_active &&
+	    liveview_take_isp_step_test_request(&isp_step_test_run_id,
+					    &isp_step_test_min_raw_dn,
+					    &isp_step_test_max_raw_dn)) {
+		UINT32 test_stride = RAW_SIZE_W * sizeof(uint16_t);
+		UINT32 test_size = test_stride * RAW_SIZE_H;
 
-	/* Pipeline: VCAP -> optional TDC -> optional NUC -> optional FFC -> VideoProc. */
+		if (isp_raw_to_y_step_diagnostic_generate(
+				(uint16_t *)p_stream0->thermal_isp_step_test_va,
+				test_stride, RAW_SIZE_W, RAW_SIZE_H,
+				isp_step_test_min_raw_dn,
+				isp_step_test_max_raw_dn) != 0) {
+			printf("ISP RAW-to-Y Step Test: generate RAW14 step frame fail\n");
+			pthread_mutex_unlock(&g_manual_calibration_lock);
+			correction_lock_held = 0;
+			liveview_finish_isp_step_test(-1);
+			goto release_vcap_frame;
+		}
+		hd_common_mem_flush_cache(
+			(void *)p_stream0->thermal_isp_step_test_va, test_size);
+		memcpy(&isp_step_test_video_frame, &vcap_video_frame,
+		       sizeof(isp_step_test_video_frame));
+		isp_step_test_video_frame.phy_addr[0] =
+			p_stream0->thermal_isp_step_test_pa;
+		isp_step_test_video_frame.blk =
+			p_stream0->thermal_isp_step_test_blk;
+		isp_step_test_video_frame.loff[0] = test_stride;
+		isp_step_test_video_frame.ph[0] = RAW_SIZE_H;
+		current_frame = &isp_step_test_video_frame;
+		current_frame_is_vcap = 0;
+		isp_step_test_requested = 1;
+		printf("ISP RAW-to-Y Step Test %04u: generated %u bands "
+		       "(%u..%u in RAW16 container)\n",
+		       isp_step_test_run_id, ISP_RAW_TO_Y_STEP_COUNT,
+		       isp_step_test_min_raw_dn,
+		       isp_step_test_max_raw_dn);
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+		correction_lock_held = 0;
+		goto after_corrections;
+	}
+
+	/* Corrections: VCAP -> optional TDC -> optional NUC -> optional FFC. */
 	if (!g_manual_calibration_active && tdc_is_enabled()) {
 		ret = tdc_apply(current_frame,
 				&tdc_video_frame,
@@ -2126,21 +3471,25 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	}
 
 	if (!g_manual_calibration_active && nuc_is_enabled()) {
-		ret = nuc_apply(current_frame,
-				&nuc_video_frame,
-				p_stream0->thermal_k_frame_pa,
-				p_stream0->thermal_b_frame_pa,
-				p_stream0->thermal_nuc_out_pa,
-				p_stream0->thermal_nuc_out_blk,
-				RAW_SIZE_W,
-				RAW_SIZE_H);
-		if (ret != HD_OK) {
-			printf("nuc correction error=%d !!\r\n\r\n", ret);
-			goto release_vcap_frame;
-		}
+		if (nuc_prepare_blackbody_dynamic_table(current_frame) != 0) {
+			printf("Dynamic NUC table build failed; bypass NUC for this frame\n");
+		} else {
+			ret = nuc_apply(current_frame,
+					&nuc_video_frame,
+					p_stream0->thermal_k_frame_pa,
+					p_stream0->thermal_b_frame_pa,
+					p_stream0->thermal_nuc_out_pa,
+					p_stream0->thermal_nuc_out_blk,
+					RAW_SIZE_W,
+					RAW_SIZE_H);
+			if (ret != HD_OK) {
+				printf("nuc correction error=%d !!\r\n\r\n", ret);
+				goto release_vcap_frame;
+			}
 
-		current_frame = &nuc_video_frame;
-		current_frame_is_vcap = 0;
+			current_frame = &nuc_video_frame;
+			current_frame_is_vcap = 0;
+		}
 	}
 
 	if (!g_manual_calibration_active &&
@@ -2165,12 +3514,143 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	pthread_mutex_unlock(&g_manual_calibration_lock);
 	correction_lock_held = 0;
 
-	if (p_stream0->cap_snap) {
+after_corrections:
+	if (!isp_step_test_requested && p_stream0->cap_snap) {
 		p_stream0->cap_snap = 0;
-		if (queue_pipeline_snapshot(&vcap_video_frame, current_frame,
-					    current_frame_is_vcap) != 0) {
-			printf("Snapshot frame queue failed\n");
+		snapshot_requested = 1;
+		snapshot_final_frame = current_frame;
+		snapshot_final_is_input = current_frame_is_vcap;
+	}
+
+	/*
+	 * Display enhancement runs after the correction snapshot point.  A
+	 * pending request retains both the pre-AGC frame and, when available,
+	 * the selected CPU AGC output before either one is submitted to VideoProc.
+	 */
+	if (!isp_step_test_requested && agc_histogram_p1_p99_is_enabled()) {
+		agc_start_ms = liveview_get_time_ms();
+		agc_status = liveview_apply_agc_histogram_p1_p99(
+			p_stream0,
+			current_frame,
+			&agc_histogram_p1_p99_video_frame,
+			&agc_p1,
+			&agc_p99);
+		agc_end_ms = liveview_get_time_ms();
+		agc_elapsed_ms = agc_end_ms >= agc_start_ms ?
+			agc_end_ms - agc_start_ms : 0;
+
+		if (agc_status >= AGC_HISTOGRAM_P1_P99_STATUS_OK) {
+			p_stream0->agc_histogram_p1_p99_frame_count++;
+			if (p_stream0->agc_histogram_p1_p99_frame_count == 1U) {
+				printf("Histogram P1/P99 AGC (CPU): frame=%u, "
+				       "P1=%u, P99=%u, AGC RAW14 output=0..16383, "
+				       "%s, elapsed=%" PRIu64 " ms\n",
+				       p_stream0->agc_histogram_p1_p99_frame_count,
+				       (unsigned int)agc_p1,
+				       (unsigned int)agc_p99,
+				       agc_status == AGC_HISTOGRAM_P1_P99_STATUS_FLAT_RANGE ?
+					"flat-range copy" : "linear stretch",
+				       (uint64_t)agc_elapsed_ms);
+			}
+
+			current_frame = &agc_histogram_p1_p99_video_frame;
+			current_frame_is_vcap = 0;
+			if (snapshot_requested) {
+				snapshot_agc_output_frame = current_frame;
+				snapshot_has_agc_output = 1;
+			}
+		} else {
+			p_stream0->agc_histogram_p1_p99_error_count++;
+			if (p_stream0->agc_histogram_p1_p99_error_count == 1U) {
+				printf("Histogram P1/P99 AGC (CPU) bypass: "
+				       "error=%d, count=%u\n",
+				       agc_status,
+				       p_stream0->agc_histogram_p1_p99_error_count);
+			}
 		}
+	}
+
+	if (!isp_step_test_requested && agc_fieldscale_is_enabled()) {
+		agc_start_ms = liveview_get_time_ms();
+		agc_status = liveview_apply_agc_fieldscale(
+			p_stream0,
+			current_frame,
+			&agc_histogram_p1_p99_video_frame);
+		agc_end_ms = liveview_get_time_ms();
+		agc_elapsed_ms = agc_end_ms >= agc_start_ms ?
+			agc_end_ms - agc_start_ms : 0;
+
+		if (agc_status == AGC_FIELDSCALE_STATUS_OK) {
+			p_stream0->agc_fieldscale_frame_count++;
+			if (p_stream0->agc_fieldscale_frame_count == 1U) {
+				printf("Fieldscale Local Adaptive AGC (CPU): "
+				       "frame=%u, grid=8x8, iterations=7, "
+				       "temporal=current10%%/previous90%%, "
+				       "AGC RAW14 output=0..16383, "
+				       "elapsed=%" PRIu64 " ms\n",
+				       p_stream0->agc_fieldscale_frame_count,
+				       (uint64_t)agc_elapsed_ms);
+			}
+			current_frame = &agc_histogram_p1_p99_video_frame;
+			current_frame_is_vcap = 0;
+			if (snapshot_requested) {
+				snapshot_agc_output_frame = current_frame;
+				snapshot_has_agc_output = 1;
+			}
+		} else {
+			p_stream0->agc_fieldscale_error_count++;
+			if (p_stream0->agc_fieldscale_error_count == 1U) {
+				printf("Fieldscale Local Adaptive AGC (CPU) bypass: "
+				       "error=%d, count=%u\n",
+				       agc_status,
+				       p_stream0->agc_fieldscale_error_count);
+			}
+		}
+	}
+
+	if (!isp_step_test_requested &&
+	    agc_min_max_tone_curve_is_enabled()) {
+		agc_start_ms = liveview_get_time_ms();
+		agc_status = liveview_apply_agc_min_max_tone_curve(
+			current_frame, &agc_tone_curve_lut);
+		agc_end_ms = liveview_get_time_ms();
+		agc_elapsed_ms = agc_end_ms >= agc_start_ms ?
+			agc_end_ms - agc_start_ms : 0;
+
+		if (agc_status >= AGC_MIN_MAX_TONE_CURVE_STATUS_OK) {
+			p_stream0->agc_min_max_tone_curve_frame_count++;
+			if (p_stream0->agc_min_max_tone_curve_frame_count == 1U) {
+				printf("Min/Max Tone Curve AGC (ISP): frame=%u, "
+				       "RAW14 min=%u, max=%u, Tone12 min=%u, max=%u, "
+				       "%s, elapsed=%" PRIu64 " ms\n",
+				       p_stream0->agc_min_max_tone_curve_frame_count,
+				       (unsigned int)agc_tone_curve_lut.raw14_min,
+				       (unsigned int)agc_tone_curve_lut.raw14_max,
+				       (unsigned int)agc_tone_curve_lut.tone12_min,
+				       (unsigned int)agc_tone_curve_lut.tone12_max,
+				       agc_status ==
+					AGC_MIN_MAX_TONE_CURVE_STATUS_FLAT_RANGE ?
+					"flat-range zero LUT" : "manual tone LUT",
+				       (uint64_t)agc_elapsed_ms);
+			}
+		} else {
+			p_stream0->agc_min_max_tone_curve_error_count++;
+			if (p_stream0->agc_min_max_tone_curve_error_count == 1U) {
+				printf("Min/Max Tone Curve AGC (ISP) failed: "
+				       "keep previous ISP tone curve, error=%d, count=%u\n",
+				       agc_status,
+				       p_stream0->agc_min_max_tone_curve_error_count);
+			}
+		}
+	}
+
+	if (snapshot_requested &&
+	    queue_pipeline_snapshot(&vcap_video_frame,
+				    snapshot_final_frame,
+				    snapshot_final_is_input,
+				    snapshot_agc_output_frame,
+				    snapshot_has_agc_output) != 0) {
+		printf("Snapshot frame queue failed\n");
 	}
 
 	/* A processed frame no longer depends on the held VCAP buffer. */
@@ -2179,6 +3659,9 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 			p_stream0->cap_path, &vcap_video_frame);
 		if (ret != HD_OK) {
 			printf("cap_release error=%d !!\r\n\r\n", ret);
+			if (isp_step_test_requested) {
+				liveview_finish_isp_step_test(-1);
+			}
 			return;
 		}
 	}
@@ -2187,6 +3670,12 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		printf("VideoProc input format: frame=0x%08X, configured=0x%08X\n",
 		       current_frame->pxlfmt, CAP_OUT_FMT);
 		g_proc_input_format_logged = 1;
+	}
+	if (isp_step_test_requested) {
+		liveview_set_isp_step_test_expected(
+			isp_step_test_run_id,
+			current_frame->timestamp,
+			current_frame->count);
 	}
 	push_ret = hd_videoproc_push_in_buf(
 		p_stream0->proc_path, current_frame, NULL, 0);
@@ -2203,6 +3692,9 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 
 	if (push_ret != HD_OK) {
 		printf("proc_push error=%d !!\r\n\r\n", push_ret);
+		if (isp_step_test_requested) {
+			liveview_finish_isp_step_test(-1);
+		}
 		return;
 	}
 
@@ -2235,6 +3727,7 @@ static void *raw_pipeline_thread(void *arg)
 	//------ wait flow_start ------
 	while (p_stream0->cap_enter == 0 && p_stream0->cap_exit == 0) usleep(100);
 	if (p_stream0->cap_exit) {
+		liveview_set_ffc_test_worker_active(0);
 		return 0;
 	}
 
@@ -2256,6 +3749,22 @@ static void *raw_pipeline_thread(void *arg)
 			liveview_prepare_shutter_interval(
 				shutter_calibration_enabled);
 
+		if (!shutter_calibration_paused &&
+		    liveview_take_ffc_test_request()) {
+			shutter_calibration_result =
+				liveview_run_shutter_calibration_cycle(
+					p_stream0,
+					&nuc_sensor_temp_next_update_ms,
+					&tdc_next_update_ms,
+					1);
+			liveview_finish_ffc_test(shutter_calibration_result);
+			if (shutter_calibration_enabled) {
+				liveview_schedule_next_shutter_calibration();
+			}
+			usleep(100);
+			continue;
+		}
+
 		liveview_update_temperature_tables_if_needed(
 			&nuc_sensor_temp_next_update_ms,
 			&tdc_next_update_ms);
@@ -2268,7 +3777,8 @@ static void *raw_pipeline_thread(void *arg)
 				liveview_run_shutter_calibration_cycle(
 					p_stream0,
 					&nuc_sensor_temp_next_update_ms,
-					&tdc_next_update_ms);
+					&tdc_next_update_ms,
+					0);
 			if (shutter_calibration_result < 0) {
 				g_shutter_next_calibration_ms = 0;
 				break;
@@ -2285,6 +3795,7 @@ static void *raw_pipeline_thread(void *arg)
 		usleep(100);
 	}
 
+	liveview_set_ffc_test_worker_active(0);
 	return 0;
 }
 
@@ -2307,6 +3818,7 @@ static void *yuv_statistics_thread(void *arg)
 			continue;
 		}
 
+		process_requested_isp_step_test_output(p_stream0, &video_frame);
 		print_requested_yuv_frame_stats(&video_frame);
 		ret = hd_videoproc_release_out_buf(
 			p_stream0->proc_path_diag, &video_frame);
@@ -2434,6 +3946,10 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	nuc_bind_capture_callback(liveview_copy_next_raw);
 	nuc_bind_calibration_state_callback(
 		liveview_on_manual_calibration_state);
+	fos_bind_capture_callback(liveview_copy_next_raw,
+				  RAW_ACTIVE_W, RAW_ACTIVE_H);
+	fos_bind_calibration_state_callback(
+		liveview_on_manual_calibration_state);
 	bpr_bind_calibration_state_callback(
 		liveview_on_manual_calibration_state);
 	tdc_bind_runtime(&tdc_layout);
@@ -2469,6 +3985,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		printf("open fail=%d\n", ret);
 		goto exit;
 	}
+	g_diagnostic_video_output = &stream[0].video_output;
 
 	// get videocap capability
 	ret = get_cap_caps(stream[0].cap_ctrl, &stream[0].cap_syscaps);
@@ -2496,11 +4013,28 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		goto exit;
 	}
 
-	ret = set_proc_param(stream[0].proc_path_3dnr, &main_dim,
-		HD_VIDEO_PXLFMT_YUV420, 0);
+	/*
+	 * A CPU AGC already stretches RAW14 before VideoProc. Bypass Tone Curve so
+	 * the stretched frame is not remapped again.
+	 * A later Liveview restart reloads the ISP cfg before applying AGC mode,
+	 * which restores the configured Tone Curve for OFF/ISP Tone Curve modes.
+	 */
+	ret = liveview_bypass_isp_tone_for_cpu_agc();
 	if (ret != HD_OK) {
-		printf("set proc fail = %d \n", ret);
-		goto exit;
+		printf("%s: Tone Curve bypass unavailable; "
+		       "disable CPU AGC for this Liveview run\n",
+		       agc_mode_name(agc_mode_get()));
+		agc_mode_set(AGC_MODE_OFF);
+		ret = HD_OK;
+	}
+
+	if (stream[0].proc_path_3dnr != 0) {
+		ret = set_proc_param(stream[0].proc_path_3dnr, &main_dim,
+			HD_VIDEO_PXLFMT_YUV420, 0);
+		if (ret != HD_OK) {
+			printf("set 3DNR reference proc fail=%d\n", ret);
+			goto exit;
+		}
 	}
 	/* OUT_1 is independent from video output OUT_0 and 3DNR reference OUT_4. */
 	ret = set_proc_param(stream[0].proc_path_diag, &main_dim,
@@ -2510,19 +4044,25 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		goto exit;
 	}
 
+	if (liveview_prepare_output_directories() != 0) {
+		printf("prepare snapshot output directories failed\n");
+		goto exit;
+	}
+
 	if (snapshot_writer_start() != 0) {
 		printf("start snapshot background writer failed\n");
 		goto exit;
 	}
 	ctx->snapshot_writer_started = 1;
 
-	// create raw_pipeline_thread (VCAP -> TDC -> NUC -> FFC -> VideoProc)
+	// create raw_pipeline_thread (VCAP -> TDC -> NUC -> FFC -> RAW snapshot -> selected AGC -> VideoProc)
 	ret = pthread_create(&stream[0].cap_thread_id, NULL, raw_pipeline_thread, (void *)stream);
 	if (ret != 0) {
 		printf("create raw_pipeline_thread failed");
 		goto exit;
 	}
 	ctx->cap_thread_created = 1;
+	liveview_set_ffc_test_worker_active(1);
 	ret = pthread_create(&stream[0].proc_thread_id, NULL,
 		yuv_statistics_thread, (void *)stream);
 	if (ret != 0) {
@@ -2555,12 +4095,14 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	}
 	ctx->proc_started = 1;
 
-	ret = hd_videoproc_start(stream[0].proc_path_3dnr);
-	if (ret != HD_OK) {
-		printf("videoproc 3DNR start failed=%d\n", ret);
-		goto exit;
+	if (stream[0].proc_path_3dnr != 0) {
+		ret = hd_videoproc_start(stream[0].proc_path_3dnr);
+		if (ret != HD_OK) {
+			printf("videoproc 3DNR start failed=%d\n", ret);
+			goto exit;
+		}
+		ctx->proc_3dnr_started = 1;
 	}
-	ctx->proc_3dnr_started = 1;
 	ret = hd_videoproc_start(stream[0].proc_path_diag);
 	if (ret != HD_OK) {
 		printf("diagnostic videoproc start failed=%d\n", ret);
@@ -2597,15 +4139,18 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 	VIDEO_LIVEVIEW *stream = ctx->stream;
 	HD_RESULT ret;
 
+	g_diagnostic_video_output = NULL;
 	/* Wake threads that may still be waiting for the pipeline to start. */
 	stream[0].cap_exit = 1;
 	stream[0].proc_exit = 1;
+	liveview_finish_isp_step_test(-1);
 
 	if (ctx->cap_thread_created) {
 		pthread_join(stream[0].cap_thread_id, NULL);
 		ctx->cap_thread_created = 0;
 		stream[0].cap_thread_id = 0;
 	}
+	liveview_finish_ffc_test(-1);
 	if (ctx->proc_thread_created) {
 		pthread_join(stream[0].proc_thread_id, NULL);
 		ctx->proc_thread_created = 0;
@@ -2653,6 +4198,8 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 
 	nuc_bind_capture_callback(NULL);
 	nuc_bind_calibration_state_callback(NULL);
+	fos_bind_capture_callback(NULL, 0, 0);
+	fos_bind_calibration_state_callback(NULL);
 	bpr_bind_calibration_state_callback(NULL);
 	nuc_bind_runtime(0, 0, 0, NULL);
 	tdc_bind_capture_callback(NULL);
@@ -2717,6 +4264,7 @@ int liveview_init(void)
 	g_liveview.running = 0;
 	g_liveview.result = 0;
 	g_liveview.initialized = 1;
+	ffc_bind_test_callback(liveview_request_ffc_test);
 	gpio_shutter_set_failure_callback(
 		liveview_on_shutter_failure);
 	pthread_mutex_lock(&g_liveview_fault_lock);
@@ -3099,6 +4647,7 @@ void liveview_deinit(void)
 	}
 
 	liveview_stop_pipeline(&g_liveview);
+	ffc_bind_test_callback(NULL);
 	gpio_shutter_set_failure_callback(NULL);
 	g_liveview.initialized = 0;
 

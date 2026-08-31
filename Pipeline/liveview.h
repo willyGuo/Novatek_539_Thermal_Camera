@@ -19,6 +19,9 @@ unsigned int liveview_get_runtime_skip_frames(void);
 void liveview_set_shutter_close_wait_ms(unsigned int wait_ms);
 unsigned int liveview_get_shutter_close_wait_ms(void);
 int liveview_menu_run(void);
+int liveview_run_isp_raw_to_y_step_diagnostic(void);
+int liveview_run_isp_raw12_to_y_step_diagnostic(void);
+int liveview_run_isp_raw14_fine_step_diagnostic(void);
 void liveview_deinit(void);
 
 #endif

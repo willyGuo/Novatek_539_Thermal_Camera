@@ -13,11 +13,16 @@
 #include <fcntl.h>
 #endif
 
-#include "../Algorithm/BPR/bpr.h"
-#include "../Algorithm/FFC/ffc.h"
-#include "../Algorithm/NUC/nuc.h"
-#include "../Algorithm/TDC/tdc.h"
+#include "../Correction/BPR/bpr.h"
+#include "../Correction/FFC/ffc.h"
+#include "../Correction/NUC/nuc.h"
+#include "../Correction/TDC/tdc.h"
+#include "../Enhancement/AGC/agc_fieldscale.h"
+#include "../Enhancement/AGC/agc_histogram_p1_p99.h"
+#include "../Enhancement/AGC/agc_min_max_tone_curve.h"
+#include "../Enhancement/AGC/agc_mode.h"
 #include "../Enhancement/Gamma/gamma.h"
+#include "../Enhancement/ISP/videoproc_isp.h"
 #include "../Pipeline/liveview.h"
 
 #define APP_CONFIG_DIR "/mnt/sd"
@@ -45,6 +50,13 @@ typedef struct {
 	unsigned int shutter_close_wait_ms;
 	int tdc_correction;
 	unsigned int tdc_interval_sec;
+	int agc_histogram_p1_p99_enable;
+	int agc_min_max_tone_curve_enable;
+	int agc_fieldscale_enable;
+	int videoproc_af_enable;
+	int videoproc_wdr_enable;
+	int videoproc_defog_enable;
+	int videoproc_3dnr_enable;
 	int gamma_correction;
 	unsigned int gamma_mode;
 	unsigned int gamma_auto_sel;
@@ -151,6 +163,15 @@ static void cfg_initialize_from_runtime(void)
 		liveview_get_shutter_close_wait_ms();
 	g_app_config.tdc_correction = tdc_is_enabled();
 	g_app_config.tdc_interval_sec = tdc_get_interval_sec();
+	g_app_config.agc_histogram_p1_p99_enable =
+		agc_histogram_p1_p99_is_enabled();
+	g_app_config.agc_min_max_tone_curve_enable =
+		agc_min_max_tone_curve_is_enabled();
+	g_app_config.agc_fieldscale_enable = agc_fieldscale_is_enabled();
+	g_app_config.videoproc_af_enable = videoproc_isp_is_af_enabled();
+	g_app_config.videoproc_wdr_enable = videoproc_isp_is_wdr_enabled();
+	g_app_config.videoproc_defog_enable = videoproc_isp_is_defog_enabled();
+	g_app_config.videoproc_3dnr_enable = videoproc_isp_is_3dnr_enabled();
 	g_app_config.gamma_correction = gamma_is_enabled();
 	g_app_config.gamma_mode = gamma_get_mode();
 	g_app_config.gamma_auto_sel = gamma_get_auto_sel();
@@ -272,6 +293,49 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 	} else if (strcmp(key, "tdc_interval_sec") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0 || int_value <= 0) return -1;
 		config->tdc_interval_sec = (unsigned int)int_value;
+	} else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->agc_histogram_p1_p99_enable = int_value ? 1 : 0;
+		if (config->agc_histogram_p1_p99_enable) {
+			config->agc_fieldscale_enable = 0;
+			if (config->agc_min_max_tone_curve_enable) {
+				printf("AGC mutual exclusion: disable Min/Max Tone Curve AGC (ISP)\n");
+			}
+			config->agc_min_max_tone_curve_enable = 0;
+		}
+	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->agc_min_max_tone_curve_enable = int_value ? 1 : 0;
+		if (config->agc_min_max_tone_curve_enable) {
+			config->agc_fieldscale_enable = 0;
+			if (config->agc_histogram_p1_p99_enable) {
+				printf("AGC mutual exclusion: disable Histogram P1/P99 AGC (CPU)\n");
+			}
+			config->agc_histogram_p1_p99_enable = 0;
+		}
+	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->agc_fieldscale_enable = int_value ? 1 : 0;
+		if (config->agc_fieldscale_enable) {
+			if (config->agc_histogram_p1_p99_enable ||
+			    config->agc_min_max_tone_curve_enable) {
+				printf("AGC mutual exclusion: disable other AGC modes\n");
+			}
+			config->agc_histogram_p1_p99_enable = 0;
+			config->agc_min_max_tone_curve_enable = 0;
+		}
+	} else if (strcmp(key, "videoproc_af_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->videoproc_af_enable = int_value ? 1 : 0;
+	} else if (strcmp(key, "videoproc_wdr_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->videoproc_wdr_enable = int_value ? 1 : 0;
+	} else if (strcmp(key, "videoproc_defog_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->videoproc_defog_enable = int_value ? 1 : 0;
+	} else if (strcmp(key, "videoproc_3dnr_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0) return -1;
+		config->videoproc_3dnr_enable = int_value ? 1 : 0;
 	} else if (strcmp(key, "gamma_correction") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->gamma_correction = int_value ? 1 : 0;
@@ -325,6 +389,25 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	ffc_set_enabled(config->ffc_correction);
 	tdc_set_interval_sec(config->tdc_interval_sec);
 	tdc_set_enabled(config->tdc_correction);
+	if (config->agc_histogram_p1_p99_enable +
+	    config->agc_min_max_tone_curve_enable +
+	    config->agc_fieldscale_enable > 1) {
+		printf("invalid AGC CFG: multiple AGCs are enabled; keep all off\n");
+		agc_mode_set(AGC_MODE_OFF);
+		apply_result = -1;
+	} else if (config->agc_histogram_p1_p99_enable) {
+		agc_mode_set(AGC_MODE_HISTOGRAM_P1_P99_CPU);
+	} else if (config->agc_min_max_tone_curve_enable) {
+		agc_mode_set(AGC_MODE_MIN_MAX_TONE_CURVE_ISP);
+	} else if (config->agc_fieldscale_enable) {
+		agc_mode_set(AGC_MODE_FIELDSCALE_CPU);
+	} else {
+		agc_mode_set(AGC_MODE_OFF);
+	}
+	videoproc_isp_set_runtime(config->videoproc_af_enable,
+				  config->videoproc_wdr_enable,
+				  config->videoproc_defog_enable,
+				  config->videoproc_3dnr_enable);
 	gamma_set_mode(config->gamma_mode);
 	gamma_set_auto_sel(config->gamma_auto_sel);
 	gamma_set_load_bin(config->gamma_load_bin);
@@ -440,6 +523,20 @@ int app_config_get_int(const char *key, int *value)
 		*value = g_app_config.tdc_correction;
 	} else if (strcmp(key, "tdc_interval_sec") == 0) {
 		*value = (int)g_app_config.tdc_interval_sec;
+	} else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0) {
+		*value = g_app_config.agc_histogram_p1_p99_enable;
+	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
+		*value = g_app_config.agc_min_max_tone_curve_enable;
+	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
+		*value = g_app_config.agc_fieldscale_enable;
+	} else if (strcmp(key, "videoproc_af_enable") == 0) {
+		*value = g_app_config.videoproc_af_enable;
+	} else if (strcmp(key, "videoproc_wdr_enable") == 0) {
+		*value = g_app_config.videoproc_wdr_enable;
+	} else if (strcmp(key, "videoproc_defog_enable") == 0) {
+		*value = g_app_config.videoproc_defog_enable;
+	} else if (strcmp(key, "videoproc_3dnr_enable") == 0) {
+		*value = g_app_config.videoproc_3dnr_enable;
 	} else if (strcmp(key, "gamma_correction") == 0) {
 		*value = g_app_config.gamma_correction;
 	} else if (strcmp(key, "gamma_mode") == 0) {
@@ -473,6 +570,26 @@ int app_config_update_int(const char *key, int value)
 		g_app_config = old_config;
 		return -1;
 	}
+	if (app_config_save() != 0) {
+		g_app_config = old_config;
+		return -1;
+	}
+
+	app_config_print_restart_required();
+	return 0;
+}
+
+int app_config_update_videoproc_isp(int af_enable, int wdr_enable,
+				    int defog_enable, int three_dnr_enable)
+{
+	APP_CONFIG_VALUES old_config;
+
+	cfg_initialize_from_runtime();
+	old_config = g_app_config;
+	g_app_config.videoproc_af_enable = af_enable ? 1 : 0;
+	g_app_config.videoproc_wdr_enable = wdr_enable ? 1 : 0;
+	g_app_config.videoproc_defog_enable = defog_enable ? 1 : 0;
+	g_app_config.videoproc_3dnr_enable = three_dnr_enable ? 1 : 0;
 	if (app_config_save() != 0) {
 		g_app_config = old_config;
 		return -1;
@@ -580,6 +697,36 @@ static int app_config_show_file(void)
 	       g_app_config.tdc_correction ? "on" : "off");
 	printf("  2. %-31s = %u sec\n", "tdc_interval_sec",
 	       g_app_config.tdc_interval_sec);
+
+	printf("\n[AGC - mutually exclusive]\n");
+	printf("  1. %-31s = %d (%s)\n",
+	       "agc_histogram_p1_p99_enable",
+	       g_app_config.agc_histogram_p1_p99_enable,
+	       g_app_config.agc_histogram_p1_p99_enable ? "on" : "off");
+	printf("  2. %-31s = %d (%s)\n",
+	       "agc_min_max_tone_curve_enable",
+	       g_app_config.agc_min_max_tone_curve_enable,
+	       g_app_config.agc_min_max_tone_curve_enable ? "on" : "off");
+	printf("  3. %-31s = %d (%s)\n",
+	       "agc_fieldscale_enable",
+	       g_app_config.agc_fieldscale_enable,
+	       g_app_config.agc_fieldscale_enable ? "on" : "off");
+	printf("     selected runtime AGC: %s\n",
+	       agc_mode_name(agc_mode_get()));
+
+	printf("\n[VideoProc / ISP]\n");
+	printf("  1. %-31s = %d (%s)\n", "videoproc_af_enable",
+	       g_app_config.videoproc_af_enable,
+	       g_app_config.videoproc_af_enable ? "on" : "off");
+	printf("  2. %-31s = %d (%s)\n", "videoproc_wdr_enable",
+	       g_app_config.videoproc_wdr_enable,
+	       g_app_config.videoproc_wdr_enable ? "on" : "off");
+	printf("  3. %-31s = %d (%s)\n", "videoproc_defog_enable",
+	       g_app_config.videoproc_defog_enable,
+	       g_app_config.videoproc_defog_enable ? "on" : "off");
+	printf("  4. %-31s = %d (%s)\n", "videoproc_3dnr_enable",
+	       g_app_config.videoproc_3dnr_enable,
+	       g_app_config.videoproc_3dnr_enable ? "on" : "off");
 
 	printf("\n[Gamma]\n");
 	printf("  1. %-31s = %d (%s)\n", "gamma_correction",
@@ -1006,6 +1153,76 @@ static int app_config_gamma_menu_run(void)
 	return ret;
 }
 
+static int app_config_agc_menu_run(void)
+{
+	int option;
+	int running = 1;
+	int ret = 0;
+
+	while (running) {
+		printf("----------------------------------------\n");
+		printf("AGC setting (mutually exclusive)\n");
+		printf(" 1. Histogram P1/P99 AGC (CPU) on/off\n");
+		printf(" 2. Min/Max Tone Curve AGC (ISP) on/off\n");
+		printf(" 3. Fieldscale Local Adaptive AGC (CPU) on/off\n");
+		printf(" 4. Disable all AGC\n");
+		printf(" 0. Back\n");
+		printf("----------------------------------------\n");
+		printf("selected runtime AGC: %s\n",
+		       agc_mode_name(agc_mode_get()));
+		printf("pending CFG: Histogram P1/P99=%s, "
+		       "Min/Max Tone Curve=%s, Fieldscale=%s\n",
+		       g_app_config.agc_histogram_p1_p99_enable ? "on" : "off",
+		       g_app_config.agc_min_max_tone_curve_enable ? "on" : "off",
+		       g_app_config.agc_fieldscale_enable ? "on" : "off");
+		printf("enabling one AGC automatically disables the other AGCs\n");
+		printf("pipeline: after RAW snapshot, before VideoProc\n");
+
+		option = app_config_read_option();
+		switch (option) {
+		case 1:
+			ret = app_config_prompt_bool(
+				"Histogram P1/P99 AGC (CPU)",
+				"agc_histogram_p1_p99_enable",
+				g_app_config.agc_histogram_p1_p99_enable);
+			break;
+		case 2:
+			ret = app_config_prompt_bool(
+				"Min/Max Tone Curve AGC (ISP)",
+				"agc_min_max_tone_curve_enable",
+				g_app_config.agc_min_max_tone_curve_enable);
+			break;
+		case 3:
+			ret = app_config_prompt_bool(
+				"Fieldscale Local Adaptive AGC (CPU)",
+				"agc_fieldscale_enable",
+				g_app_config.agc_fieldscale_enable);
+			break;
+		case 4:
+			g_app_config.agc_histogram_p1_p99_enable = 0;
+			g_app_config.agc_min_max_tone_curve_enable = 0;
+			g_app_config.agc_fieldscale_enable = 0;
+			ret = app_config_save();
+			if (ret == 0) {
+				printf("All pending CFG AGC modes disabled\n");
+				app_config_print_restart_required();
+			}
+			break;
+		case 0:
+		case -1:
+			running = 0;
+			break;
+		case MENU_OPTION_REFRESH:
+			break;
+		default:
+			printf("Invalid option\n");
+			break;
+		}
+	}
+
+	return ret;
+}
+
 int app_config_menu_run(void)
 {
 	int option;
@@ -1022,9 +1239,11 @@ int app_config_menu_run(void)
 		printf(" 4. NUC setting\n");
 		printf(" 5. TDC setting\n");
 		printf(" 6. Gamma setting\n");
-		printf(" 7. Show current tiffany_thermal.cfg\n");
-		printf(" 8. Generate tiffany_thermal.cfg\n");
-		printf(" 9. Use CFG on next boot/restart on/off\n");
+		printf(" 7. AGC setting (mutually exclusive)\n");
+		printf(" 8. VideoProc / ISP setting\n");
+		printf(" 9. Show current tiffany_thermal.cfg\n");
+		printf("10. Generate tiffany_thermal.cfg\n");
+		printf("11. Use CFG on next boot/restart on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("pending CFG: boot load %s\n",
@@ -1051,12 +1270,18 @@ int app_config_menu_run(void)
 			ret = app_config_gamma_menu_run();
 			break;
 		case 7:
-			ret = app_config_show_file();
+			ret = app_config_agc_menu_run();
 			break;
 		case 8:
-			ret = app_config_save();
+			ret = videoproc_isp_menu_run();
 			break;
 		case 9:
+			ret = app_config_show_file();
+			break;
+		case 10:
+			ret = app_config_save();
+			break;
+		case 11:
 			ret = app_config_prompt_bool(
 				"Use CFG on next boot/restart",
 				"cfg_boot_load",
@@ -1134,6 +1359,20 @@ int app_config_save(void)
 	fprintf(fp, "tdc_correction=%d\n", g_app_config.tdc_correction);
 	fprintf(fp, "tdc_interval_sec=%u\n",
 		g_app_config.tdc_interval_sec);
+	fprintf(fp, "agc_histogram_p1_p99_enable=%d\n",
+		g_app_config.agc_histogram_p1_p99_enable);
+	fprintf(fp, "agc_min_max_tone_curve_enable=%d\n",
+		g_app_config.agc_min_max_tone_curve_enable);
+	fprintf(fp, "agc_fieldscale_enable=%d\n",
+		g_app_config.agc_fieldscale_enable);
+	fprintf(fp, "videoproc_af_enable=%d\n",
+		g_app_config.videoproc_af_enable);
+	fprintf(fp, "videoproc_wdr_enable=%d\n",
+		g_app_config.videoproc_wdr_enable);
+	fprintf(fp, "videoproc_defog_enable=%d\n",
+		g_app_config.videoproc_defog_enable);
+	fprintf(fp, "videoproc_3dnr_enable=%d\n",
+		g_app_config.videoproc_3dnr_enable);
 	fprintf(fp, "gamma_correction=%d\n",
 		g_app_config.gamma_correction);
 	fprintf(fp, "gamma_mode=%u\n", g_app_config.gamma_mode);

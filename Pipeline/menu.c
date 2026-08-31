@@ -4,12 +4,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "../Algorithm/BPR/bpr.h"
-#include "../Algorithm/FFC/ffc.h"
-#include "../Algorithm/NUC/nuc.h"
-#include "../Algorithm/TDC/tdc.h"
+#include "../Correction/BPR/bpr.h"
+#include "../Correction/FFC/ffc.h"
+#include "../Correction/NUC/nuc.h"
+#include "../Correction/TDC/tdc.h"
 #include "../Config/app_config.h"
-#include "../Enhancement/Gamma/gamma.h"
+#include "../Device/FOS/fos.h"
+#include "../Enhancement/AGC/agc_mode.h"
+#include "../Enhancement/ISP/videoproc_isp.h"
+#include "../Diagnostics/diagnostics_menu.h"
 #include "../app.h"
 #include "liveview.h"
 
@@ -63,7 +66,10 @@ int menu_run(void)
 		printf(" 4. NUC\n");
 		printf(" 5. FFC\n");
 		printf(" 6. TDC\n");
-		printf(" 7. Gamma\n");
+		printf(" 7. AGC\n");
+		printf(" 8. FOS\n");
+		printf(" 9. VideoProc / ISP\n");
+		printf("10. Image Pipeline Diagnostics\n");
 		printf(" q. Quit\n");
 		printf("----------------------------------------\n");
 
@@ -94,7 +100,19 @@ int menu_run(void)
 			break;
 
 		case 7:
-			ret = gamma_menu_run();
+			ret = agc_menu_run();
+			break;
+
+		case 8:
+			ret = fos_menu_run();
+			break;
+
+		case 9:
+			ret = videoproc_isp_menu_run();
+			break;
+
+		case 10:
+			ret = diagnostics_menu_run();
 			break;
 
 		case MENU_OPTION_REFRESH:

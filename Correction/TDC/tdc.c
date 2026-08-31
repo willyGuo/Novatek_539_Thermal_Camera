@@ -13,7 +13,7 @@
 #endif
 #include "tdc.h"
 #include <inttypes.h>
-#include "../../Device/sensor_temp.h"
+#include "../../Device/SensorTemp/sensor_temp.h"
 #include "vendor_gfx.h"
 
 #define TDC_DIR "/mnt/sd/thermal_op"
