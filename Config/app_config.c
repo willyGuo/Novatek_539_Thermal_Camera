@@ -21,7 +21,6 @@
 #include "../Enhancement/AGC/agc_histogram_p1_p99.h"
 #include "../Enhancement/AGC/agc_min_max_tone_curve.h"
 #include "../Enhancement/AGC/agc_mode.h"
-#include "../Enhancement/Gamma/gamma.h"
 #include "../Enhancement/ISP/videoproc_isp.h"
 #include "../Pipeline/liveview.h"
 
@@ -57,10 +56,6 @@ typedef struct {
 	int videoproc_wdr_enable;
 	int videoproc_defog_enable;
 	int videoproc_3dnr_enable;
-	int gamma_correction;
-	unsigned int gamma_mode;
-	unsigned int gamma_auto_sel;
-	int gamma_load_bin;
 } APP_CONFIG_VALUES;
 
 static APP_CONFIG_VALUES g_app_config;
@@ -172,10 +167,6 @@ static void cfg_initialize_from_runtime(void)
 	g_app_config.videoproc_wdr_enable = videoproc_isp_is_wdr_enabled();
 	g_app_config.videoproc_defog_enable = videoproc_isp_is_defog_enabled();
 	g_app_config.videoproc_3dnr_enable = videoproc_isp_is_3dnr_enabled();
-	g_app_config.gamma_correction = gamma_is_enabled();
-	g_app_config.gamma_mode = gamma_get_mode();
-	g_app_config.gamma_auto_sel = gamma_get_auto_sel();
-	g_app_config.gamma_load_bin = gamma_get_load_bin();
 	g_app_config.initialized = 1;
 }
 
@@ -336,18 +327,6 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 	} else if (strcmp(key, "videoproc_3dnr_enable") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->videoproc_3dnr_enable = int_value ? 1 : 0;
-	} else if (strcmp(key, "gamma_correction") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0) return -1;
-		config->gamma_correction = int_value ? 1 : 0;
-	} else if (strcmp(key, "gamma_mode") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0 || int_value < 0) return -1;
-		config->gamma_mode = (unsigned int)int_value;
-	} else if (strcmp(key, "gamma_auto_sel") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0 || int_value < 0) return -1;
-		config->gamma_auto_sel = (unsigned int)int_value;
-	} else if (strcmp(key, "gamma_load_bin") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0) return -1;
-		config->gamma_load_bin = int_value ? 1 : 0;
 	} else {
 		return 1;
 	}
@@ -408,10 +387,6 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 				  config->videoproc_wdr_enable,
 				  config->videoproc_defog_enable,
 				  config->videoproc_3dnr_enable);
-	gamma_set_mode(config->gamma_mode);
-	gamma_set_auto_sel(config->gamma_auto_sel);
-	gamma_set_load_bin(config->gamma_load_bin);
-	gamma_set_enabled(config->gamma_correction);
 	return apply_result;
 }
 
@@ -537,14 +512,6 @@ int app_config_get_int(const char *key, int *value)
 		*value = g_app_config.videoproc_defog_enable;
 	} else if (strcmp(key, "videoproc_3dnr_enable") == 0) {
 		*value = g_app_config.videoproc_3dnr_enable;
-	} else if (strcmp(key, "gamma_correction") == 0) {
-		*value = g_app_config.gamma_correction;
-	} else if (strcmp(key, "gamma_mode") == 0) {
-		*value = (int)g_app_config.gamma_mode;
-	} else if (strcmp(key, "gamma_auto_sel") == 0) {
-		*value = (int)g_app_config.gamma_auto_sel;
-	} else if (strcmp(key, "gamma_load_bin") == 0) {
-		*value = g_app_config.gamma_load_bin;
 	} else {
 		return -1;
 	}
@@ -727,18 +694,6 @@ static int app_config_show_file(void)
 	printf("  4. %-31s = %d (%s)\n", "videoproc_3dnr_enable",
 	       g_app_config.videoproc_3dnr_enable,
 	       g_app_config.videoproc_3dnr_enable ? "on" : "off");
-
-	printf("\n[Gamma]\n");
-	printf("  1. %-31s = %d (%s)\n", "gamma_correction",
-	       g_app_config.gamma_correction,
-	       g_app_config.gamma_correction ? "on" : "off");
-	printf("  2. %-31s = %d (%s)\n", "gamma_load_bin",
-	       g_app_config.gamma_load_bin,
-	       g_app_config.gamma_load_bin ? "on" : "off");
-	printf("  3. %-31s = %u\n", "gamma_mode",
-	       g_app_config.gamma_mode);
-	printf("  4. %-31s = %u\n", "gamma_auto_sel",
-	       g_app_config.gamma_auto_sel);
 
 	printf("\n");
 	return 0;
@@ -1092,67 +1047,6 @@ static int app_config_tdc_menu_run(void)
 	return ret;
 }
 
-static int app_config_gamma_menu_run(void)
-{
-	int option;
-	int running = 1;
-	int ret = 0;
-
-	while (running) {
-		printf("----------------------------------------\n");
-		printf("Gamma setting\n");
-		printf(" 1. Gamma on/off\n");
-		printf(" 2. Use Gamma bin on/off\n");
-		printf(" 3. Gamma mode\n");
-		printf(" 4. Gamma auto selection\n");
-		printf(" 0. Back\n");
-		printf("----------------------------------------\n");
-		printf("runtime: Gamma=%s, bin=%s, mode=%u, auto_sel=%u\n",
-		       gamma_is_enabled() ? "on" : "off",
-		       gamma_get_load_bin() ? "on" : "off",
-		       gamma_get_mode(), gamma_get_auto_sel());
-		printf("pending CFG: Gamma=%s, bin=%s, mode=%u, auto_sel=%u\n",
-		       g_app_config.gamma_correction ? "on" : "off",
-		       g_app_config.gamma_load_bin ? "on" : "off",
-		       g_app_config.gamma_mode, g_app_config.gamma_auto_sel);
-
-		option = app_config_read_option();
-		switch (option) {
-		case 1:
-			ret = app_config_prompt_bool("Gamma", "gamma_correction",
-				g_app_config.gamma_correction);
-			break;
-		case 2:
-			ret = app_config_prompt_bool("Use Gamma bin",
-				"gamma_load_bin",
-				g_app_config.gamma_load_bin);
-			break;
-		case 3:
-			ret = app_config_prompt_int("Gamma mode",
-				"gamma_mode", (int)g_app_config.gamma_mode,
-				0, 1, "");
-			break;
-		case 4:
-			ret = app_config_prompt_int("Gamma auto selection",
-				"gamma_auto_sel",
-				(int)g_app_config.gamma_auto_sel,
-				1, 2, "");
-			break;
-		case 0:
-		case -1:
-			running = 0;
-			break;
-		case MENU_OPTION_REFRESH:
-			break;
-		default:
-			printf("Invalid option\n");
-			break;
-		}
-	}
-
-	return ret;
-}
-
 static int app_config_agc_menu_run(void)
 {
 	int option;
@@ -1238,12 +1132,11 @@ int app_config_menu_run(void)
 		printf(" 3. FFC setting / Shutter\n");
 		printf(" 4. NUC setting\n");
 		printf(" 5. TDC setting\n");
-		printf(" 6. Gamma setting\n");
-		printf(" 7. AGC setting (mutually exclusive)\n");
-		printf(" 8. VideoProc / ISP setting\n");
-		printf(" 9. Show current tiffany_thermal.cfg\n");
-		printf("10. Generate tiffany_thermal.cfg\n");
-		printf("11. Use CFG on next boot/restart on/off\n");
+		printf(" 6. AGC setting (mutually exclusive)\n");
+		printf(" 7. VideoProc / ISP setting\n");
+		printf(" 8. Show current tiffany_thermal.cfg\n");
+		printf(" 9. Generate tiffany_thermal.cfg\n");
+		printf("10. Use CFG on next boot/restart on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("pending CFG: boot load %s\n",
@@ -1267,21 +1160,18 @@ int app_config_menu_run(void)
 			ret = app_config_tdc_menu_run();
 			break;
 		case 6:
-			ret = app_config_gamma_menu_run();
-			break;
-		case 7:
 			ret = app_config_agc_menu_run();
 			break;
-		case 8:
+		case 7:
 			ret = videoproc_isp_menu_run();
 			break;
-		case 9:
+		case 8:
 			ret = app_config_show_file();
 			break;
-		case 10:
+		case 9:
 			ret = app_config_save();
 			break;
-		case 11:
+		case 10:
 			ret = app_config_prompt_bool(
 				"Use CFG on next boot/restart",
 				"cfg_boot_load",
@@ -1373,12 +1263,6 @@ int app_config_save(void)
 		g_app_config.videoproc_defog_enable);
 	fprintf(fp, "videoproc_3dnr_enable=%d\n",
 		g_app_config.videoproc_3dnr_enable);
-	fprintf(fp, "gamma_correction=%d\n",
-		g_app_config.gamma_correction);
-	fprintf(fp, "gamma_mode=%u\n", g_app_config.gamma_mode);
-	fprintf(fp, "gamma_auto_sel=%u\n", g_app_config.gamma_auto_sel);
-	fprintf(fp, "gamma_load_bin=%d\n", g_app_config.gamma_load_bin);
-
 	if (ferror(fp)) {
 		printf("write config temp (%s) fail\n", APP_CONFIG_TEMP_PATH);
 		goto save_fail;

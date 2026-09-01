@@ -139,7 +139,7 @@ int videoproc_isp_menu_run(void)
 		printf(" 4. 3DNR + 3DNR statistics on/off\n");
 		printf(" 5. All on\n");
 		printf(" 6. All off\n");
-		printf(" 7. Gamma status\n");
+		printf(" 7. Gamma on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: AF=%s, WDR=%s, DEFOG=%s, 3DNR=%s\n",

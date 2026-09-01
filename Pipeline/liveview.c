@@ -3837,6 +3837,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	HD_DIM main_dim;
 	ISPT_C_GAIN cgain = {0};
 	IQT_CFG_INFO cfg_info = {0};
+	int isp_cfg_loaded = 0;
 	NUC_IMAGE_LAYOUT nuc_layout = {
 		.raw_width = RAW_SIZE_W,
 		.raw_height = RAW_SIZE_H,
@@ -3894,14 +3895,16 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	cgain.gain[2] = 256;
 	vendor_isp_set_common(ISPT_ITEM_C_GAIN, &cgain);
 
+	gamma_reset();
 	cfg_info.id = g_thermal_pipeline_id;
-	strncpy(cfg_info.path, "/mnt/sd/isp_ty640_0.cfg", CFG_NAME_LENGTH);
+	strncpy(cfg_info.path, THERMAL_ISP_CONFIG_PATH, CFG_NAME_LENGTH);
 	ret = vendor_isp_set_iq(IQT_ITEM_RLD_CONFIG, &cfg_info);
 	if (ret != HD_OK) {
 		printf("ISP IQ reload failed=%d, path=%s\n", ret, cfg_info.path);
 		ret = HD_OK;
 	} else {
 		printf("ISP IQ reload ok: %s\n", cfg_info.path);
+		isp_cfg_loaded = 1;
 	}
 
 	ret = bpr_load_table();
@@ -3910,10 +3913,16 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		ret = HD_OK;
 	}
 
-	ret = gamma_init_from_isp();
-	if (ret != HD_OK) {
-		printf("init Gamma from ISP failed=%d, keep ISP cfg Gamma\n", ret);
-		ret = HD_OK;
+	if (isp_cfg_loaded) {
+		ret = gamma_init_from_isp();
+		if (ret != HD_OK) {
+			printf("init Gamma from ISP failed=%d, keep ISP cfg Gamma\n",
+			       ret);
+			ret = HD_OK;
+		}
+	} else {
+		printf("Gamma control unavailable because ISP cfg was not loaded: %s\n",
+		       THERMAL_ISP_CONFIG_PATH);
 	}
 
 	if (gpio_shutter_open() != 0) {
@@ -3969,13 +3978,6 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	if (ret != 0) {
 		printf("apply CFG settings failed; check the messages above\n");
 	}
-	ret = gamma_apply();
-	if (ret != HD_OK) {
-		printf("apply custom Gamma failed=%d, keep available Gamma settings\n",
-		       ret);
-		ret = HD_OK;
-	}
-
 	// open video_liveview modules (main)
 	stream[0].proc_max_dim.w = VDO_SIZE_W; //assign by user
 	stream[0].proc_max_dim.h = VDO_SIZE_H; //assign by user

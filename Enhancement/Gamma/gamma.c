@@ -8,22 +8,10 @@
 #include "../../Config/hardware_config.h"
 #include "vendor_isp.h"
 
-#define GAMMA_BIN_PATH "/mnt/sd/thermal_op/gamma.bin"
-#define GAMMA_LUT_SIZE 129U
-#define GAMMA_AUTO_SET_COUNT 5U
 #define MENU_OPTION_REFRESH (-2)
 
-typedef struct {
-	UINT32 manual_lut[GAMMA_LUT_SIZE];
-	UINT32 auto_set_lut[GAMMA_AUTO_SET_COUNT][GAMMA_LUT_SIZE];
-} GAMMA_BIN_TABLE;
-
-static int g_gamma_default_ready;
-static IQT_GAMMA_PARAM g_gamma_default;
-static int g_gamma_enabled = 1;
-static UINT32 g_gamma_mode;
-static UINT32 g_gamma_auto_sel = 2;
-static int g_gamma_load_bin;
+static int g_gamma_ready;
+static IQT_GAMMA_PARAM g_gamma_runtime;
 
 static int gamma_read_option(void)
 {
@@ -35,7 +23,6 @@ static int gamma_read_option(void)
 	if (fgets(buf, sizeof(buf), stdin) == NULL) {
 		return -1;
 	}
-
 	if (buf[0] == 'q' || buf[0] == 'Q') {
 		return -1;
 	}
@@ -58,166 +45,108 @@ static int gamma_read_option(void)
 	return (int)value;
 }
 
-static int gamma_read_bin(GAMMA_BIN_TABLE *table)
-{
-	FILE *fp;
-	UINT32 read_size;
-
-	fp = fopen(GAMMA_BIN_PATH, "rb");
-	if (fp == NULL) {
-		printf("open Gamma bin (%s) fail\n", GAMMA_BIN_PATH);
-		return -1;
-	}
-
-	read_size = (UINT32)fread(table, 1, sizeof(*table), fp);
-	fclose(fp);
-	if (read_size != sizeof(*table)) {
-		printf("read Gamma bin size error, read=%u expect=%u\n",
-		       read_size, (UINT32)sizeof(*table));
-		return -1;
-	}
-
-	return 0;
-}
-
-static void gamma_copy_bin_to_iq(const GAMMA_BIN_TABLE *table,
-				 IQT_GAMMA_PARAM *gamma)
-{
-	memcpy(gamma->gamma.manual_lut, table->manual_lut,
-	       sizeof(table->manual_lut));
-	memcpy(gamma->gamma.auto_set0_lut, table->auto_set_lut[0],
-	       sizeof(table->auto_set_lut[0]));
-	memcpy(gamma->gamma.auto_set1_lut, table->auto_set_lut[1],
-	       sizeof(table->auto_set_lut[1]));
-	memcpy(gamma->gamma.auto_set2_lut, table->auto_set_lut[2],
-	       sizeof(table->auto_set_lut[2]));
-	memcpy(gamma->gamma.auto_set3_lut, table->auto_set_lut[3],
-	       sizeof(table->auto_set_lut[3]));
-	memcpy(gamma->gamma.auto_set4_lut, table->auto_set_lut[4],
-	       sizeof(table->auto_set_lut[4]));
-}
-
 HD_RESULT gamma_init_from_isp(void)
 {
+	IQT_GAMMA_PARAM gamma;
 	HD_RESULT ret;
 
-	memset(&g_gamma_default, 0, sizeof(g_gamma_default));
-	g_gamma_default.id = g_thermal_pipeline_id;
-	ret = vendor_isp_get_iq(IQT_ITEM_GAMMA_PARAM, &g_gamma_default);
+	memset(&gamma, 0, sizeof(gamma));
+	gamma.id = g_thermal_pipeline_id;
+	ret = vendor_isp_get_iq(IQT_ITEM_GAMMA_PARAM, &gamma);
 	if (ret != HD_OK) {
-		g_gamma_default_ready = 0;
-		printf("get default Gamma from ISP failed=%d\n", ret);
+		g_gamma_ready = 0;
+		printf("get Gamma from loaded ISP cfg failed=%d, path=%s\n",
+		       ret, THERMAL_ISP_CONFIG_PATH);
 		return ret;
 	}
 
-	g_gamma_default_ready = 1;
-	g_gamma_enabled = g_gamma_default.gamma.enable ? 1 : 0;
-	g_gamma_mode = g_gamma_default.gamma.mode;
-	g_gamma_auto_sel = g_gamma_default.gamma.auto_sel;
-	printf("Default Gamma loaded from ISP\n");
+	g_gamma_runtime = gamma;
+	g_gamma_ready = 1;
+	printf("Gamma loaded from ISP cfg: %s, enable=%s\n",
+	       THERMAL_ISP_CONFIG_PATH,
+	       g_gamma_runtime.gamma.enable ? "on" : "off");
 	return HD_OK;
 }
 
-HD_RESULT gamma_apply(void)
+void gamma_reset(void)
 {
-	GAMMA_BIN_TABLE table;
+	g_gamma_ready = 0;
+	memset(&g_gamma_runtime, 0, sizeof(g_gamma_runtime));
+}
+
+HD_RESULT gamma_set_enabled(int enable)
+{
 	IQT_GAMMA_PARAM gamma;
 	HD_RESULT ret;
-	int bin_ret = 0;
 
-	if (!g_gamma_default_ready) {
-		printf("Default Gamma is not ready\n");
+	if (!g_gamma_ready) {
+		printf("Gamma is unavailable; ISP cfg was not loaded from %s\n",
+		       THERMAL_ISP_CONFIG_PATH);
 		return HD_ERR_NG;
 	}
 
-	memcpy(&gamma, &g_gamma_default, sizeof(gamma));
+	gamma = g_gamma_runtime;
 	gamma.id = g_thermal_pipeline_id;
-	gamma.gamma.enable = g_gamma_enabled;
-	gamma.gamma.mode = g_gamma_mode;
-	gamma.gamma.auto_sel = g_gamma_auto_sel;
-
-	if (g_gamma_load_bin) {
-		bin_ret = gamma_read_bin(&table);
-		if (bin_ret == 0) {
-			gamma_copy_bin_to_iq(&table, &gamma);
-		} else {
-			printf("Keep ISP cfg default Gamma LUT\n");
-		}
-	}
-
+	gamma.gamma.enable = enable ? 1 : 0;
 	ret = vendor_isp_set_iq(IQT_ITEM_GAMMA_PARAM, &gamma);
 	if (ret != HD_OK) {
-		printf("apply Gamma failed=%d\n", ret);
+		printf("set Gamma runtime enable failed=%d\n", ret);
 		return ret;
 	}
 
-	printf("Gamma applied: %s, mode=%u, auto_sel=%u, LUT=%s\n",
-	       g_gamma_enabled ? "on" : "off",
-	       g_gamma_mode,
-	       g_gamma_auto_sel,
-	       g_gamma_load_bin && bin_ret == 0 ? "bin" : "ISP cfg");
-
-	return bin_ret == 0 ? HD_OK : HD_ERR_NG;
-}
-
-void gamma_set_enabled(int enable)
-{
-	g_gamma_enabled = enable ? 1 : 0;
+	g_gamma_runtime = gamma;
+	printf("Gamma runtime enable=%s; source cfg remains %s\n",
+	       g_gamma_runtime.gamma.enable ? "on" : "off",
+	       THERMAL_ISP_CONFIG_PATH);
+	return HD_OK;
 }
 
 int gamma_is_enabled(void)
 {
-	return g_gamma_enabled;
-}
-
-void gamma_set_mode(UINT32 mode)
-{
-	g_gamma_mode = mode;
-}
-
-UINT32 gamma_get_mode(void)
-{
-	return g_gamma_mode;
-}
-
-void gamma_set_auto_sel(UINT32 auto_sel)
-{
-	g_gamma_auto_sel = auto_sel;
-}
-
-UINT32 gamma_get_auto_sel(void)
-{
-	return g_gamma_auto_sel;
-}
-
-void gamma_set_load_bin(int enable)
-{
-	g_gamma_load_bin = enable ? 1 : 0;
-}
-
-int gamma_get_load_bin(void)
-{
-	return g_gamma_load_bin;
+	return g_gamma_ready && g_gamma_runtime.gamma.enable;
 }
 
 int gamma_menu_run(void)
 {
 	int option;
+	int value;
 	int running = 1;
+	int ret = 0;
+
+	if (!g_gamma_ready) {
+		printf("Gamma is unavailable; start Liveview with a valid %s first\n",
+		       THERMAL_ISP_CONFIG_PATH);
+		return -1;
+	}
 
 	while (running) {
 		printf("----------------------------------------\n");
-		printf("Gamma status\n");
+		printf("Gamma\n");
+		printf(" 1. Gamma on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: Gamma=%s, Gamma bin=%s, mode=%u, auto_sel=%u\n",
-		       g_gamma_enabled ? "on" : "off",
-		       g_gamma_load_bin ? "on" : "off",
-		       g_gamma_mode, g_gamma_auto_sel);
-		printf("Settings: CFG Setting -> Gamma setting\n");
+		printf("ISP cfg: %s\n", THERMAL_ISP_CONFIG_PATH);
+		printf("runtime: Gamma=%s\n",
+		       gamma_is_enabled() ? "on" : "off");
+		printf("Changes apply to the current ISP runtime only.\n");
 
 		option = gamma_read_option();
 		switch (option) {
+		case 1:
+			printf("Gamma (0: off, 1: on, runtime: %s)\n",
+			       gamma_is_enabled() ? "on" : "off");
+			value = gamma_read_option();
+			if (value == -1 || value == MENU_OPTION_REFRESH) {
+				break;
+			}
+			if (value != 0 && value != 1) {
+				printf("Invalid Gamma value, enter 0 or 1\n");
+				ret = -1;
+				break;
+			}
+			ret = gamma_set_enabled(value);
+			break;
+
 		case 0:
 		case -1:
 			running = 0;
@@ -232,5 +161,5 @@ int gamma_menu_run(void)
 		}
 	}
 
-	return 0;
+	return ret;
 }

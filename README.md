@@ -199,12 +199,11 @@ CFG Setting
  3. Shutter / FFC setting
  4. NUC setting
  5. TDC setting
- 6. Gamma setting
- 7. AGC setting (mutually exclusive)
- 8. VideoProc / ISP setting
- 9. Show current tiffany_thermal.cfg
-10. Generate tiffany_thermal.cfg
-11. Use CFG on next boot/restart on/off
+ 6. AGC setting (mutually exclusive)
+ 7. VideoProc / ISP setting
+ 8. Show current tiffany_thermal.cfg
+ 9. Generate tiffany_thermal.cfg
+10. Use CFG on next boot/restart on/off
  0. Back
 pending CFG: boot load on/off
 ```
@@ -216,7 +215,6 @@ pending CFG: boot load on/off
 - `Shutter / FFC setting`：FFC enable、FFC/Runtime BPR 共用 shutter interval、shutter close wait time。
 - `NUC setting`：NUC enable 與 Sensor Temperature table interval。五點 Sensor 溫度由 NUC calibration 自動寫入，不提供手動修改。
 - `TDC setting`：TDC enable 與 update interval。
-- `Gamma setting`：Gamma enable、Gamma bin、mode 與 auto selection。
 - `AGC setting`：Histogram P1/P99 CPU AGC 與 Min/Max ISP Tone Curve AGC，兩者互斥。
 - `VideoProc / ISP setting`：AF、WDR、DEFOG、3DNR 個別開關，以及全開／全關。
 - `Show current tiffany_thermal.cfg`：直接顯示 SD 卡上的完整 cfg。
@@ -267,10 +265,6 @@ videoproc_af_enable=1
 videoproc_wdr_enable=1
 videoproc_defog_enable=1
 videoproc_3dnr_enable=1
-gamma_correction=1
-gamma_mode=0
-gamma_auto_sel=2
-gamma_load_bin=0
 ```
 
 欄位說明：
@@ -300,11 +294,6 @@ gamma_load_bin=0
 | `videoproc_wdr_enable` | VideoProc WDR flag on/off，預設 `1` |
 | `videoproc_defog_enable` | VideoProc DEFOG flag on/off，預設 `1` |
 | `videoproc_3dnr_enable` | VideoProc 3DNR 與 3DNR statistics flag on/off，預設 `1` |
-| `gamma_correction` | Gamma on/off |
-| `gamma_mode` | Gamma mode |
-| `gamma_auto_sel` | Gamma auto set 選擇 |
-| `gamma_load_bin` | 是否載入自訂 `gamma.bin` |
-
 如果檔案不存在，程式會建立預設 cfg。任何設定修改只寫入 cfg；使用者必須執行 `Liveview Restart` 或重新開機才會套用。
 
 ## BPR／DPC
@@ -514,7 +503,7 @@ VideoProc / ISP setting
  4. 3DNR + 3DNR statistics on/off
  5. All on
  6. All off
- 7. Gamma status
+ 7. Gamma on/off
  0. Back
 ```
 
@@ -522,14 +511,21 @@ VideoProc / ISP setting
 
 ## Gamma
 
-Gamma 入口已整合至 `VideoProc / ISP -> Gamma status`，只保留 runtime 狀態：
+Gamma 入口整合至 `VideoProc / ISP -> Gamma on/off`。完整 Gamma
+參數由 Liveview 啟動時載入的 `/mnt/sd/isp_ty640_0.cfg` 提供，選單只修改
+目前 ISP runtime 的 `enable`，不修改 mode、auto selection 或 LUT：
 
 ```text
-Gamma status
+Gamma
+ 1. Gamma on/off
  0. Back
 ```
 
-Gamma enable、是否使用 `gamma.bin`、mode 與 auto selection 都集中到 `CFG Setting -> Gamma setting`。設定寫入 cfg 後，必須 Liveview Restart 或重新開機才套用。
+選擇 `Gamma on/off` 後必須明確輸入 `0: off` 或 `1: on`，並立即透過
+`IQT_ITEM_GAMMA_PARAM` 套用到目前 ISP。程式不會反向寫入 vendor IQ cfg；
+Liveview Restart 或重新開機後，Gamma enable 會再次以
+`/mnt/sd/isp_ty640_0.cfg` 的內容為準。原本的 `gamma.bin`、mode 與
+auto selection 應用層覆蓋功能已移除。
 
 ## Shutter GPIO
 
@@ -549,7 +545,7 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 | 路徑 | 用途 | 產生／載入時機 |
 |---|---|---|
 | `/mnt/sd/tiffany_thermal.cfg` | 使用者設定 | 設定時立即保存；Liveview Start／Restart 或開機時載入 |
-| `/mnt/sd/isp_ty640_0.cfg` | ISP cfg | Liveview 啟動時載入 |
+| `/mnt/sd/isp_ty640_0.cfg` | ISP cfg，包含 Gamma 完整參數與預設 enable | Liveview 啟動時載入；Gamma menu 只暫時修改目前 runtime enable |
 | `/mnt/sd/thermal_op/dpc_table.bin` | BPR/DPC table | Liveview 啟動時由 Tiffany 直接載入 ISP；Bright/Dark BPR 或 Runtime BPR 產生新表後，也可直接更新 ISP |
 | `/mnt/sd/thermal_op/sensor_temp/point1_K.bin` ... `point5_K.bin` | NUC gain tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
 | `/mnt/sd/thermal_op/sensor_temp/point1_B.bin` ... `point5_B.bin` | NUC offset tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
