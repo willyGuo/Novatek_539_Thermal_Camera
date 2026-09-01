@@ -2,9 +2,12 @@ import os
 import sys
 import csv
 import glob
+import json
 import re
 import time
 import threading
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -17,18 +20,24 @@ except ImportError:
 
 try:
     from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-    from PyQt5.QtGui import QImage, QPixmap
+    from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPixmap
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
         QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
         QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit,
-        QTextEdit, QGroupBox, QStackedWidget, QSplitter, QCheckBox
+        QTextEdit, QGroupBox, QStackedWidget, QSplitter, QCheckBox,
+        QListWidget, QListWidgetItem, QScrollArea, QFrame, QSizePolicy
     )
 except ImportError as exc:
     raise SystemExit("PyQt5 is required. Install with: pip install PyQt5") from exc
 
+try:
+    from PyQt5.QtMultimedia import QCameraInfo
+except (ImportError, OSError):
+    QCameraInfo = None
 
-APP_VERSION = "v1.0.0"
+
+APP_VERSION = "v1.1.0"
 APP_TITLE = f"Thermal RAW Toolkit {APP_VERSION}"
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 512
@@ -46,11 +55,70 @@ NOVATEK_NUC_GAIN_SHIFT = 8
 NOVATEK_NUC_GAIN_ONE = 1 << NOVATEK_NUC_GAIN_SHIFT
 DEFAULT_CAMERA_INDEX = 1
 CAMERA_INDEX_OPTIONS = list(range(10))
+CAMERA_DEVICE_ID_ROLE = Qt.UserRole + 1
+CAMERA_FRIENDLY_NAME_ROLE = Qt.UserRole + 2
+CAMERA_REFRESH_INTERVAL_MS = 1000
 DEFAULT_UVC_FPS = 30
 UVC_CAPTURE_FOURCC = "MJPG"
+DEFAULT_UVC_CAPTURE_MODE = "auto_detect"
+UVC_CAPTURE_MODE_OPTIONS = [
+    ("Auto Detect (MJPG -> Generic)", "auto_detect"),
+    ("Novatek Thermal (MJPG Strict)", "novatek_mjpg"),
+    ("Generic Webcam (Auto Format)", "generic_auto"),
+]
+UVC_AUTO_DETECT_FRAME_TIMEOUT_SECONDS = 2.0
 UVC_FRAME_WAIT_SECONDS = 0.5
 UVC_RECONNECT_SECONDS = 5.0
 UVC_CLOSE_TIMEOUT_MS = 3000
+UVC_RECORDING_FOURCC = "MJPG"
+UVC_RECORDING_QUEUE_SIZE = 8
+DUAL_UVC_IMAGE_NAME_OPTIONS = [
+    ("PEGA", "PEGA"),
+    ("天淵", "TianYuan"),
+    ("方見", "FangJian"),
+]
+
+
+def camera_device_id_text(device_name):
+    if isinstance(device_name, str):
+        return device_name
+    try:
+        return bytes(device_name).decode("utf-8", errors="replace")
+    except (TypeError, ValueError):
+        return str(device_name)
+
+
+def enumerate_camera_devices():
+    """Return camera index/name/stable ID in Qt multimedia enumeration order."""
+    if QCameraInfo is not None:
+        try:
+            devices = []
+            for camera_index, camera_info in enumerate(
+                QCameraInfo.availableCameras()
+            ):
+                friendly_name = str(camera_info.description()).strip()
+                device_id = camera_device_id_text(camera_info.deviceName())
+                devices.append(
+                    {
+                        "index": camera_index,
+                        "name": friendly_name or f"Camera {camera_index}",
+                        "device_id": device_id or f"camera-index:{camera_index}",
+                    }
+                )
+            return devices
+        except Exception:
+            pass
+
+    return [
+        {
+            "index": camera_index,
+            "name": f"Camera {camera_index}",
+            "device_id": f"camera-index:{camera_index}",
+        }
+        for camera_index in CAMERA_INDEX_OPTIONS
+    ]
+
+
 BPR_MARK_RADIUS = 5
 IMAGE_ALGORITHM_OPTIONS = [
     ("Percentile Auto Contrast", "auto_contrast"),
@@ -62,6 +130,19 @@ IMAGE_ALGORITHM_OPTIONS = [
     ("Unsharp Mask", "unsharp"),
     ("Auto Contrast + CLAHE", "auto_contrast_clahe"),
     ("P1/P99 Percentile Preview (Original Values)", "raw_percentile_preview"),
+]
+PIPELINE_ALGORITHM_OPTIONS = [
+    ("Percentile Auto Contrast", "auto_contrast"),
+    ("Fieldscale Local Adaptive AGC (Firmware Core)", "fieldscale"),
+    ("Histogram Equalization", "hist_equalization"),
+    ("CLAHE", "clahe"),
+    ("Gamma Correction", "gamma"),
+    ("Bilateral Denoise", "bilateral"),
+    ("Unsharp Mask", "unsharp"),
+]
+RAW_INPUT_MAPPING_OPTIONS = [
+    ("Fixed Bit Depth Scale", "fixed_scale"),
+    ("P1/P99 from Original RAW DN", "raw_percentile_preview"),
 ]
 IMAGE_ALGORITHM_DESCRIPTIONS = {
     "auto_contrast": (
@@ -100,6 +181,52 @@ IMAGE_ALGORITHM_DESCRIPTIONS = {
         "範圍外的像素裁切，最後輸出成 8-bit 顯示影像。"
     ),
 }
+
+DEFAULT_ALGORITHM_PARAMETERS = {
+    "auto_contrast": {"low_percentile": 1.0, "high_percentile": 99.0},
+    "fieldscale": {},
+    "hist_equalization": {},
+    "clahe": {"clahe_clip": 2.0, "clahe_grid": 8},
+    "gamma": {"gamma": 0.7},
+    "bilateral": {"bilateral_strength": 2},
+    "unsharp": {"unsharp_amount": 1.0},
+}
+
+
+def algorithm_display_name(algorithm_key):
+    for display_name, key in PIPELINE_ALGORITHM_OPTIONS:
+        if key == algorithm_key:
+            return display_name
+    return algorithm_key
+
+
+def default_algorithm_parameters(algorithm_key):
+    if algorithm_key not in DEFAULT_ALGORITHM_PARAMETERS:
+        raise ValueError(f"Unsupported pipeline algorithm: {algorithm_key}")
+    return dict(DEFAULT_ALGORITHM_PARAMETERS[algorithm_key])
+
+
+@dataclass
+class AlgorithmStage:
+    algorithm_key: str
+    enabled: bool = True
+    parameters: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        defaults = default_algorithm_parameters(self.algorithm_key)
+        defaults.update(self.parameters)
+        self.parameters = defaults
+
+    def clone(self):
+        return AlgorithmStage(self.algorithm_key, self.enabled, dict(self.parameters))
+
+    def to_dict(self):
+        return {
+            "algorithm": self.algorithm_key,
+            "name": algorithm_display_name(self.algorithm_key),
+            "enabled": bool(self.enabled),
+            "parameters": dict(self.parameters),
+        }
 
 
 def timestamp():
@@ -452,6 +579,115 @@ def apply_image_algorithm(
     return processed, details
 
 
+def apply_algorithm_pipeline(
+    gray,
+    stages,
+    input_max=255,
+    clahe_cache=None,
+    fieldscale_states=None,
+    fieldscale_temporal=False,
+):
+    """Apply enabled stages in top-to-bottom order and keep every step result."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV not installed. pip install opencv-python")
+    if gray.ndim != 2:
+        raise ValueError("Algorithm pipeline input must be a 2D grayscale image.")
+    if not any(stage.enabled for stage in stages):
+        raise ValueError("Add and enable at least one algorithm stage.")
+
+    processed = np.ascontiguousarray(gray.copy())
+    current_max = int(input_max)
+    records = []
+    execution_index = 0
+    for pipeline_index, stage in enumerate(stages, start=1):
+        if not stage.enabled:
+            continue
+        execution_index += 1
+        params = default_algorithm_parameters(stage.algorithm_key)
+        params.update(stage.parameters)
+        clahe = None
+        if stage.algorithm_key == "clahe" and clahe_cache is not None:
+            cache_key = (
+                pipeline_index,
+                float(params["clahe_clip"]),
+                int(params["clahe_grid"]),
+            )
+            clahe = clahe_cache.get(cache_key)
+            if clahe is None:
+                clahe = cv2.createCLAHE(
+                    clipLimit=cache_key[1],
+                    tileGridSize=(cache_key[2], cache_key[2]),
+                )
+                clahe_cache[cache_key] = clahe
+
+        fieldscale_state = None
+        if stage.algorithm_key == "fieldscale" and fieldscale_states is not None:
+            fieldscale_state = fieldscale_states.setdefault(pipeline_index, {})
+
+        started = time.perf_counter()
+        processed, details = apply_image_algorithm(
+            processed,
+            stage.algorithm_key,
+            low_percentile=params.get("low_percentile", 1.0),
+            high_percentile=params.get("high_percentile", 99.0),
+            clahe_clip=params.get("clahe_clip", 2.0),
+            clahe_grid=params.get("clahe_grid", 8),
+            gamma=params.get("gamma", 0.7),
+            bilateral_strength=params.get("bilateral_strength", 2),
+            unsharp_amount=params.get("unsharp_amount", 1.0),
+            clahe=clahe,
+            input_max=current_max,
+            fieldscale_state=fieldscale_state,
+            fieldscale_temporal=(
+                fieldscale_temporal and stage.algorithm_key == "fieldscale"
+            ),
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        current_max = 255
+        records.append(
+            {
+                "pipeline_index": pipeline_index,
+                "execution_index": execution_index,
+                "algorithm": stage.algorithm_key,
+                "name": algorithm_display_name(stage.algorithm_key),
+                "parameters": dict(params),
+                "details": list(details),
+                "elapsed_ms": elapsed_ms,
+                "image": processed,
+            }
+        )
+    return processed, records
+
+
+def pipeline_execution_json(records):
+    return [
+        {
+            "pipeline_index": record["pipeline_index"],
+            "execution_index": record["execution_index"],
+            "algorithm": record["algorithm"],
+            "name": record["name"],
+            "parameters": dict(record["parameters"]),
+            "details": list(record["details"]),
+            "elapsed_ms": round(float(record["elapsed_ms"]), 3),
+        }
+        for record in records
+    ]
+
+
+def pipeline_summary_text(stages):
+    names = [algorithm_display_name(stage.algorithm_key) for stage in stages if stage.enabled]
+    return " -> ".join(names) if names else "No enabled algorithm"
+
+
+def pipeline_record_image(records, pipeline_index, final_image):
+    if pipeline_index is None:
+        return final_image
+    for record in records:
+        if record["pipeline_index"] == pipeline_index:
+            return record["image"]
+    return final_image
+
+
 def uvc_to_gray(frame):
     if frame.ndim == 2:
         return frame
@@ -460,16 +696,6 @@ def uvc_to_gray(frame):
     if frame.shape[2] == 4:
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-
-def uvc_gray_to_nuc_dn(gray, raw_max):
-    """Convert a UVC grayscale frame into the DN domain used by the NUC table."""
-    if gray.ndim != 2 or not np.issubdtype(gray.dtype, np.integer):
-        raise ValueError("UVC NUC requires a 2D integer grayscale frame.")
-    if gray.dtype.itemsize == 1:
-        scaled = gray.astype(np.float64) * raw_max / 255.0
-        return np.rint(scaled).astype(np.uint16), f"8-bit UVC mapped to 0..{raw_max} DN"
-    return np.clip(gray, 0, raw_max).astype(np.uint16), f"{gray.dtype} UVC DN"
 
 
 def image_stats(image):
@@ -757,6 +983,88 @@ def save_rgb_png(path, image_rgb):
         raise RuntimeError(f"Failed to save image: {path}")
 
 
+def save_pipeline_overview_png(path, items, max_columns=3):
+    """Save numbered pipeline images as one labeled contact sheet."""
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required to save PNG. Install: pip install opencv-python")
+    if not items:
+        raise ValueError("Pipeline overview requires at least one image.")
+
+    prepared = []
+    for label, image, display_max in items:
+        if image.ndim != 2:
+            raise ValueError("Pipeline overview supports grayscale images only.")
+        if display_max <= 0:
+            raise ValueError("Pipeline overview display maximum must be positive.")
+        image_u8 = np.rint(
+            np.clip(image, 0, display_max).astype(np.float64)
+            * 255.0
+            / display_max
+        ).astype(np.uint8)
+        prepared.append((str(label), image_u8))
+
+    source_height, source_width = prepared[0][1].shape
+    if any(image.shape != (source_height, source_width) for _, image in prepared):
+        raise ValueError("All pipeline overview images must have the same dimensions.")
+
+    scale = min(1.0, 480.0 / source_width, 360.0 / source_height)
+    tile_width = max(1, int(round(source_width * scale)))
+    tile_height = max(1, int(round(source_height * scale)))
+    header_height = 42
+    gap = 8
+    margin = 8
+    columns = min(max(1, int(max_columns)), len(prepared))
+    rows = (len(prepared) + columns - 1) // columns
+    panel_width = tile_width
+    panel_height = header_height + tile_height
+    canvas_width = margin * 2 + columns * panel_width + (columns - 1) * gap
+    canvas_height = margin * 2 + rows * panel_height + (rows - 1) * gap
+    canvas = np.full((canvas_height, canvas_width), 24, dtype=np.uint8)
+
+    for item_index, (label, image_u8) in enumerate(prepared):
+        row = item_index // columns
+        column = item_index % columns
+        x = margin + column * (panel_width + gap)
+        y = margin + row * (panel_height + gap)
+        resized = (
+            image_u8
+            if image_u8.shape == (tile_height, tile_width)
+            else cv2.resize(
+                image_u8,
+                (tile_width, tile_height),
+                interpolation=cv2.INTER_AREA,
+            )
+        )
+        canvas[y + header_height:y + panel_height, x:x + tile_width] = resized
+        cv2.rectangle(
+            canvas,
+            (x, y),
+            (x + panel_width - 1, y + panel_height - 1),
+            72,
+            1,
+        )
+        font_scale = min(
+            0.62,
+            max(0.36, panel_width / max(500.0, len(label) * 17.0)),
+        )
+        text_size, _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1
+        )
+        text_x = x + max(6, (panel_width - text_size[0]) // 2)
+        cv2.putText(
+            canvas,
+            label,
+            (text_x, y + 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            255,
+            1,
+            cv2.LINE_AA,
+        )
+
+    save_png(path, canvas)
+
+
 def save_uvc_comparison_png(path, original, processed, algorithm_title):
     if cv2 is None:
         raise RuntimeError("OpenCV is required to save PNG. Install: pip install opencv-python")
@@ -871,18 +1179,420 @@ class PathRow(QWidget):
         self.edit.setText(text)
 
 
+class AlgorithmPipelineEditor(QWidget):
+    pipeline_changed = pyqtSignal()
+
+    def __init__(self, parent=None, allow_step_algorithm_change=True):
+        super().__init__(parent)
+        self._stages = []
+        self._updating = False
+        self._allow_step_algorithm_change = bool(
+            allow_step_algorithm_change
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(7)
+        title = QLabel("Algorithm Pipeline (top to bottom)")
+        title.setWordWrap(True)
+        title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        title.setStyleSheet("font-size:15px; font-weight:700; color:#c9e2f2;")
+        root.addWidget(title)
+
+        self.add_algorithm_combo = QComboBox()
+        for display_name, algorithm_key in PIPELINE_ALGORITHM_OPTIONS:
+            self.add_algorithm_combo.addItem(display_name, algorithm_key)
+        self.add_algorithm_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.add_button = QPushButton("Add Step")
+        self.add_button.setObjectName("primaryButton")
+        root.addWidget(self.add_algorithm_combo)
+        root.addWidget(self.add_button)
+
+        self.stage_list = QListWidget()
+        self.stage_list.setMinimumHeight(132)
+        self.stage_list.setMaximumHeight(190)
+        self.stage_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.stage_list.setTextElideMode(Qt.ElideRight)
+        self.stage_list.setToolTip(
+            "Checked steps run from top to bottom. Duplicate algorithms are allowed."
+        )
+        root.addWidget(self.stage_list)
+
+        order_grid = QGridLayout()
+        order_grid.setHorizontalSpacing(7)
+        order_grid.setVerticalSpacing(7)
+        self.move_up_button = QPushButton("Move Up")
+        self.move_down_button = QPushButton("Move Down")
+        self.remove_button = QPushButton("Remove")
+        self.reset_step_button = QPushButton("Reset Step")
+        self.reset_pipeline_button = QPushButton("Reset Pipeline")
+        self.reset_pipeline_button.setObjectName("resetButton")
+        order_grid.addWidget(self.move_up_button, 0, 0)
+        order_grid.addWidget(self.move_down_button, 0, 1)
+        order_grid.addWidget(self.remove_button, 1, 0)
+        order_grid.addWidget(self.reset_step_button, 1, 1)
+        order_grid.addWidget(self.reset_pipeline_button, 2, 0, 1, 2)
+        for button in (
+            self.move_up_button,
+            self.move_down_button,
+            self.remove_button,
+            self.reset_step_button,
+            self.reset_pipeline_button,
+        ):
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        root.addLayout(order_grid)
+
+        self.parameter_group = QGroupBox("Step Parameters")
+        self.parameter_group.setObjectName("pipelineParameterCard")
+        self.parameter_form = QFormLayout(self.parameter_group)
+        self.parameter_form.setRowWrapPolicy(QFormLayout.WrapAllRows)
+        self.stage_algorithm_combo = QComboBox()
+        for display_name, algorithm_key in PIPELINE_ALGORITHM_OPTIONS:
+            self.stage_algorithm_combo.addItem(display_name, algorithm_key)
+        self.stage_algorithm_combo.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        self.stage_description = QLabel()
+        self.stage_description.setWordWrap(True)
+        self.stage_description.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.stage_description.setStyleSheet(
+            "color:#c8d0d9; background:#292d33; border-left:3px solid #79afd3; "
+            "border-radius:5px; padding:7px;"
+        )
+        self.stage_low_percentile = QDoubleSpinBox()
+        self.stage_low_percentile.setRange(0.0, 99.5)
+        self.stage_low_percentile.setDecimals(1)
+        self.stage_low_percentile.setSingleStep(0.5)
+        self.stage_high_percentile = QDoubleSpinBox()
+        self.stage_high_percentile.setRange(0.5, 100.0)
+        self.stage_high_percentile.setDecimals(1)
+        self.stage_high_percentile.setSingleStep(0.5)
+        self.stage_clahe_clip = QDoubleSpinBox()
+        self.stage_clahe_clip.setRange(0.1, 100.0)
+        self.stage_clahe_clip.setDecimals(1)
+        self.stage_clahe_clip.setSingleStep(0.1)
+        self.stage_clahe_grid = QSpinBox()
+        self.stage_clahe_grid.setRange(1, 64)
+        self.stage_gamma = QDoubleSpinBox()
+        self.stage_gamma.setRange(0.1, 3.0)
+        self.stage_gamma.setDecimals(1)
+        self.stage_gamma.setSingleStep(0.1)
+        self.stage_bilateral_strength = QSpinBox()
+        self.stage_bilateral_strength.setRange(1, 7)
+        self.stage_unsharp_amount = QDoubleSpinBox()
+        self.stage_unsharp_amount.setRange(0.1, 3.0)
+        self.stage_unsharp_amount.setDecimals(1)
+        self.stage_unsharp_amount.setSingleStep(0.1)
+        if self._allow_step_algorithm_change:
+            self.parameter_form.addRow("Algorithm", self.stage_algorithm_combo)
+        self.parameter_form.addRow(self.stage_description)
+        self.parameter_form.addRow("Low Percentile", self.stage_low_percentile)
+        self.parameter_form.addRow("High Percentile", self.stage_high_percentile)
+        self.parameter_form.addRow("CLAHE Clip Limit", self.stage_clahe_clip)
+        self.parameter_form.addRow("CLAHE Grid Size", self.stage_clahe_grid)
+        self.parameter_form.addRow("Gamma", self.stage_gamma)
+        self.parameter_form.addRow("Bilateral Strength", self.stage_bilateral_strength)
+        self.parameter_form.addRow("Unsharp Amount", self.stage_unsharp_amount)
+        root.addWidget(self.parameter_group)
+
+        self.add_button.clicked.connect(self.add_stage)
+        self.move_up_button.clicked.connect(lambda: self.move_selected(-1))
+        self.move_down_button.clicked.connect(lambda: self.move_selected(1))
+        self.remove_button.clicked.connect(self.remove_selected)
+        self.reset_step_button.clicked.connect(self.reset_selected_step)
+        self.reset_pipeline_button.clicked.connect(self.reset_pipeline)
+        self.stage_list.currentRowChanged.connect(self.load_selected_step)
+        self.stage_list.itemChanged.connect(self.stage_check_changed)
+        if self._allow_step_algorithm_change:
+            self.stage_algorithm_combo.currentIndexChanged.connect(
+                self.selected_algorithm_changed
+            )
+        for widget in (
+            self.stage_low_percentile,
+            self.stage_high_percentile,
+            self.stage_clahe_clip,
+            self.stage_clahe_grid,
+            self.stage_gamma,
+            self.stage_bilateral_strength,
+            self.stage_unsharp_amount,
+        ):
+            widget.valueChanged.connect(self.selected_parameter_changed)
+        self.set_stages([AlgorithmStage("auto_contrast")])
+
+    def stages(self):
+        return [stage.clone() for stage in self._stages]
+
+    def enabled_stages(self):
+        return [stage.clone() for stage in self._stages if stage.enabled]
+
+    def configuration(self):
+        return [stage.to_dict() for stage in self._stages]
+
+    def summary(self):
+        return pipeline_summary_text(self._stages)
+
+    def set_stages(self, stages, selected_row=0):
+        self._stages = [
+            stage.clone()
+            if isinstance(stage, AlgorithmStage)
+            else AlgorithmStage(
+                stage["algorithm"],
+                stage.get("enabled", True),
+                stage.get("parameters", {}),
+            )
+            for stage in stages
+        ]
+        self.refresh_stage_list(selected_row)
+
+    @staticmethod
+    def parameter_summary(stage):
+        params = stage.parameters
+        if stage.algorithm_key == "auto_contrast":
+            return f"P{params['low_percentile']:.1f}/P{params['high_percentile']:.1f}"
+        if stage.algorithm_key == "clahe":
+            return f"clip={params['clahe_clip']:.1f}, grid={params['clahe_grid']}"
+        if stage.algorithm_key == "gamma":
+            return f"gamma={params['gamma']:.1f}"
+        if stage.algorithm_key == "bilateral":
+            return f"strength={params['bilateral_strength']}"
+        if stage.algorithm_key == "unsharp":
+            return f"amount={params['unsharp_amount']:.1f}"
+        return "no parameters"
+
+    def refresh_stage_list(self, selected_row=None):
+        if selected_row is None:
+            selected_row = self.stage_list.currentRow()
+        self._updating = True
+        self.stage_list.blockSignals(True)
+        self.stage_list.clear()
+        for index, stage in enumerate(self._stages, start=1):
+            text = (
+                f"{index}. {algorithm_display_name(stage.algorithm_key)}"
+                f"    [{self.parameter_summary(stage)}]"
+            )
+            item = QListWidgetItem(text)
+            item.setToolTip(text)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if stage.enabled else Qt.Unchecked)
+            self.stage_list.addItem(item)
+        self.stage_list.blockSignals(False)
+        self._updating = False
+        if self._stages:
+            self.stage_list.setCurrentRow(
+                min(max(selected_row, 0), len(self._stages) - 1)
+            )
+        else:
+            self.load_selected_step(-1)
+        self.update_button_states()
+
+    def add_stage(self, _checked=False):
+        self._stages.append(AlgorithmStage(self.add_algorithm_combo.currentData()))
+        self.refresh_stage_list(len(self._stages) - 1)
+        self.pipeline_changed.emit()
+
+    def remove_selected(self, _checked=False):
+        row = self.stage_list.currentRow()
+        if row < 0:
+            return
+        del self._stages[row]
+        self.refresh_stage_list(min(row, len(self._stages) - 1))
+        self.pipeline_changed.emit()
+
+    def move_selected(self, offset):
+        row = self.stage_list.currentRow()
+        target = row + offset
+        if row < 0 or target < 0 or target >= len(self._stages):
+            return
+        self._stages[row], self._stages[target] = self._stages[target], self._stages[row]
+        self.refresh_stage_list(target)
+        self.pipeline_changed.emit()
+
+    def reset_selected_step(self, _checked=False):
+        row = self.stage_list.currentRow()
+        if row < 0:
+            return
+        self._stages[row].parameters = default_algorithm_parameters(
+            self._stages[row].algorithm_key
+        )
+        self.refresh_stage_list(row)
+        self.pipeline_changed.emit()
+
+    def reset_pipeline(self, _checked=False):
+        self.set_stages([AlgorithmStage("auto_contrast")])
+        self.pipeline_changed.emit()
+
+    def stage_check_changed(self, item):
+        if self._updating:
+            return
+        row = self.stage_list.row(item)
+        if 0 <= row < len(self._stages):
+            self._stages[row].enabled = item.checkState() == Qt.Checked
+            self.pipeline_changed.emit()
+
+    def selected_algorithm_changed(self, _combo_index):
+        if self._updating:
+            return
+        row = self.stage_list.currentRow()
+        if row < 0:
+            return
+        self._stages[row] = AlgorithmStage(
+            self.stage_algorithm_combo.currentData(),
+            enabled=self._stages[row].enabled,
+        )
+        self.refresh_stage_list(row)
+        self.pipeline_changed.emit()
+
+    def selected_parameter_changed(self, _value=None):
+        if self._updating:
+            return
+        row = self.stage_list.currentRow()
+        if row < 0:
+            return
+        self.update_percentile_limits()
+        stage = self._stages[row]
+        if stage.algorithm_key == "auto_contrast":
+            stage.parameters["low_percentile"] = self.stage_low_percentile.value()
+            stage.parameters["high_percentile"] = self.stage_high_percentile.value()
+        elif stage.algorithm_key == "clahe":
+            stage.parameters["clahe_clip"] = self.stage_clahe_clip.value()
+            stage.parameters["clahe_grid"] = self.stage_clahe_grid.value()
+        elif stage.algorithm_key == "gamma":
+            stage.parameters["gamma"] = self.stage_gamma.value()
+        elif stage.algorithm_key == "bilateral":
+            stage.parameters["bilateral_strength"] = self.stage_bilateral_strength.value()
+        elif stage.algorithm_key == "unsharp":
+            stage.parameters["unsharp_amount"] = self.stage_unsharp_amount.value()
+        self.refresh_stage_list(row)
+        self.pipeline_changed.emit()
+
+    def set_parameter_visible(self, widget, visible):
+        widget.setVisible(visible)
+        label = self.parameter_form.labelForField(widget)
+        if label is not None:
+            label.setVisible(visible)
+
+    def load_selected_step(self, row):
+        valid = 0 <= row < len(self._stages)
+        self.parameter_group.setEnabled(valid)
+        self._updating = True
+        if valid:
+            stage = self._stages[row]
+            index = self.stage_algorithm_combo.findData(stage.algorithm_key)
+            self.stage_algorithm_combo.setCurrentIndex(max(index, 0))
+            params = stage.parameters
+            self.stage_low_percentile.setValue(params.get("low_percentile", 1.0))
+            self.stage_high_percentile.setValue(params.get("high_percentile", 99.0))
+            self.stage_clahe_clip.setValue(params.get("clahe_clip", 2.0))
+            self.stage_clahe_grid.setValue(params.get("clahe_grid", 8))
+            self.stage_gamma.setValue(params.get("gamma", 0.7))
+            self.stage_bilateral_strength.setValue(params.get("bilateral_strength", 2))
+            self.stage_unsharp_amount.setValue(params.get("unsharp_amount", 1.0))
+            self.stage_description.setText(
+                IMAGE_ALGORITHM_DESCRIPTIONS.get(stage.algorithm_key, "")
+            )
+            self.set_parameter_visible(
+                self.stage_low_percentile, stage.algorithm_key == "auto_contrast"
+            )
+            self.set_parameter_visible(
+                self.stage_high_percentile, stage.algorithm_key == "auto_contrast"
+            )
+            self.set_parameter_visible(
+                self.stage_clahe_clip, stage.algorithm_key == "clahe"
+            )
+            self.set_parameter_visible(
+                self.stage_clahe_grid, stage.algorithm_key == "clahe"
+            )
+            self.set_parameter_visible(self.stage_gamma, stage.algorithm_key == "gamma")
+            self.set_parameter_visible(
+                self.stage_bilateral_strength, stage.algorithm_key == "bilateral"
+            )
+            self.set_parameter_visible(
+                self.stage_unsharp_amount, stage.algorithm_key == "unsharp"
+            )
+            self.update_percentile_limits()
+        else:
+            self.stage_description.setText("Add a step to configure its parameters.")
+        self._updating = False
+        self.update_button_states()
+
+    def update_percentile_limits(self):
+        self.stage_high_percentile.setMinimum(
+            min(100.0, self.stage_low_percentile.value() + 0.5)
+        )
+        self.stage_low_percentile.setMaximum(
+            max(0.0, self.stage_high_percentile.value() - 0.5)
+        )
+
+    def update_button_states(self):
+        row = self.stage_list.currentRow()
+        valid = 0 <= row < len(self._stages)
+        self.move_up_button.setEnabled(valid and row > 0)
+        self.move_down_button.setEnabled(valid and row < len(self._stages) - 1)
+        self.remove_button.setEnabled(valid)
+        self.reset_step_button.setEnabled(valid)
+
+
+class LatestFrameBuffer:
+    """Thread-safe single-frame mailbox; newer frames replace pending old ones."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._frame = None
+        self._frame_time = 0.0
+        self._sequence = 0
+
+    def submit(self, frame):
+        if frame is None or not getattr(frame, "size", 0):
+            return
+        with self._lock:
+            self._frame = frame.copy()
+            self._frame_time = time.perf_counter()
+            self._sequence += 1
+
+    def take_latest(self, previous_sequence):
+        with self._lock:
+            if self._frame is None or self._sequence == previous_sequence:
+                return None, previous_sequence, 0.0
+            return self._frame.copy(), self._sequence, self._frame_time
+
+    def clear(self):
+        with self._lock:
+            self._frame = None
+            self._frame_time = 0.0
+            self._sequence = 0
+
+
 class UvcCaptureThread(QThread):
     frame_ready = pyqtSignal(object)
+    frame_seen = pyqtSignal(float)
     camera_opened = pyqtSignal(int, int, int, float)
     status_changed = pyqtSignal(str)
 
-    def __init__(self, camera_index, width, height, fps, reconnect_seconds, parent=None):
+    def __init__(
+        self,
+        camera_index,
+        width,
+        height,
+        fps,
+        reconnect_seconds,
+        parent=None,
+        frame_consumer=None,
+        capture_mode=DEFAULT_UVC_CAPTURE_MODE,
+        camera_device_id=None,
+        camera_name=None,
+    ):
         super().__init__(parent)
         self.camera_index = camera_index
         self.width = width
         self.height = height
         self.fps = fps
         self.reconnect_seconds = reconnect_seconds
+        self.frame_consumer = frame_consumer
+        self.capture_mode = capture_mode
+        self.camera_device_id = camera_device_id
+        self.camera_name = camera_name or f"Camera {camera_index}"
+        self.selected_capture_mode = None
+        self._camera_info_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._reconnect_event = threading.Event()
         self._capture_lock = threading.Lock()
@@ -893,6 +1603,16 @@ class UvcCaptureThread(QThread):
 
     def force_reconnect(self):
         self._reconnect_event.set()
+
+    def update_camera_device(self, camera_index, camera_name=None):
+        with self._camera_info_lock:
+            self.camera_index = camera_index
+            if camera_name:
+                self.camera_name = camera_name
+
+    def _camera_device_snapshot(self):
+        with self._camera_info_lock:
+            return self.camera_index, self.camera_name
 
     def _set_capture(self, capture):
         with self._capture_lock:
@@ -907,7 +1627,27 @@ class UvcCaptureThread(QThread):
         except Exception:
             pass
 
-    def _open_capture(self):
+    def _open_capture(self, capture_mode=None, camera_index=None):
+        capture_mode = capture_mode or self.capture_mode
+        if camera_index is None:
+            camera_index, _camera_name = self._camera_device_snapshot()
+        if camera_index is None:
+            return None
+        if capture_mode == "generic_auto":
+            if sys.platform.startswith("win"):
+                backends = [cv2.CAP_DSHOW]
+                if hasattr(cv2, "CAP_MSMF"):
+                    backends.append(cv2.CAP_MSMF)
+                for backend in backends:
+                    try:
+                        capture = cv2.VideoCapture(camera_index, backend)
+                    except (TypeError, cv2.error):
+                        continue
+                    if capture.isOpened():
+                        return capture
+                    capture.release()
+            return cv2.VideoCapture(camera_index)
+
         if sys.platform.startswith("win"):
             mjpg_fourcc = cv2.VideoWriter_fourcc(*UVC_CAPTURE_FOURCC)
             open_params = [
@@ -923,18 +1663,18 @@ class UvcCaptureThread(QThread):
                 # Setting CAP_PROP_FPS afterward can reopen it without FOURCC
                 # and make the Novatek host request format=0 instead of MJPEG.
                 capture = cv2.VideoCapture(
-                    self.camera_index,
+                    camera_index,
                     cv2.CAP_DSHOW,
                     open_params,
                 )
             except (TypeError, cv2.error):
-                capture = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+                capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 
             if capture.isOpened():
                 return capture
 
             capture.release()
-            capture = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+            capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
             if capture.isOpened():
                 capture.set(cv2.CAP_PROP_FOURCC, mjpg_fourcc)
                 capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -942,7 +1682,7 @@ class UvcCaptureThread(QThread):
                 capture.set(cv2.CAP_PROP_FOURCC, mjpg_fourcc)
             return capture
 
-        capture = cv2.VideoCapture(self.camera_index)
+        capture = cv2.VideoCapture(camera_index)
         if capture.isOpened():
             capture.set(
                 cv2.CAP_PROP_FOURCC,
@@ -954,18 +1694,55 @@ class UvcCaptureThread(QThread):
         return capture
 
     @staticmethod
+    def _capture_mode_name(capture_mode):
+        for mode_name, mode_key in UVC_CAPTURE_MODE_OPTIONS:
+            if mode_key == capture_mode:
+                return mode_name
+        return capture_mode
+
+    @staticmethod
+    def _alternate_auto_mode(capture_mode):
+        if capture_mode == "novatek_mjpg":
+            return "generic_auto"
+        return "novatek_mjpg"
+
+    @staticmethod
     def _fourcc_text(value):
         fourcc = int(value)
-        return "".join(chr((fourcc >> (8 * index)) & 0xFF) for index in range(4))
+        text = "".join(chr((fourcc >> (8 * index)) & 0xFF) for index in range(4))
+        return text.strip("\x00 ") or "UNKNOWN"
 
     def run(self):
         capture = None
+        next_auto_mode = "novatek_mjpg"
         try:
             while not self._stop_event.is_set():
                 self._reconnect_event.clear()
-                self.status_changed.emit(f"Opening camera {self.camera_index}...")
+                camera_index, camera_name = self._camera_device_snapshot()
+                if camera_index is None:
+                    self.status_changed.emit(
+                        f"{camera_name} disconnected; waiting for hot-plug..."
+                    )
+                    if self._stop_event.wait(1.0):
+                        break
+                    continue
+                active_capture_mode = self.capture_mode
+                if self.capture_mode == "auto_detect":
+                    active_capture_mode = next_auto_mode
+                    self.status_changed.emit(
+                        f"Auto Detect: trying {camera_name} "
+                        f"(index {camera_index}) with "
+                        f"{self._capture_mode_name(active_capture_mode)}..."
+                    )
+                else:
+                    self.status_changed.emit(
+                        f"Opening {camera_name} (index {camera_index}) "
+                        f"({self._capture_mode_name(active_capture_mode)})..."
+                    )
                 try:
-                    capture = self._open_capture()
+                    capture = self._open_capture(
+                        active_capture_mode, camera_index
+                    )
                 except Exception as exc:
                     capture = None
                     self.status_changed.emit(f"Camera open error: {exc}; retrying...")
@@ -974,7 +1751,14 @@ class UvcCaptureThread(QThread):
                     if capture is not None:
                         self._clear_capture(capture)
                         capture = None
-                    self.status_changed.emit(f"Cannot open camera {self.camera_index}; retrying...")
+                    if self.capture_mode == "auto_detect":
+                        next_auto_mode = self._alternate_auto_mode(
+                            active_capture_mode
+                        )
+                    self.status_changed.emit(
+                        f"Cannot open {camera_name} (index {camera_index}); "
+                        "retrying..."
+                    )
                     if self._stop_event.wait(1.0):
                         break
                     continue
@@ -991,24 +1775,31 @@ class UvcCaptureThread(QThread):
                 actual_fourcc = self._fourcc_text(actual_fourcc_value)
                 if (
                     sys.platform.startswith("win")
+                    and active_capture_mode == "novatek_mjpg"
                     and actual_fourcc != UVC_CAPTURE_FOURCC
                 ):
                     self.status_changed.emit(
-                        f"Camera {self.camera_index} negotiated {actual_fourcc!r}, "
+                        f"{camera_name} negotiated {actual_fourcc!r}, "
                         f"expected {UVC_CAPTURE_FOURCC}; retrying..."
                     )
                     self._clear_capture(capture)
                     capture = None
+                    if self.capture_mode == "auto_detect":
+                        next_auto_mode = "generic_auto"
                     if self._stop_event.wait(1.0):
                         break
                     continue
                 self.status_changed.emit(
-                    f"Camera {self.camera_index}: {actual_fourcc} "
+                    f"{camera_name} (index {camera_index}): {actual_fourcc} "
                     f"{actual_width}x{actual_height} {actual_fps:.2f} FPS"
                 )
-                self.camera_opened.emit(self.camera_index, actual_width, actual_height, actual_fps)
+                self.camera_opened.emit(
+                    camera_index, actual_width, actual_height, actual_fps
+                )
 
                 failed_since = None
+                received_frame = False
+                last_frame_seen_emit = 0.0
                 while not self._stop_event.is_set():
                     try:
                         ok, frame = capture.read()
@@ -1018,19 +1809,48 @@ class UvcCaptureThread(QThread):
                     if self._stop_event.is_set():
                         break
                     if self._reconnect_event.is_set():
-                        self.status_changed.emit(f"Reconnecting camera {self.camera_index}...")
+                        self.status_changed.emit(
+                            f"Reconnecting {camera_name} (index {camera_index})..."
+                        )
                         break
                     if ok and frame is not None and frame.size:
                         failed_since = None
-                        self.frame_ready.emit(frame)
+                        if not received_frame:
+                            received_frame = True
+                            self.selected_capture_mode = active_capture_mode
+                            if self.capture_mode == "auto_detect":
+                                next_auto_mode = active_capture_mode
+                                self.status_changed.emit(
+                                    f"Auto Detect selected: "
+                                    f"{self._capture_mode_name(active_capture_mode)}; "
+                                    f"{actual_fourcc} {actual_width}x{actual_height} "
+                                    f"{actual_fps:.2f} FPS"
+                                )
+                        now = time.perf_counter()
+                        if now - last_frame_seen_emit >= 0.1:
+                            self.frame_seen.emit(now)
+                            last_frame_seen_emit = now
+                        if self.frame_consumer is None:
+                            self.frame_ready.emit(frame)
+                        else:
+                            self.frame_consumer(frame)
                         continue
 
                     now = time.perf_counter()
                     if failed_since is None:
                         failed_since = now
-                    if now - failed_since >= self.reconnect_seconds:
+                    no_frame_timeout = self.reconnect_seconds
+                    if self.capture_mode == "auto_detect" and not received_frame:
+                        no_frame_timeout = UVC_AUTO_DETECT_FRAME_TIMEOUT_SECONDS
+                    if now - failed_since >= no_frame_timeout:
+                        if self.capture_mode == "auto_detect" and not received_frame:
+                            next_auto_mode = self._alternate_auto_mode(
+                                active_capture_mode
+                            )
                         self.status_changed.emit(
-                            f"No frame for {self.reconnect_seconds:.1f}s; reconnecting camera {self.camera_index}..."
+                            f"No frame for {no_frame_timeout:.1f}s; "
+                            f"reconnecting {camera_name} "
+                            f"(index {camera_index})..."
                         )
                         break
                     if self._stop_event.wait(0.03):
@@ -1045,6 +1865,402 @@ class UvcCaptureThread(QThread):
                 self._clear_capture(capture)
 
 
+def process_uvc_pipeline_frame(
+    frame,
+    config,
+    clahe_cache=None,
+    fieldscale_states=None,
+):
+    started = time.perf_counter()
+    original_gray = uvc_to_gray(frame)
+    preprocessing_details = []
+    pipeline_input_max = 255
+
+    first_enabled = next(
+        (stage for stage in config["stages"] if stage.enabled), None
+    )
+    use_native_fieldscale = (
+        first_enabled is not None
+        and first_enabled.algorithm_key == "fieldscale"
+        and original_gray.dtype.itemsize > 1
+    )
+    if use_native_fieldscale:
+        pipeline_input = original_gray.copy()
+        pipeline_input_max = config["raw_max"]
+        preprocessing_details.append("Native DN input for first Fieldscale step")
+    elif original_gray.dtype == np.uint8:
+        pipeline_input = original_gray.copy()
+    else:
+        pipeline_input = raw_to_display_u8(original_gray, config["raw_max"])
+
+    final_image, records = apply_algorithm_pipeline(
+        pipeline_input,
+        config["stages"],
+        input_max=pipeline_input_max,
+        clahe_cache=clahe_cache,
+        fieldscale_states=fieldscale_states,
+        fieldscale_temporal=True,
+    )
+    total_ms = (time.perf_counter() - started) * 1000.0
+    original_display = (
+        original_gray.copy()
+        if original_gray.dtype == np.uint8
+        else raw_to_display_u8(original_gray, config["raw_max"])
+    )
+    return {
+        "revision": config["revision"],
+        "original_source": original_gray.copy(),
+        "original_display": original_display,
+        "pipeline_input": pipeline_input,
+        "pipeline_input_max": pipeline_input_max,
+        "final_image": final_image,
+        "records": records,
+        "preprocessing_details": preprocessing_details,
+        "total_ms": total_ms,
+    }
+
+
+class UvcProcessingThread(QThread):
+    frame_processed = pyqtSignal(object)
+    frame_failed = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._condition = threading.Condition()
+        self._pending = None
+        self._config = None
+        self._config_revision = None
+        self._stop_requested = False
+        self._clahe_cache = {}
+        self._fieldscale_states = {}
+
+    def set_config(self, config):
+        with self._condition:
+            revision = None if config is None else config.get("revision")
+            if revision != self._config_revision:
+                self._clahe_cache.clear()
+                self._fieldscale_states.clear()
+                self._config_revision = revision
+            self._config = config
+            self._pending = None
+
+    def submit_frame(self, frame):
+        with self._condition:
+            if self._stop_requested or self._config is None:
+                return
+            self._pending = (frame.copy(), self._config)
+            self._condition.notify()
+
+    def submit(self, frame, config):
+        with self._condition:
+            if self._stop_requested:
+                return
+            self._pending = (frame.copy(), config)
+            self._condition.notify()
+
+    def stop(self):
+        with self._condition:
+            self._stop_requested = True
+            self._pending = None
+            self._config = None
+            self._condition.notify_all()
+
+    def run(self):
+        while True:
+            with self._condition:
+                while self._pending is None and not self._stop_requested:
+                    self._condition.wait()
+                if self._stop_requested:
+                    return
+                frame, config = self._pending
+                self._pending = None
+            try:
+                payload = process_uvc_pipeline_frame(
+                    frame,
+                    config,
+                    clahe_cache=self._clahe_cache,
+                    fieldscale_states=self._fieldscale_states,
+                )
+            except Exception as exc:
+                self.frame_failed.emit(
+                    {"revision": config.get("revision"), "message": str(exc)}
+                )
+            else:
+                self.frame_processed.emit(payload)
+
+
+class UvcRecordingThread(QThread):
+    """Encode synchronized Original/Final comparison frames off the GUI thread."""
+
+    def __init__(
+        self,
+        video_path,
+        fps,
+        parent=None,
+        left_label="Original UVC",
+        right_label="Final Pipeline Output",
+    ):
+        super().__init__(parent)
+        self.video_path = Path(video_path)
+        self.fps = max(1.0, float(fps))
+        self.left_label = str(left_label)
+        self.right_label = str(right_label)
+        self._condition = threading.Condition()
+        self._queue = deque()
+        self._stop_requested = False
+        self._stop_frame_time = None
+        self._submitted_frames = 0
+        self._queue_dropped_frames = 0
+        self.result_summary = None
+        self.error_message = None
+
+    def submit(self, original, processed, frame_time=None):
+        if original is None or processed is None:
+            return False
+        timestamp_value = (
+            time.perf_counter() if frame_time is None else float(frame_time)
+        )
+        with self._condition:
+            if self._stop_requested:
+                return False
+            if len(self._queue) >= UVC_RECORDING_QUEUE_SIZE:
+                self._queue.popleft()
+                self._queue_dropped_frames += 1
+            self._queue.append(
+                (original.copy(), processed.copy(), timestamp_value)
+            )
+            self._submitted_frames += 1
+            self._condition.notify()
+        return True
+
+    def stop(self, frame_time=None):
+        with self._condition:
+            if not self._stop_requested:
+                self._stop_frame_time = (
+                    time.perf_counter()
+                    if frame_time is None
+                    else float(frame_time)
+                )
+            self._stop_requested = True
+            self._condition.notify_all()
+
+    @staticmethod
+    def _display_bgr(image):
+        array = np.asarray(image)
+        if array.ndim != 2:
+            raise ValueError("UVC recording requires 2D grayscale images.")
+        if array.dtype == np.uint8:
+            gray = np.ascontiguousarray(array)
+        else:
+            gray = np.clip(array, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    @classmethod
+    def _compose_frame(
+        cls,
+        original,
+        processed,
+        left_label="Original UVC",
+        right_label="Final Pipeline Output",
+    ):
+        left = cls._display_bgr(original)
+        right = cls._display_bgr(processed)
+        if right.shape[:2] != left.shape[:2]:
+            right = cv2.resize(
+                right,
+                (left.shape[1], left.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+        canvas = np.ascontiguousarray(np.hstack((left, right)))
+        if canvas.shape[0] % 2:
+            canvas = cv2.copyMakeBorder(
+                canvas, 0, 1, 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+        if canvas.shape[1] % 2:
+            canvas = cv2.copyMakeBorder(
+                canvas, 0, 0, 0, 1, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            )
+
+        panel_width = left.shape[1]
+        cv2.rectangle(canvas, (0, 0), (panel_width - 1, 34), (0, 0, 0), -1)
+        cv2.rectangle(
+            canvas,
+            (panel_width, 0),
+            (canvas.shape[1] - 1, 34),
+            (0, 0, 0),
+            -1,
+        )
+        return cls._draw_comparison_labels(
+            canvas, panel_width, left_label, right_label
+        )
+
+    @staticmethod
+    def _draw_comparison_labels(canvas, panel_width, left_label, right_label):
+        """Draw Unicode camera names into a BGR frame using Qt's system fonts."""
+        bgr_format = getattr(QImage, "Format_BGR888", None)
+        if bgr_format is not None:
+            drawing_array = canvas
+            image = QImage(
+                drawing_array.data,
+                drawing_array.shape[1],
+                drawing_array.shape[0],
+                drawing_array.strides[0],
+                bgr_format,
+            )
+            convert_back = False
+        else:
+            drawing_array = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+            image = QImage(
+                drawing_array.data,
+                drawing_array.shape[1],
+                drawing_array.shape[0],
+                drawing_array.strides[0],
+                QImage.Format_RGB888,
+            )
+            convert_back = True
+
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        font = QFont()
+        font.setPixelSize(18)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(12, 24, str(left_label))
+        painter.drawText(panel_width + 12, 24, str(right_label))
+        painter.end()
+
+        byte_count = (
+            image.sizeInBytes() if hasattr(image, "sizeInBytes") else image.byteCount()
+        )
+        bits = image.bits()
+        bits.setsize(byte_count)
+        painted = np.frombuffer(bits, dtype=np.uint8).reshape(
+            image.height(), image.bytesPerLine()
+        )
+        painted = painted[:, : image.width() * 3].reshape(
+            image.height(), image.width(), 3
+        ).copy()
+        if convert_back:
+            return cv2.cvtColor(painted, cv2.COLOR_RGB2BGR)
+        return painted
+
+    def run(self):
+        writer = None
+        first_frame_time = None
+        last_frame_time = None
+        last_canvas = None
+        frame_size = None
+        written_frames = 0
+        duplicate_frames = 0
+        timestamp_dropped_frames = 0
+
+        try:
+            if cv2 is None:
+                raise RuntimeError(
+                    "OpenCV not installed. pip install opencv-python"
+                )
+            while True:
+                with self._condition:
+                    while not self._queue and not self._stop_requested:
+                        self._condition.wait()
+                    if self._queue:
+                        original, processed, frame_time = self._queue.popleft()
+                    elif self._stop_requested:
+                        break
+                    else:
+                        continue
+
+                if first_frame_time is None:
+                    first_frame_time = frame_time
+                elapsed_seconds = max(0.0, frame_time - first_frame_time)
+                canvas = self._compose_frame(
+                    original,
+                    processed,
+                    self.left_label,
+                    self.right_label,
+                )
+                current_size = (canvas.shape[1], canvas.shape[0])
+                if writer is None:
+                    frame_size = current_size
+                    fourcc = cv2.VideoWriter_fourcc(*UVC_RECORDING_FOURCC)
+                    writer = cv2.VideoWriter(
+                        str(self.video_path), fourcc, self.fps, frame_size, True
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError(
+                            f"Cannot open UVC recording writer: {self.video_path}"
+                        )
+                elif current_size != frame_size:
+                    raise RuntimeError(
+                        "UVC recording frame size changed from "
+                        f"{frame_size[0]}x{frame_size[1]} to "
+                        f"{current_size[0]}x{current_size[1]}"
+                    )
+
+                target_index = int(round(elapsed_seconds * self.fps))
+                if target_index < written_frames:
+                    timestamp_dropped_frames += 1
+                    last_frame_time = frame_time
+                    continue
+                while written_frames < target_index and last_canvas is not None:
+                    writer.write(last_canvas)
+                    written_frames += 1
+                    duplicate_frames += 1
+                writer.write(canvas)
+                written_frames += 1
+                last_canvas = canvas
+                last_frame_time = frame_time
+
+            if (
+                writer is not None
+                and last_canvas is not None
+                and first_frame_time is not None
+                and self._stop_frame_time is not None
+            ):
+                stop_elapsed = max(
+                    0.0, self._stop_frame_time - first_frame_time
+                )
+                target_count = int(round(stop_elapsed * self.fps)) + 1
+                while written_frames < target_count:
+                    writer.write(last_canvas)
+                    written_frames += 1
+                    duplicate_frames += 1
+        except Exception as exc:
+            self.error_message = str(exc)
+        finally:
+            if writer is not None:
+                writer.release()
+            duration_seconds = 0.0
+            if first_frame_time is not None:
+                end_time = self._stop_frame_time
+                if end_time is None:
+                    end_time = last_frame_time
+                if end_time is not None:
+                    duration_seconds = max(0.0, end_time - first_frame_time)
+            file_size = (
+                self.video_path.stat().st_size
+                if self.video_path.is_file()
+                else 0
+            )
+            self.result_summary = {
+                "codec": UVC_RECORDING_FOURCC,
+                "fps": round(self.fps, 3),
+                "frame_size": (
+                    None
+                    if frame_size is None
+                    else {"width": frame_size[0], "height": frame_size[1]}
+                ),
+                "duration_seconds": round(duration_seconds, 3),
+                "submitted_frames": self._submitted_frames,
+                "written_frames": written_frames,
+                "duplicate_frames": duplicate_frames,
+                "queue_dropped_frames": self._queue_dropped_frames,
+                "timestamp_dropped_frames": timestamp_dropped_frames,
+                "file_size_bytes": int(file_size),
+            }
+
+
 class ThermalRawToolkit(QMainWindow):
     FUNCTIONS = [
         "RAW Viewer",
@@ -1054,6 +2270,7 @@ class ThermalRawToolkit(QMainWindow):
         "High / Low Analyzer",
         "Temporal Drift Analyzer",
         "BPR Bad Pixel Marking",
+        "Dual UVC Compare",
         "RAW Algorithm Compare",
         "UVC Algorithm Compare",
     ]
@@ -1064,8 +2281,8 @@ class ThermalRawToolkit(QMainWindow):
         "讀取 RAW、pointN_K.bin 與 pointN_B.bin 執行 NUC 計算，顯示並儲存原始與 NUC 後的 RAW 和 PNG。",
         "逐像素比較 LOW 與 HIGH RAW，影像區顯示 HIGH - LOW Difference，並分析 DN 差異及異常像素。",
         "分析資料夾內多張 RAW 的時間變化，計算標準差與 Peak-to-Peak。",
-        "讀取單張 RAW，以固定 Bit Depth 映射後套用所選影像演算法，並比較原始與處理結果。",
-        "開啟 UVC Camera，可選擇先套用 Novatek K/B NUC table，再即時比較原始影像與影像演算法結果。",
+        "讀取單張 RAW，選擇輸入映射，再依自訂數量與順序執行影像演算法 Pipeline。",
+        "開啟 UVC Camera：預設 Auto Detect 先嘗試 Novatek MJPG，失敗自動改用相機原生格式，再依自訂順序即時執行 Pipeline。",
     ]
     PREVIEW_LAYOUTS = [
         (False, "", "RAW Preview (Fixed Scale)"),
@@ -1075,12 +2292,17 @@ class ThermalRawToolkit(QMainWindow):
         (False, "", "HIGH - LOW Difference (Fixed Scale)"),
         (False, "", "Temporal Standard Deviation (Fixed Scale)"),
         (True, "RAW Fixed-Scale / White Canvas", "BPR Bad Pixels Marked"),
-        (True, "Original RAW (Fixed Scale)", "Percentile Auto Contrast"),
-        (True, "Original UVC", "Percentile Auto Contrast"),
+        (True, "UVC Camera A", "UVC Camera B"),
+        (True, "Original RAW (Fixed Scale)", "Final Pipeline Output"),
+        (True, "Original UVC", "Final Pipeline Output"),
     ]
     FUNCTION_DESCRIPTIONS.insert(
         6,
         "Load a Novatek BPR dpc_table.bin or x,y coordinate file. Optionally overlay bad-pixel circles on a RAW image; otherwise use a white canvas.",
+    )
+    FUNCTION_DESCRIPTIONS.insert(
+        7,
+        "Open two independent UVC cameras with per-camera Auto Detect for side-by-side monitoring, paired capture, and synchronized comparison recording.",
     )
 
     def __init__(self):
@@ -1090,13 +2312,59 @@ class ThermalRawToolkit(QMainWindow):
         self.current_original = None
         self.current_result = None
         self.last_output_dir = None
+        self.camera_devices = []
+        self._camera_device_signature = None
+        self.raw_algorithm_source = None
+        self.raw_pipeline_input = None
+        self.raw_pipeline_input_max = 255
+        self.raw_pipeline_final = None
+        self.raw_pipeline_records = []
+        self.dual_uvc_worker_a = None
+        self.dual_uvc_worker_b = None
+        self.dual_uvc_frame_a = None
+        self.dual_uvc_frame_b = None
+        self.dual_uvc_frame_time_a = 0.0
+        self.dual_uvc_frame_time_b = 0.0
+        self.dual_uvc_actual_fps_a = 0.0
+        self.dual_uvc_actual_fps_b = 0.0
+        self.dual_uvc_output_fps_a = 0.0
+        self.dual_uvc_output_fps_b = 0.0
+        self.dual_uvc_frame_count_a = 0
+        self.dual_uvc_frame_count_b = 0
+        self.dual_uvc_fps_started_a = 0.0
+        self.dual_uvc_fps_started_b = 0.0
+        self.dual_uvc_recording_worker = None
+        self.dual_uvc_recording_output_dir = None
+        self.dual_uvc_recording_manifest = None
+        self.dual_uvc_recording_stop_reason = None
+        self.dual_uvc_recording_started_perf = 0.0
+        self.dual_uvc_restart_when_stopped = False
+        self.dual_uvc_close_pending = False
+        self.dual_uvc_buffer_a = LatestFrameBuffer()
+        self.dual_uvc_buffer_b = LatestFrameBuffer()
+        self.dual_uvc_buffer_sequence_a = 0
+        self.dual_uvc_buffer_sequence_b = 0
+        self.dual_uvc_display_timer = QTimer(self)
+        self.dual_uvc_display_timer.setInterval(10)
+        self.dual_uvc_display_timer.timeout.connect(
+            self.consume_dual_uvc_latest_frames
+        )
         self.uvc_worker = None
+        self.uvc_processing_worker = None
+        self.uvc_recording_worker = None
+        self.uvc_recording_output_dir = None
+        self.uvc_recording_manifest = None
+        self.uvc_recording_stop_reason = None
+        self.uvc_recording_started_perf = 0.0
+        self.uvc_actual_fps = 0.0
         self.uvc_original_source = None
         self.uvc_original_frame = None
         self.uvc_processed_frame = None
-        self.uvc_nuc_k_table = None
-        self.uvc_nuc_b_table = None
-        self.uvc_nuc_cache_key = None
+        self.uvc_pipeline_input = None
+        self.uvc_pipeline_input_max = 255
+        self.uvc_pipeline_records = []
+        self.uvc_pipeline_total_ms = 0.0
+        self.uvc_processing_revision = 0
         self.uvc_last_processing_error = None
         self.uvc_frame_count = 0
         self.uvc_fps_display = 0.0
@@ -1106,14 +2374,16 @@ class ThermalRawToolkit(QMainWindow):
         self.uvc_reconnect_requested = False
         self.uvc_restart_when_stopped = False
         self.uvc_close_pending = False
-        self.uvc_clahe = None
-        self.uvc_clahe_settings = None
-        self.uvc_fieldscale_state = {}
         self.uvc_watchdog_timer = QTimer(self)
         self.uvc_watchdog_timer.setInterval(200)
         self.uvc_watchdog_timer.timeout.connect(self.check_uvc_stream)
         self._build_ui()
         self._apply_ui_style()
+        self.refresh_camera_devices(log_changes=False)
+        self.camera_refresh_timer = QTimer(self)
+        self.camera_refresh_timer.setInterval(CAMERA_REFRESH_INTERVAL_MS)
+        self.camera_refresh_timer.timeout.connect(self.refresh_camera_devices)
+        self.camera_refresh_timer.start()
 
     def _apply_ui_style(self):
         self.setStyleSheet("""
@@ -1155,6 +2425,21 @@ class ThermalRawToolkit(QMainWindow):
                 left: 10px;
                 padding: 0 5px;
             }
+            QGroupBox#pipelineParameterCard {
+                background-color: #202328;
+                border: 1px solid #424850;
+                border-radius: 7px;
+                margin-top: 10px;
+                padding: 10px 8px 8px 8px;
+                color: #c9e2f2;
+                font-weight: 700;
+            }
+            QGroupBox#pipelineParameterCard::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #c9e2f2;
+            }
             QLabel[viewerStatValue="true"] {
                 color: #ffffff;
                 background-color: #191c21;
@@ -1168,7 +2453,7 @@ class ThermalRawToolkit(QMainWindow):
                 color: #e0e3e8;
                 background: transparent;
             }
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QListWidget {
                 background-color: #191c21;
                 color: #f0f1f3;
                 border: 1px solid #454b54;
@@ -1176,7 +2461,8 @@ class ThermalRawToolkit(QMainWindow):
                 padding: 6px 8px;
                 selection-background-color: #4f8fbd;
             }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+            QTextEdit:focus, QListWidget:focus {
                 border: 1px solid #86bce2;
             }
             QComboBox::drop-down {
@@ -1189,6 +2475,15 @@ class ThermalRawToolkit(QMainWindow):
                 border: 1px solid #4a515b;
                 selection-background-color: #4f8fbd;
                 padding: 4px;
+            }
+            QListWidget::item {
+                color: #e7e9ed;
+                padding: 4px 5px;
+                border-radius: 3px;
+            }
+            QListWidget::item:selected {
+                background-color: #4f8fbd;
+                color: #ffffff;
             }
             QPushButton {
                 background-color: #3a4048;
@@ -1279,6 +2574,47 @@ class ThermalRawToolkit(QMainWindow):
                 border: 1px solid #86bce2;
                 border-radius: 4px;
             }
+            QScrollArea#formScroll,
+            QWidget#formViewport,
+            QWidget#formContent {
+                background-color: #22252a;
+                color: #e7e9ed;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background-color: #191c21;
+                width: 12px;
+                margin: 0;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #4a515b;
+                min-height: 28px;
+                border-radius: 5px;
+            }
+            QScrollBar:horizontal {
+                background-color: #191c21;
+                height: 12px;
+                margin: 0;
+                border: none;
+            }
+            QScrollBar::handle:horizontal {
+                background-color: #4a515b;
+                min-width: 28px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:hover {
+                background-color: #626c78;
+            }
+            QScrollBar::add-line, QScrollBar::sub-line {
+                width: 0;
+                height: 0;
+                border: none;
+                background: transparent;
+            }
+            QScrollBar::add-page, QScrollBar::sub-page {
+                background: transparent;
+            }
             QTextEdit {
                 font-family: "Cascadia Mono", "Consolas";
                 font-size: 17px;
@@ -1315,7 +2651,23 @@ class ThermalRawToolkit(QMainWindow):
         top.addStretch()
         top.addWidget(QLabel("Function:"))
         self.function_combo = QComboBox()
-        self.function_combo.addItems(self.FUNCTIONS)
+        uvc_function_names = (
+            "Dual UVC Compare",
+            "UVC Algorithm Compare",
+        )
+        function_menu_order = [
+            function_index
+            for function_index, function_name in enumerate(self.FUNCTIONS)
+            if function_name not in uvc_function_names
+        ]
+        function_menu_order.extend(
+            self.FUNCTIONS.index(function_name)
+            for function_name in uvc_function_names
+        )
+        for function_index in function_menu_order:
+            self.function_combo.addItem(
+                self.FUNCTIONS[function_index], function_index
+            )
         self.function_combo.currentIndexChanged.connect(self.change_page)
         self.function_combo.setMinimumWidth(240)
         top.addWidget(self.function_combo)
@@ -1450,7 +2802,26 @@ class ThermalRawToolkit(QMainWindow):
             )
 
     def _form_page(self):
-        w = QWidget(); layout = QVBoxLayout(w); form = QFormLayout(); layout.addLayout(form); layout.addStretch(); return w, form
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setObjectName("formScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.viewport().setObjectName("formViewport")
+        scroll.viewport().setAutoFillBackground(True)
+        content = QWidget()
+        content.setObjectName("formContent")
+        content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        content_layout = QVBoxLayout(content)
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        content_layout.addLayout(form)
+        content_layout.addStretch()
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
+        return page, form
 
     def _create_pages(self):
         # Viewer
@@ -1584,124 +2955,260 @@ class ThermalRawToolkit(QMainWindow):
         self.update_bpr_marking_ui()
         self.update_bpr_coordinate_note()
 
+        # Dual UVC Compare
+        p, f = self._form_page()
+        self.dual_uvc_note = QLabel(
+            "Camera A and Camera B run in independent capture threads. Capture "
+            "and recording pair the latest available frames in software; this is "
+            "not hardware-trigger synchronization. Camera indexes must differ."
+        )
+        self.dual_uvc_note.setWordWrap(True)
+        self.dual_uvc_note.setStyleSheet(
+            "color:#c8d0d9; background:#292d33; border-left:3px solid #79afd3; "
+            "border-radius:5px; padding:8px;"
+        )
+        f.addRow(self.dual_uvc_note)
+
+        self.dual_uvc_group_a = QGroupBox("UVC Camera A")
+        self.dual_uvc_group_a.setObjectName("settingsCard")
+        dual_form_a = QFormLayout(self.dual_uvc_group_a)
+        self.dual_uvc_image_name_a = QComboBox()
+        self.dual_uvc_image_name_b = QComboBox()
+        for image_name, file_tag in DUAL_UVC_IMAGE_NAME_OPTIONS:
+            self.dual_uvc_image_name_a.addItem(image_name, file_tag)
+            self.dual_uvc_image_name_b.addItem(image_name, file_tag)
+        self.dual_uvc_image_name_a.setCurrentIndex(0)
+        self.dual_uvc_image_name_b.setCurrentIndex(1)
+        self.dual_uvc_camera_a = QComboBox()
+        self.dual_uvc_camera_b = QComboBox()
+        self.dual_uvc_fps_a = QComboBox()
+        self.dual_uvc_fps_b = QComboBox()
+        for fps in (30, 60):
+            self.dual_uvc_fps_a.addItem(f"{fps} FPS", fps)
+            self.dual_uvc_fps_b.addItem(f"{fps} FPS", fps)
+        self.dual_uvc_fps_a.setCurrentIndex(
+            max(self.dual_uvc_fps_a.findData(DEFAULT_UVC_FPS), 0)
+        )
+        self.dual_uvc_fps_b.setCurrentIndex(
+            max(self.dual_uvc_fps_b.findData(DEFAULT_UVC_FPS), 0)
+        )
+        self.dual_uvc_status_a = QLabel("Camera A stopped")
+        self.dual_uvc_status_a.setWordWrap(True)
+        dual_form_a.addRow("Image Name", self.dual_uvc_image_name_a)
+        dual_form_a.addRow("CAMERA_INDEX", self.dual_uvc_camera_a)
+        dual_form_a.addRow("Requested FPS", self.dual_uvc_fps_a)
+        dual_form_a.addRow("Status", self.dual_uvc_status_a)
+
+        self.dual_uvc_group_b = QGroupBox("UVC Camera B")
+        self.dual_uvc_group_b.setObjectName("settingsCard")
+        dual_form_b = QFormLayout(self.dual_uvc_group_b)
+        self.dual_uvc_status_b = QLabel("Camera B stopped")
+        self.dual_uvc_status_b.setWordWrap(True)
+        dual_form_b.addRow("Image Name", self.dual_uvc_image_name_b)
+        dual_form_b.addRow("CAMERA_INDEX", self.dual_uvc_camera_b)
+        dual_form_b.addRow("Requested FPS", self.dual_uvc_fps_b)
+        dual_form_b.addRow("Status", self.dual_uvc_status_b)
+        f.addRow(self.dual_uvc_group_a)
+        f.addRow(self.dual_uvc_group_b)
+
+        dual_controls = QWidget()
+        dual_controls_layout = QGridLayout(dual_controls)
+        dual_controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.dual_uvc_start_btn = QPushButton("Start Cameras")
+        self.dual_uvc_start_btn.setObjectName("startButton")
+        self.dual_uvc_start_btn.clicked.connect(self.start_dual_uvc_cameras)
+        self.dual_uvc_stop_btn = QPushButton("Stop Cameras")
+        self.dual_uvc_stop_btn.setObjectName("stopButton")
+        self.dual_uvc_stop_btn.clicked.connect(self.stop_dual_uvc_cameras)
+        self.dual_uvc_stop_btn.setEnabled(False)
+        self.dual_uvc_capture_btn = QPushButton("Capture Pair")
+        self.dual_uvc_capture_btn.setObjectName("captureButton")
+        self.dual_uvc_capture_btn.clicked.connect(self.capture_dual_uvc_pair)
+        self.dual_uvc_capture_btn.setEnabled(False)
+        self.dual_uvc_record_start_btn = QPushButton("Start Recording")
+        self.dual_uvc_record_start_btn.setObjectName("startButton")
+        self.dual_uvc_record_start_btn.clicked.connect(
+            self.start_dual_uvc_recording
+        )
+        self.dual_uvc_record_start_btn.setEnabled(False)
+        self.dual_uvc_record_stop_btn = QPushButton("Stop Recording")
+        self.dual_uvc_record_stop_btn.setObjectName("stopButton")
+        self.dual_uvc_record_stop_btn.clicked.connect(
+            self.stop_dual_uvc_recording
+        )
+        self.dual_uvc_record_stop_btn.setEnabled(False)
+        self.dual_uvc_refresh_btn = QPushButton("Refresh Cameras")
+        self.dual_uvc_refresh_btn.clicked.connect(self.refresh_camera_devices)
+        dual_controls_layout.addWidget(self.dual_uvc_start_btn, 0, 0)
+        dual_controls_layout.addWidget(self.dual_uvc_stop_btn, 0, 1)
+        dual_controls_layout.addWidget(self.dual_uvc_capture_btn, 1, 0, 1, 2)
+        dual_controls_layout.addWidget(self.dual_uvc_record_start_btn, 2, 0)
+        dual_controls_layout.addWidget(self.dual_uvc_record_stop_btn, 2, 1)
+        dual_controls_layout.addWidget(self.dual_uvc_refresh_btn, 3, 0, 1, 2)
+        f.addRow(dual_controls)
+        self.stack.addWidget(p)
+
+        self.dual_uvc_camera_a.currentIndexChanged.connect(
+            self.dual_uvc_setting_changed
+        )
+        self.dual_uvc_camera_b.currentIndexChanged.connect(
+            self.dual_uvc_setting_changed
+        )
+        self.dual_uvc_fps_a.currentIndexChanged.connect(
+            self.dual_uvc_setting_changed
+        )
+        self.dual_uvc_fps_b.currentIndexChanged.connect(
+            self.dual_uvc_setting_changed
+        )
+        self.dual_uvc_image_name_a.currentIndexChanged.connect(
+            self.dual_uvc_image_name_changed
+        )
+        self.dual_uvc_image_name_b.currentIndexChanged.connect(
+            self.dual_uvc_image_name_changed
+        )
+        self.resolution_combo.currentIndexChanged.connect(
+            self.dual_uvc_setting_changed
+        )
+        self.dual_uvc_image_name_changed()
+
         # Single RAW Algorithm Compare
         p, f = self._form_page()
-        self.raw_algorithm_form = f
         self.raw_algorithm_file = PathRow(
             "file",
             "RAW Files (*.raw *.RAW *.bin *.BIN)",
             "Select RAW File for Algorithm Compare",
         )
-        self.raw_algorithm_combo = QComboBox()
-        for algorithm_name, algorithm_key in IMAGE_ALGORITHM_OPTIONS:
-            self.raw_algorithm_combo.addItem(algorithm_name, algorithm_key)
-        self.raw_algorithm_description = QLabel()
-        self.raw_algorithm_description.setWordWrap(True)
-        self.raw_algorithm_description.setStyleSheet(
-            "color:#c8d0d9; background:#292d33; border-left:3px solid #79afd3; "
-            "border-radius:5px; padding:8px;"
+        self.raw_input_mapping_combo = QComboBox()
+        for mapping_name, mapping_key in RAW_INPUT_MAPPING_OPTIONS:
+            self.raw_input_mapping_combo.addItem(mapping_name, mapping_key)
+        self.raw_input_mapping_combo.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
         )
-        self.raw_low_percentile = QDoubleSpinBox(); self.raw_low_percentile.setRange(0.0, 99.5); self.raw_low_percentile.setDecimals(1); self.raw_low_percentile.setSingleStep(0.5); self.raw_low_percentile.setValue(1.0)
-        self.raw_high_percentile = QDoubleSpinBox(); self.raw_high_percentile.setRange(0.5, 100.0); self.raw_high_percentile.setDecimals(1); self.raw_high_percentile.setSingleStep(0.5); self.raw_high_percentile.setValue(99.0)
-        self.raw_clahe_clip = QDoubleSpinBox(); self.raw_clahe_clip.setRange(0.1, 100.0); self.raw_clahe_clip.setDecimals(1); self.raw_clahe_clip.setSingleStep(0.1); self.raw_clahe_clip.setValue(2.0)
-        self.raw_clahe_grid = QSpinBox(); self.raw_clahe_grid.setRange(1, 64); self.raw_clahe_grid.setValue(8)
-        self.raw_gamma = QDoubleSpinBox(); self.raw_gamma.setRange(0.1, 3.0); self.raw_gamma.setDecimals(1); self.raw_gamma.setSingleStep(0.1); self.raw_gamma.setValue(0.7)
-        self.raw_bilateral_strength = QSpinBox(); self.raw_bilateral_strength.setRange(1, 7); self.raw_bilateral_strength.setValue(2)
-        self.raw_unsharp_amount = QDoubleSpinBox(); self.raw_unsharp_amount.setRange(0.1, 3.0); self.raw_unsharp_amount.setDecimals(1); self.raw_unsharp_amount.setSingleStep(0.1); self.raw_unsharp_amount.setValue(1.0)
-        self.raw_algorithm_reset_btn = QPushButton("Reset Algorithm Defaults")
-        self.raw_algorithm_reset_btn.setObjectName("resetButton")
-        self.raw_algorithm_reset_btn.clicked.connect(self.reset_raw_algorithm_settings)
-        self.raw_low_percentile.valueChanged.connect(self.update_raw_percentile_limits)
-        self.raw_high_percentile.valueChanged.connect(self.update_raw_percentile_limits)
+        self.raw_input_mapping_note = QLabel(
+            "Input Mapping runs before the display pipeline. With Fixed Bit Depth "
+            "and Fieldscale as the first enabled step, Fieldscale reads original RAW "
+            "DN to preserve its firmware-matching behavior; following steps are 8-bit."
+        )
+        self.raw_input_mapping_note.setWordWrap(True)
+        self.raw_input_mapping_note.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred
+        )
+        self.raw_input_mapping_note.setStyleSheet("color:#c98;")
+        self.raw_pipeline_editor = AlgorithmPipelineEditor(
+            allow_step_algorithm_change=False
+        )
+        self.raw_preview_stage_combo = QComboBox()
+        self.raw_preview_stage_combo.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        self.raw_save_intermediates = QCheckBox("Save Step PNGs")
+        self.raw_save_intermediates.setToolTip(
+            "Save one PNG after every enabled pipeline step"
+        )
+        self.raw_save_intermediates.setChecked(True)
         f.addRow("RAW File", self.raw_algorithm_file)
-        f.addRow("Right-side Algorithm", self.raw_algorithm_combo)
-        f.addRow(self.raw_algorithm_description)
-        f.addRow("Low Percentile", self.raw_low_percentile)
-        f.addRow("High Percentile", self.raw_high_percentile)
-        f.addRow("CLAHE Clip Limit", self.raw_clahe_clip)
-        f.addRow("CLAHE Grid Size", self.raw_clahe_grid)
-        f.addRow("Gamma", self.raw_gamma)
-        f.addRow("Bilateral Strength", self.raw_bilateral_strength)
-        f.addRow("Unsharp Amount", self.raw_unsharp_amount)
-        f.addRow(self.raw_algorithm_reset_btn)
+        f.addRow("Input Mapping", self.raw_input_mapping_combo)
+        f.addRow(self.raw_input_mapping_note)
+        f.addRow(self.raw_pipeline_editor)
+        f.addRow("Right Preview", self.raw_preview_stage_combo)
+        f.addRow("Intermediate Output", self.raw_save_intermediates)
         self.stack.addWidget(p)
-        self.raw_algorithm_combo.currentIndexChanged.connect(self.update_raw_algorithm_ui)
-        self.update_raw_percentile_limits()
-        self.update_raw_algorithm_ui()
+        self.raw_algorithm_file.edit.textChanged.connect(
+            self.invalidate_raw_pipeline_source
+        )
+        self.raw_input_mapping_combo.currentIndexChanged.connect(
+            self.update_raw_pipeline_ui
+        )
+        self.raw_pipeline_editor.pipeline_changed.connect(
+            self.update_raw_pipeline_ui
+        )
+        self.raw_preview_stage_combo.currentIndexChanged.connect(
+            self.update_raw_stage_preview
+        )
+        self.resolution_combo.currentIndexChanged.connect(
+            self.invalidate_raw_pipeline_source
+        )
+        self.bit_depth_combo.currentIndexChanged.connect(
+            self.update_raw_pipeline_ui
+        )
+        self.update_raw_pipeline_ui()
 
         # UVC Algorithm Compare
         p, f = self._form_page()
         self.uvc_camera_combo = QComboBox()
-        for camera_index in CAMERA_INDEX_OPTIONS:
-            self.uvc_camera_combo.addItem(f"Camera {camera_index}", camera_index)
-        default_camera_index = CAMERA_INDEX_OPTIONS.index(DEFAULT_CAMERA_INDEX) if DEFAULT_CAMERA_INDEX in CAMERA_INDEX_OPTIONS else 0
-        self.uvc_camera_combo.setCurrentIndex(default_camera_index)
-        self.uvc_form = f
-        self.uvc_algorithm_combo = QComboBox()
-        for algorithm_name, algorithm_key in IMAGE_ALGORITHM_OPTIONS:
-            self.uvc_algorithm_combo.addItem(algorithm_name, algorithm_key)
-        self.uvc_algorithm_description = QLabel()
-        self.uvc_algorithm_description.setWordWrap(True)
-        self.uvc_algorithm_description.setStyleSheet(
-            "color:#c8d0d9; background:#292d33; border-left:3px solid #79afd3; "
-            "border-radius:5px; padding:8px;"
-        )
-        self.uvc_apply_nuc = QCheckBox("Enable NUC before algorithm")
-        self.uvc_nuc_k_file = PathRow("file", "Novatek K Table (*.bin *.BIN)", "Select UVC NUC pointN_K.bin")
-        self.uvc_nuc_b_file = PathRow("file", "Novatek B Table (*.bin *.BIN)", "Select UVC NUC pointN_B.bin")
-        self.uvc_nuc_note = QLabel("K/B table must match the selected Resolution and DN scale. An 8-bit UVC frame is linearly mapped to the selected Bit Depth before NUC.")
-        self.uvc_nuc_note.setWordWrap(True)
-        self.uvc_nuc_note.setStyleSheet("color:#c98;")
         self.uvc_fps_combo = QComboBox()
         for fps in (30, 60):
             self.uvc_fps_combo.addItem(f"{fps} FPS", fps)
         default_fps_index = self.uvc_fps_combo.findData(DEFAULT_UVC_FPS)
         self.uvc_fps_combo.setCurrentIndex(max(default_fps_index, 0))
-        self.uvc_low_percentile = QDoubleSpinBox(); self.uvc_low_percentile.setRange(0.0, 99.5); self.uvc_low_percentile.setDecimals(1); self.uvc_low_percentile.setSingleStep(0.5); self.uvc_low_percentile.setValue(1.0)
-        self.uvc_high_percentile = QDoubleSpinBox(); self.uvc_high_percentile.setRange(0.5, 100.0); self.uvc_high_percentile.setDecimals(1); self.uvc_high_percentile.setSingleStep(0.5); self.uvc_high_percentile.setValue(99.0)
-        self.uvc_clahe_clip = QDoubleSpinBox(); self.uvc_clahe_clip.setRange(0.1, 100.0); self.uvc_clahe_clip.setDecimals(1); self.uvc_clahe_clip.setSingleStep(0.1); self.uvc_clahe_clip.setValue(2.0)
-        self.uvc_clahe_grid = QSpinBox(); self.uvc_clahe_grid.setRange(1, 64); self.uvc_clahe_grid.setValue(8)
-        self.uvc_gamma = QDoubleSpinBox(); self.uvc_gamma.setRange(0.1, 3.0); self.uvc_gamma.setDecimals(1); self.uvc_gamma.setSingleStep(0.1); self.uvc_gamma.setValue(0.7)
-        self.uvc_bilateral_strength = QSpinBox(); self.uvc_bilateral_strength.setRange(1, 7); self.uvc_bilateral_strength.setValue(2)
-        self.uvc_unsharp_amount = QDoubleSpinBox(); self.uvc_unsharp_amount.setRange(0.1, 3.0); self.uvc_unsharp_amount.setDecimals(1); self.uvc_unsharp_amount.setSingleStep(0.1); self.uvc_unsharp_amount.setValue(1.0)
-        self.uvc_low_percentile.valueChanged.connect(self.update_uvc_percentile_limits)
-        self.uvc_high_percentile.valueChanged.connect(self.update_uvc_percentile_limits)
-        self.update_uvc_percentile_limits()
+        self.uvc_pipeline_editor = AlgorithmPipelineEditor(
+            allow_step_algorithm_change=False
+        )
+        self.uvc_preview_stage_combo = QComboBox()
+        self.uvc_preview_stage_combo.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        self.uvc_save_intermediates = QCheckBox("Save Step PNGs")
+        self.uvc_save_intermediates.setToolTip(
+            "Save one PNG after every enabled pipeline step when capturing"
+        )
+        self.uvc_save_intermediates.setChecked(True)
         self.uvc_camera_combo.currentIndexChanged.connect(self.switch_uvc_camera)
-        self.uvc_apply_nuc.toggled.connect(self.update_uvc_nuc_ui)
-        self.uvc_nuc_k_file.path_selected.connect(self.auto_pair_uvc_nuc_b_file)
-        self.uvc_nuc_k_file.edit.textChanged.connect(self.invalidate_uvc_nuc_cache)
-        self.uvc_nuc_b_file.edit.textChanged.connect(self.invalidate_uvc_nuc_cache)
-        self.resolution_combo.currentIndexChanged.connect(self.invalidate_uvc_nuc_cache)
-        controls = QWidget(); controls_layout = QHBoxLayout(controls); controls_layout.setContentsMargins(0, 0, 0, 0)
-        self.uvc_start_btn = QPushButton("Start Camera"); self.uvc_start_btn.setObjectName("startButton"); self.uvc_start_btn.clicked.connect(self.start_uvc_camera)
-        self.uvc_stop_btn = QPushButton("Stop Camera"); self.uvc_stop_btn.setObjectName("stopButton"); self.uvc_stop_btn.clicked.connect(self.stop_uvc_camera); self.uvc_stop_btn.setEnabled(False)
-        self.uvc_capture_btn = QPushButton("Capture Pair"); self.uvc_capture_btn.setObjectName("captureButton"); self.uvc_capture_btn.clicked.connect(self.capture_uvc_pair); self.uvc_capture_btn.setEnabled(False)
-        self.uvc_reset_btn = QPushButton("Reset Algorithm Defaults"); self.uvc_reset_btn.setObjectName("resetButton"); self.uvc_reset_btn.clicked.connect(self.reset_uvc_algorithm_settings)
-        controls_layout.addWidget(self.uvc_start_btn); controls_layout.addWidget(self.uvc_stop_btn); controls_layout.addWidget(self.uvc_capture_btn); controls_layout.addWidget(self.uvc_reset_btn)
-        self.uvc_status = QLabel("Camera stopped"); self.uvc_status.setWordWrap(True)
+        self.bit_depth_combo.currentIndexChanged.connect(
+            self.mark_uvc_processing_config_changed
+        )
+        self.uvc_pipeline_editor.pipeline_changed.connect(
+            self.update_uvc_pipeline_ui
+        )
+        self.uvc_preview_stage_combo.currentIndexChanged.connect(
+            self.update_uvc_stage_preview
+        )
+        controls = QWidget()
+        controls_layout = QGridLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.uvc_start_btn = QPushButton("Start Camera")
+        self.uvc_start_btn.setObjectName("startButton")
+        self.uvc_start_btn.clicked.connect(self.start_uvc_camera)
+        self.uvc_stop_btn = QPushButton("Stop Camera")
+        self.uvc_stop_btn.setObjectName("stopButton")
+        self.uvc_stop_btn.clicked.connect(self.stop_uvc_camera)
+        self.uvc_stop_btn.setEnabled(False)
+        self.uvc_capture_btn = QPushButton("Capture Pair")
+        self.uvc_capture_btn.setObjectName("captureButton")
+        self.uvc_capture_btn.clicked.connect(self.capture_uvc_pair)
+        self.uvc_capture_btn.setEnabled(False)
+        self.uvc_record_start_btn = QPushButton("Start Recording")
+        self.uvc_record_start_btn.setObjectName("startButton")
+        self.uvc_record_start_btn.setToolTip(
+            "Record synchronized Original UVC and Final Pipeline Output "
+            "side by side as MJPG AVI"
+        )
+        self.uvc_record_start_btn.clicked.connect(self.start_uvc_recording)
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn = QPushButton("Stop Recording")
+        self.uvc_record_stop_btn.setObjectName("stopButton")
+        self.uvc_record_stop_btn.clicked.connect(self.stop_uvc_recording)
+        self.uvc_record_stop_btn.setEnabled(False)
+        self.uvc_refresh_btn = QPushButton("Refresh Cameras")
+        self.uvc_refresh_btn.clicked.connect(self.refresh_camera_devices)
+        controls_layout.addWidget(self.uvc_start_btn, 0, 0)
+        controls_layout.addWidget(self.uvc_stop_btn, 0, 1)
+        controls_layout.addWidget(self.uvc_capture_btn, 1, 0, 1, 2)
+        controls_layout.addWidget(self.uvc_record_start_btn, 2, 0)
+        controls_layout.addWidget(self.uvc_record_stop_btn, 2, 1)
+        controls_layout.addWidget(self.uvc_refresh_btn, 3, 0, 1, 2)
+        self.uvc_status = QLabel("Camera stopped")
+        self.uvc_status.setWordWrap(True)
+        self.uvc_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         f.addRow("CAMERA_INDEX", self.uvc_camera_combo)
-        f.addRow("NUC Preprocess", self.uvc_apply_nuc)
-        f.addRow("NUC pointN_K.bin", self.uvc_nuc_k_file)
-        f.addRow("NUC pointN_B.bin", self.uvc_nuc_b_file)
-        f.addRow(self.uvc_nuc_note)
-        f.addRow("Right-side Algorithm", self.uvc_algorithm_combo)
-        f.addRow(self.uvc_algorithm_description)
         f.addRow("Requested FPS", self.uvc_fps_combo)
-        f.addRow("Low Percentile", self.uvc_low_percentile)
-        f.addRow("High Percentile", self.uvc_high_percentile)
-        f.addRow("CLAHE Clip Limit", self.uvc_clahe_clip)
-        f.addRow("CLAHE Grid Size", self.uvc_clahe_grid)
-        f.addRow("Gamma", self.uvc_gamma)
-        f.addRow("Bilateral Strength", self.uvc_bilateral_strength)
-        f.addRow("Unsharp Amount", self.uvc_unsharp_amount)
+        f.addRow(self.uvc_pipeline_editor)
+        f.addRow("Right Preview", self.uvc_preview_stage_combo)
+        f.addRow("Intermediate Output", self.uvc_save_intermediates)
         f.addRow(controls)
         f.addRow("Status", self.uvc_status)
         self.stack.addWidget(p)
-        self.uvc_algorithm_combo.currentIndexChanged.connect(self.update_uvc_algorithm_ui)
-        self.update_uvc_nuc_ui()
-        self.update_uvc_algorithm_ui()
-
+        self.update_uvc_pipeline_ui()
     def update_nuc_mode(self):
         folder_mode = self.nuc_mode.currentIndex() == 0
         for w in (self.low_folder, self.high_folder): w.setEnabled(folder_mode)
@@ -1733,95 +3240,152 @@ class ThermalRawToolkit(QMainWindow):
         if label is not None:
             label.setVisible(visible)
 
-    def update_raw_percentile_limits(self, _value=None):
-        self.raw_high_percentile.setMinimum(
-            min(100.0, self.raw_low_percentile.value() + 0.5)
-        )
-        self.raw_low_percentile.setMaximum(
-            max(0.0, self.raw_high_percentile.value() - 0.5)
-        )
+    def rebuild_pipeline_preview_combo(self, editor, combo):
+        previous_data = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Final Pipeline Output", None)
+        for pipeline_index, stage in enumerate(editor.stages(), start=1):
+            if stage.enabled:
+                combo.addItem(
+                    f"After Step {pipeline_index}: "
+                    f"{algorithm_display_name(stage.algorithm_key)}",
+                    pipeline_index,
+                )
+        target_index = combo.findData(previous_data)
+        combo.setCurrentIndex(target_index if target_index >= 0 else 0)
+        combo.blockSignals(False)
 
-    def reset_raw_algorithm_settings(self):
-        algorithm_key = self.raw_algorithm_combo.currentData()
-        reset_items = []
-        if algorithm_key in ("auto_contrast", "auto_contrast_clahe"):
-            self.raw_high_percentile.setValue(99.0)
-            self.raw_low_percentile.setValue(1.0)
-            reset_items.append("Percentiles P1.0/P99.0")
-        if algorithm_key in ("clahe", "auto_contrast_clahe"):
-            self.raw_clahe_clip.setValue(2.0)
-            self.raw_clahe_grid.setValue(8)
-            reset_items.append("CLAHE clip=2.0, grid=8x8")
-        if algorithm_key == "gamma":
-            self.raw_gamma.setValue(0.7)
-            reset_items.append("Gamma=0.7")
-        elif algorithm_key == "bilateral":
-            self.raw_bilateral_strength.setValue(2)
-            reset_items.append("Bilateral strength=2")
-        elif algorithm_key == "unsharp":
-            self.raw_unsharp_amount.setValue(1.0)
-            reset_items.append("Unsharp amount=1.0")
-        if reset_items:
-            self.log.append(
-                f"Reset {self.raw_algorithm_combo.currentText()}: {', '.join(reset_items)}"
+    def invalidate_raw_pipeline_source(self, _value=None):
+        self.raw_algorithm_source = None
+        self.raw_pipeline_input = None
+        self.raw_pipeline_input_max = 255
+        self.raw_pipeline_final = None
+        self.raw_pipeline_records = []
+        if self.current_function_index() == len(self.FUNCTIONS) - 2:
+            self.current_original = None
+            self.current_result = None
+            self.preview_original.set_array(None)
+            self.preview_result.set_array(None)
+
+    def prepare_raw_pipeline_input(self, raw):
+        mapping_key = self.raw_input_mapping_combo.currentData()
+        if mapping_key == "raw_percentile_preview":
+            mapped, p1, p99 = percentile_preview_u8(raw)
+            return (
+                mapped,
+                255,
+                f"Original RAW DN P1={p1:.1f}, P99={p99:.1f} -> 8-bit",
             )
 
-    def update_raw_algorithm_ui(self, _combo_index=None):
-        algorithm_key = self.raw_algorithm_combo.currentData()
-        self.raw_algorithm_description.setText(
-            IMAGE_ALGORITHM_DESCRIPTIONS.get(algorithm_key, "")
+        first_enabled = next(
+            (
+                stage
+                for stage in self.raw_pipeline_editor.stages()
+                if stage.enabled
+            ),
+            None,
         )
-        uses_auto_contrast = algorithm_key in ("auto_contrast", "auto_contrast_clahe")
-        uses_clahe = algorithm_key in ("clahe", "auto_contrast_clahe")
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form, self.raw_low_percentile, uses_auto_contrast
-        )
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form, self.raw_high_percentile, uses_auto_contrast
-        )
-        self.raw_algorithm_reset_btn.setEnabled(
-            algorithm_key not in (
-                "fieldscale",
-                "hist_equalization",
-                "raw_percentile_preview",
+        if first_enabled is not None and first_enabled.algorithm_key == "fieldscale":
+            return (
+                raw.copy(),
+                self.raw_max,
+                f"Original RAW DN 0..{self.raw_max} -> first Fieldscale step",
             )
+        return (
+            raw_to_display_u8(raw, self.raw_max),
+            255,
+            f"Fixed 0..{self.raw_max} DN -> 0..255",
         )
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form, self.raw_clahe_clip, uses_clahe
+
+    def update_raw_pipeline_ui(self, _value=None):
+        self.rebuild_pipeline_preview_combo(
+            self.raw_pipeline_editor, self.raw_preview_stage_combo
         )
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form, self.raw_clahe_grid, uses_clahe
+        if self.current_function_index() == len(self.FUNCTIONS) - 2:
+            self.run_btn.setEnabled(bool(self.raw_pipeline_editor.enabled_stages()))
+        self.refresh_raw_pipeline_preview()
+        self.update_raw_stage_preview()
+
+    def refresh_raw_pipeline_preview(self):
+        if self.raw_algorithm_source is None:
+            return
+        try:
+            pipeline_input, input_max, _mapping_details = (
+                self.prepare_raw_pipeline_input(self.raw_algorithm_source)
+            )
+            final_image, records = apply_algorithm_pipeline(
+                pipeline_input,
+                self.raw_pipeline_editor.stages(),
+                input_max=input_max,
+            )
+        except Exception as exc:
+            self.raw_pipeline_input = None
+            self.raw_pipeline_input_max = 255
+            self.raw_pipeline_final = None
+            self.raw_pipeline_records = []
+            self.current_result = None
+            if self.current_function_index() == len(self.FUNCTIONS) - 2:
+                self.preview_result.set_array(None)
+            self.log.append(f"RAW pipeline preview error: {exc}")
+            return
+        self.raw_pipeline_input = pipeline_input
+        self.raw_pipeline_input_max = input_max
+        self.raw_pipeline_final = final_image
+        self.raw_pipeline_records = records
+        self.update_raw_stage_preview()
+
+    def update_raw_stage_preview(self, _combo_index=None):
+        if self.raw_pipeline_final is None:
+            return
+        selected_pipeline_index = self.raw_preview_stage_combo.currentData()
+        preview = pipeline_record_image(
+            self.raw_pipeline_records,
+            selected_pipeline_index,
+            self.raw_pipeline_final,
         )
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form, self.raw_gamma, algorithm_key == "gamma"
-        )
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form,
-            self.raw_bilateral_strength,
-            algorithm_key == "bilateral",
-        )
-        self.set_form_parameter_visible(
-            self.raw_algorithm_form, self.raw_unsharp_amount, algorithm_key == "unsharp"
-        )
-        if self.function_combo.currentIndex() == len(self.FUNCTIONS) - 2:
-            title = self.raw_algorithm_combo.currentText()
+        self.current_result = preview
+        if self.current_function_index() == len(self.FUNCTIONS) - 2:
+            title = self.raw_preview_stage_combo.currentText()
             self.preview_result.set_title(title)
             self.preview_result_caption.setText(title)
+            self.preview_result.set_array(preview)
 
-    def change_page(self, index):
+    def current_function_index(self):
+        function_index = self.function_combo.currentData()
+        if function_index is None:
+            return 0
+        return int(function_index)
+
+    def change_page(self, _combo_index):
+        index = self.function_combo.currentData()
+        if index is None:
+            return
+        index = int(index)
         uvc_page_index = len(self.FUNCTIONS) - 1
         raw_algorithm_page_index = len(self.FUNCTIONS) - 2
-        if index != uvc_page_index and self.uvc_worker is not None:
+        dual_uvc_page_index = len(self.FUNCTIONS) - 3
+        if index != uvc_page_index and (
+            self.uvc_worker is not None or self.uvc_processing_worker is not None
+        ):
             self.uvc_restart_when_stopped = False
             self.stop_uvc_camera(log_message=False)
+        if index != dual_uvc_page_index and (
+            self.dual_uvc_worker_a is not None
+            or self.dual_uvc_worker_b is not None
+        ):
+            self.dual_uvc_restart_when_stopped = False
+            self.stop_dual_uvc_cameras(log_message=False)
         self.stack.setCurrentIndex(index)
         self.function_title.setText(self.FUNCTIONS[index])
         self.function_description.setText(self.FUNCTION_DESCRIPTIONS[index])
         show_comparison, original_title, result_title = self.PREVIEW_LAYOUTS[index]
         if index == raw_algorithm_page_index:
-            result_title = self.raw_algorithm_combo.currentText()
+            result_title = self.raw_preview_stage_combo.currentText()
         elif index == uvc_page_index:
             result_title = self.uvc_result_title()
+        elif index == dual_uvc_page_index:
+            original_title, result_title = self.dual_uvc_image_names()
         self.preview_original_container.setVisible(show_comparison)
         self.preview_original.setVisible(show_comparison)
         self.preview_original.set_title(original_title)
@@ -1830,18 +3394,20 @@ class ThermalRawToolkit(QMainWindow):
         self.preview_result_caption.setText(result_title)
         self.preview_original.set_array(None)
         self.preview_result.set_array(None)
-        self.run_btn.setVisible(index != uvc_page_index)
-        self.save_current_btn.setVisible(index != 3)
-        self.save_current_btn.setText(
-            "Save Original + Processed PNG"
-            if index == uvc_page_index
-            else "Save Current Preview PNG"
+        self.run_btn.setVisible(
+            index not in (dual_uvc_page_index, uvc_page_index)
+        )
+        self.run_btn.setEnabled(
+            index != raw_algorithm_page_index
+            or bool(self.raw_pipeline_editor.enabled_stages())
+        )
+        self.save_current_btn.setVisible(
+            index not in (3, dual_uvc_page_index)
         )
         self.log.clear()
         self.log.append(f"Selected: {self.FUNCTIONS[index]}")
-
     def auto_preview_raw(self, _path=None):
-        if self.function_combo.currentIndex() == 0:
+        if self.current_function_index() == 0:
             self.run_current()
 
     def auto_pair_nuc_b_file(self, k_path):
@@ -1884,7 +3450,7 @@ class ThermalRawToolkit(QMainWindow):
     def run_current(self):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            idx = self.function_combo.currentIndex()
+            idx = self.current_function_index()
             handlers = [
                 self.run_viewer,
                 self.run_average,
@@ -1893,6 +3459,7 @@ class ThermalRawToolkit(QMainWindow):
                 self.run_high_low,
                 self.run_drift,
                 self.run_bpr_marking,
+                self.start_dual_uvc_cameras,
                 self.run_raw_algorithm,
                 self.start_uvc_camera,
             ]
@@ -2174,109 +3741,1059 @@ class ThermalRawToolkit(QMainWindow):
     def run_raw_algorithm(self):
         raw = load_raw(self.raw_algorithm_file.text(), self.width, self.height)
         raw8 = raw_to_display_u8(raw, self.raw_max)
-        algorithm_key = self.raw_algorithm_combo.currentData()
-        algorithm_input = (
-            raw
-            if algorithm_key in ("fieldscale", "raw_percentile_preview")
-            else raw8
+        stages = self.raw_pipeline_editor.stages()
+        pipeline_input, input_max, mapping_details = (
+            self.prepare_raw_pipeline_input(raw)
         )
-        processed, details = apply_image_algorithm(
-            algorithm_input,
-            algorithm_key,
-            low_percentile=self.raw_low_percentile.value(),
-            high_percentile=self.raw_high_percentile.value(),
-            clahe_clip=self.raw_clahe_clip.value(),
-            clahe_grid=self.raw_clahe_grid.value(),
-            gamma=self.raw_gamma.value(),
-            bilateral_strength=self.raw_bilateral_strength.value(),
-            unsharp_amount=self.raw_unsharp_amount.value(),
-            input_max=self.raw_max if algorithm_key == "fieldscale" else 255,
+        total_started = time.perf_counter()
+        processed, records = apply_algorithm_pipeline(
+            pipeline_input,
+            stages,
+            input_max=input_max,
         )
+        total_ms = (time.perf_counter() - total_started) * 1000.0
         out = self.make_output("raw_algorithm_compare")
         original_path = out / "original_fixed.png"
-        result_path = out / f"result_{algorithm_key}.png"
+        mapping_path = out / (
+            "input_native_dn.png" if input_max > 255 else "input_mapped.png"
+        )
+        result_path = out / "final_pipeline.png"
+        overview_path = out / "00_pipeline_overview.png"
         save_png(original_path, raw8)
+        save_png(mapping_path, pipeline_input)
+        if self.raw_save_intermediates.isChecked():
+            for record in records:
+                step_path = out / (
+                    f"step_{record['pipeline_index']:02d}_"
+                    f"{record['algorithm']}.png"
+                )
+                save_png(step_path, record["image"])
+                record["output_file"] = step_path.name
         save_png(result_path, processed)
-        self.current_original = raw8
-        self.current_result = processed
-        self.preview_original.set_array(raw8)
-        self.preview_result.set_array(processed)
-        self.log.append(f"Algorithm: {self.raw_algorithm_combo.currentText()}")
-        self.log.append(f"Processing: {' | '.join(details)}")
-        if algorithm_key == "fieldscale":
-            self.log.append(
-                f"Algorithm input: original RAW DN 0..{self.raw_max}; firmware-core parameters"
+        mapping_label = (
+            "P1/P99 RAW DN"
+            if self.raw_input_mapping_combo.currentData() == "raw_percentile_preview"
+            else "Native RAW DN"
+            if input_max > 255
+            else "Fixed Bit Depth"
+        )
+        overview_items = [
+            ("00 Original Fixed", raw8, 255),
+            (f"01 Pipeline Input - {mapping_label}", pipeline_input, input_max),
+        ]
+        for overview_index, record in enumerate(records, start=2):
+            overview_items.append(
+                (
+                    f"{overview_index:02d} Step {record['pipeline_index']:02d} "
+                    f"{record['name']}",
+                    record["image"],
+                    255,
+                )
             )
-        elif algorithm_key == "raw_percentile_preview":
-            self.log.append("Algorithm input: original RAW DN with direct P1/P99 preview scaling")
-        else:
-            self.log.append(f"Algorithm input: fixed 0..{self.raw_max} DN -> 0..255")
+        save_pipeline_overview_png(overview_path, overview_items)
+        manifest = {
+            "format_version": 1,
+            "mode": "raw_algorithm_compare",
+            "source": str(Path(self.raw_algorithm_file.text()).resolve()),
+            "resolution": {"width": self.width, "height": self.height},
+            "bit_depth": self.bit_depth,
+            "input_mapping": {
+                "key": self.raw_input_mapping_combo.currentData(),
+                "name": self.raw_input_mapping_combo.currentText(),
+                "details": mapping_details,
+                "input_max": input_max,
+                "output_file": mapping_path.name,
+            },
+            "pipeline": self.raw_pipeline_editor.configuration(),
+            "execution": pipeline_execution_json(records),
+            "total_ms": round(total_ms, 3),
+            "original_output": original_path.name,
+            "final_output": result_path.name,
+            "overview_output": overview_path.name,
+        }
+        for execution, record in zip(manifest["execution"], records):
+            if "output_file" in record:
+                execution["output_file"] = record["output_file"]
+        with open(out / "pipeline.json", "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, ensure_ascii=False, indent=2)
+        with open(out / "pipeline_summary.txt", "w", encoding="utf-8") as summary:
+            summary.write(f"Source: {manifest['source']}\n")
+            summary.write(f"Input Mapping: {mapping_details}\n")
+            summary.write(f"Pipeline: {self.raw_pipeline_editor.summary()}\n")
+            summary.write(f"Overview: {overview_path.name}\n")
+            for execution in manifest["execution"]:
+                summary.write(
+                    f"Step {execution['pipeline_index']}: {execution['name']} - "
+                    f"{execution['elapsed_ms']:.3f} ms - "
+                    f"{' | '.join(execution['details'])}\n"
+                )
+            summary.write(f"Total: {total_ms:.3f} ms\n")
+
+        self.raw_algorithm_source = raw
+        self.raw_pipeline_input = pipeline_input
+        self.raw_pipeline_input_max = input_max
+        self.raw_pipeline_final = processed
+        self.raw_pipeline_records = records
+        self.current_original = raw8
+        self.preview_original.set_array(raw8)
+        self.update_raw_stage_preview()
+        self.log.append(f"Input Mapping: {mapping_details}")
+        self.log.append(f"Pipeline: {self.raw_pipeline_editor.summary()}")
+        for record in records:
+            self.log.append(
+                f"Step {record['pipeline_index']} {record['name']}: "
+                f"{record['elapsed_ms']:.3f} ms | "
+                f"{' | '.join(record['details'])}"
+            )
+        self.log.append(f"Pipeline total: {total_ms:.3f} ms")
         self.log_stats("Original 8-bit", raw8)
-        self.log_stats("Processed 8-bit", processed)
+        self.log_stats("Final 8-bit", processed)
         self.log.append(f"Saved: {original_path}")
         self.log.append(f"Saved: {result_path}")
+        self.log.append(f"Saved overview: {overview_path}")
+        self.log.append(f"Pipeline settings: {out / 'pipeline.json'}")
 
-    def uvc_result_title(self):
-        prefix = "NUC + " if self.uvc_apply_nuc.isChecked() else ""
-        return f"{prefix}{self.uvc_algorithm_combo.currentText()}"
+    @staticmethod
+    def camera_combo_device_id(combo):
+        return combo.currentData(CAMERA_DEVICE_ID_ROLE)
 
-    def invalidate_uvc_nuc_cache(self, _value=None):
-        self.uvc_nuc_k_table = None
-        self.uvc_nuc_b_table = None
-        self.uvc_nuc_cache_key = None
-        self.reset_uvc_fieldscale_state()
+    @staticmethod
+    def camera_combo_friendly_name(combo):
+        name = combo.currentData(CAMERA_FRIENDLY_NAME_ROLE)
+        return str(name) if name else combo.currentText()
 
-    def reset_uvc_fieldscale_state(self):
-        self.uvc_fieldscale_state.clear()
+    @staticmethod
+    def populate_camera_combo(
+        combo,
+        devices,
+        default_index,
+        preferred_device_id=None,
+        preferred_name=None,
+    ):
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            selected_item = -1
+            for device in devices:
+                camera_index = int(device["index"])
+                friendly_name = str(device["name"])
+                device_id = str(device["device_id"])
+                combo.addItem(
+                    f"{friendly_name} (Camera {camera_index})",
+                    camera_index,
+                )
+                item_index = combo.count() - 1
+                combo.setItemData(
+                    item_index, device_id, CAMERA_DEVICE_ID_ROLE
+                )
+                combo.setItemData(
+                    item_index, friendly_name, CAMERA_FRIENDLY_NAME_ROLE
+                )
+                if preferred_device_id and device_id == preferred_device_id:
+                    selected_item = item_index
 
-    def auto_pair_uvc_nuc_b_file(self, k_path):
-        path = Path(k_path)
-        if path.name.lower().endswith("_k.bin"):
-            candidate = path.with_name(f"{path.name[:-6]}_B.bin")
-            if candidate.is_file():
-                self.uvc_nuc_b_file.setText(str(candidate))
+            if preferred_device_id and selected_item < 0:
+                disconnected_name = preferred_name or "Previously selected camera"
+                combo.addItem(f"Disconnected - {disconnected_name}", None)
+                selected_item = combo.count() - 1
+                combo.setItemData(
+                    selected_item,
+                    preferred_device_id,
+                    CAMERA_DEVICE_ID_ROLE,
+                )
+                combo.setItemData(
+                    selected_item,
+                    disconnected_name,
+                    CAMERA_FRIENDLY_NAME_ROLE,
+                )
 
-    def update_uvc_nuc_ui(self, _checked=None):
-        enabled = self.uvc_apply_nuc.isChecked()
-        self.uvc_nuc_k_file.setEnabled(enabled)
-        self.uvc_nuc_b_file.setEnabled(enabled)
-        self.uvc_nuc_note.setEnabled(enabled)
-        self.invalidate_uvc_nuc_cache()
-        self.preview_result.set_title(self.uvc_result_title())
-        self.preview_result_caption.setText(self.uvc_result_title())
-        if self.uvc_original_source is not None:
-            if not enabled or (self.uvc_nuc_k_file.text() and self.uvc_nuc_b_file.text()):
-                self.refresh_uvc_processed_preview()
+            if combo.count() == 0:
+                combo.addItem("No camera detected", None)
+                combo.setItemData(
+                    0, "", CAMERA_DEVICE_ID_ROLE
+                )
+                combo.setItemData(
+                    0, "No camera detected", CAMERA_FRIENDLY_NAME_ROLE
+                )
+                selected_item = 0
+            elif selected_item < 0:
+                selected_item = combo.findData(default_index)
+                if selected_item < 0:
+                    selected_item = 0
+            combo.setCurrentIndex(selected_item)
+        finally:
+            combo.blockSignals(False)
 
-    def load_uvc_nuc_tables(self):
-        k_path = self.uvc_nuc_k_file.text()
-        b_path = self.uvc_nuc_b_file.text()
-        if not k_path or not b_path:
-            raise ValueError("Enable UVC NUC requires both pointN_K.bin and pointN_B.bin.")
-        cache_key = (str(Path(k_path).resolve()), str(Path(b_path).resolve()), self.width, self.height)
-        if self.uvc_nuc_cache_key != cache_key:
-            self.uvc_nuc_k_table = load_novatek_nuc_bin(k_path, self.width, self.height, "<u2", "K")
-            self.uvc_nuc_b_table = load_novatek_nuc_bin(b_path, self.width, self.height, "<i2", "B")
-            self.uvc_nuc_cache_key = cache_key
-        return self.uvc_nuc_k_table, self.uvc_nuc_b_table
+    def selected_camera_info(self, combo):
+        camera_index = combo.currentData()
+        return {
+            "index": None if camera_index is None else int(camera_index),
+            "device_id": self.camera_combo_device_id(combo),
+            "name": self.camera_combo_friendly_name(combo),
+        }
 
-    def apply_uvc_nuc(self, original_gray):
-        expected_shape = (self.height, self.width)
-        if original_gray.shape != expected_shape:
-            raise ValueError(
-                f"UVC frame is {original_gray.shape[1]}x{original_gray.shape[0]}, but NUC table Resolution is "
-                f"{self.width}x{self.height}. Select the matching Resolution."
+    def refresh_camera_devices(self, _checked=False, log_changes=True):
+        devices = enumerate_camera_devices()
+        signature = tuple(
+            (
+                int(device["index"]),
+                str(device["device_id"]),
+                str(device["name"]),
             )
-        stored_k, gfx_b = self.load_uvc_nuc_tables()
-        nuc_input, conversion_details = uvc_gray_to_nuc_dn(original_gray, self.raw_max)
-        corrected = apply_novatek_nuc(nuc_input, stored_k, gfx_b, self.raw_max)
-        return raw_to_display_u8(corrected, self.raw_max), conversion_details
+            for device in devices
+        )
+        if signature == self._camera_device_signature:
+            return
 
-    def refresh_uvc_processed_preview(self):
-        if self.uvc_original_source is None:
+        old_devices = {
+            str(device["device_id"]): str(device["name"])
+            for device in self.camera_devices
+        }
+        new_devices = {
+            str(device["device_id"]): str(device["name"])
+            for device in devices
+        }
+        selections = []
+        for combo in (
+            self.uvc_camera_combo,
+            self.dual_uvc_camera_a,
+            self.dual_uvc_camera_b,
+        ):
+            selections.append(
+                (
+                    self.camera_combo_device_id(combo),
+                    self.camera_combo_friendly_name(combo),
+                )
+            )
+
+        self.populate_camera_combo(
+            self.uvc_camera_combo,
+            devices,
+            DEFAULT_CAMERA_INDEX,
+            *selections[0],
+        )
+        self.populate_camera_combo(
+            self.dual_uvc_camera_a,
+            devices,
+            DEFAULT_CAMERA_INDEX,
+            *selections[1],
+        )
+        default_b_index = 0 if DEFAULT_CAMERA_INDEX != 0 else 1
+        self.populate_camera_combo(
+            self.dual_uvc_camera_b,
+            devices,
+            default_b_index,
+            *selections[2],
+        )
+
+        self.camera_devices = devices
+        self._camera_device_signature = signature
+        devices_by_id = {
+            str(device["device_id"]): device for device in devices
+        }
+        for worker in (
+            self.uvc_worker,
+            self.dual_uvc_worker_a,
+            self.dual_uvc_worker_b,
+        ):
+            if worker is None or not worker.camera_device_id:
+                continue
+            device = devices_by_id.get(str(worker.camera_device_id))
+            if device is None:
+                worker.update_camera_device(None)
+            else:
+                worker.update_camera_device(
+                    int(device["index"]), str(device["name"])
+                )
+
+        if log_changes and hasattr(self, "log"):
+            added = [
+                new_devices[device_id]
+                for device_id in new_devices.keys() - old_devices.keys()
+            ]
+            removed = [
+                old_devices[device_id]
+                for device_id in old_devices.keys() - new_devices.keys()
+            ]
+            if added:
+                self.log.append("Camera connected: " + ", ".join(added))
+            if removed:
+                self.log.append("Camera disconnected: " + ", ".join(removed))
+
+    def dual_uvc_image_names(self):
+        return (
+            self.dual_uvc_image_name_a.currentText(),
+            self.dual_uvc_image_name_b.currentText(),
+        )
+
+    def dual_uvc_image_file_tags(self):
+        return (
+            self.dual_uvc_image_name_a.currentData(),
+            self.dual_uvc_image_name_b.currentData(),
+        )
+
+    def dual_uvc_image_name_changed(self, _combo_index=None):
+        name_a, name_b = self.dual_uvc_image_names()
+        self.dual_uvc_group_a.setTitle(f"UVC Camera A — {name_a}")
+        self.dual_uvc_group_b.setTitle(f"UVC Camera B — {name_b}")
+        if self.dual_uvc_worker_a is None:
+            self.dual_uvc_status_a.setText(f"{name_a} (Camera A) stopped")
+        if self.dual_uvc_worker_b is None:
+            self.dual_uvc_status_b.setText(f"{name_b} (Camera B) stopped")
+        dual_page_index = len(self.FUNCTIONS) - 3
+        if self.current_function_index() == dual_page_index:
+            self.preview_original.set_title(name_a)
+            self.preview_result.set_title(name_b)
+            self.preview_original_caption.setText(name_a)
+            self.preview_result_caption.setText(name_b)
+
+    def dual_uvc_setting_changed(self, _combo_index=None):
+        if (
+            self.dual_uvc_worker_a is not None
+            or self.dual_uvc_worker_b is not None
+        ):
+            self.start_dual_uvc_cameras()
+
+    def dual_uvc_frames_ready(self):
+        return (
+            self.dual_uvc_worker_a is not None
+            and self.dual_uvc_worker_b is not None
+            and self.dual_uvc_frame_a is not None
+            and self.dual_uvc_frame_b is not None
+        )
+
+    def update_dual_uvc_button_states(self):
+        running = (
+            self.dual_uvc_worker_a is not None
+            or self.dual_uvc_worker_b is not None
+        )
+        ready = self.dual_uvc_frames_ready()
+        recording = self.dual_uvc_recording_worker is not None
+        self.dual_uvc_image_name_a.setEnabled(not recording)
+        self.dual_uvc_image_name_b.setEnabled(not recording)
+        self.dual_uvc_start_btn.setEnabled(not running)
+        self.dual_uvc_stop_btn.setEnabled(running)
+        self.dual_uvc_capture_btn.setEnabled(ready)
+        self.dual_uvc_record_start_btn.setEnabled(ready and not recording)
+        self.dual_uvc_record_stop_btn.setEnabled(recording)
+
+    def start_dual_uvc_cameras(self, _checked=False):
+        if cv2 is None:
+            message = "OpenCV not installed. pip install opencv-python"
+            self.log.append(f"\nERROR: {message}")
+            QMessageBox.critical(self, "Camera Error", message)
+            return
+        camera_info_a = self.selected_camera_info(self.dual_uvc_camera_a)
+        camera_info_b = self.selected_camera_info(self.dual_uvc_camera_b)
+        if camera_info_a["index"] is None or camera_info_b["index"] is None:
+            QMessageBox.warning(
+                self,
+                "Camera Disconnected",
+                "Select two connected cameras before starting Dual UVC.",
+            )
+            return
+        camera_a = camera_info_a["index"]
+        camera_b = camera_info_b["index"]
+        if camera_a == camera_b:
+            if (
+                self.dual_uvc_worker_a is not None
+                or self.dual_uvc_worker_b is not None
+            ):
+                self.stop_dual_uvc_cameras(log_message=False)
+            QMessageBox.warning(
+                self,
+                "Duplicate Camera Index",
+                "Camera A and Camera B must use different CAMERA_INDEX values.",
+            )
+            return
+
+        if not self.stop_dual_uvc_cameras(log_message=False):
+            self.dual_uvc_restart_when_stopped = True
+            self.log.append(
+                "Previous dual UVC capture threads are still stopping; "
+                "both cameras will restart afterward."
+            )
+            return
+        self.dual_uvc_restart_when_stopped = False
+
+        worker_a = UvcCaptureThread(
+            camera_a,
+            self.width,
+            self.height,
+            int(self.dual_uvc_fps_a.currentData()),
+            UVC_RECONNECT_SECONDS,
+            self,
+            frame_consumer=self.dual_uvc_buffer_a.submit,
+            capture_mode=DEFAULT_UVC_CAPTURE_MODE,
+            camera_device_id=camera_info_a["device_id"],
+            camera_name=camera_info_a["name"],
+        )
+        worker_b = UvcCaptureThread(
+            camera_b,
+            self.width,
+            self.height,
+            int(self.dual_uvc_fps_b.currentData()),
+            UVC_RECONNECT_SECONDS,
+            self,
+            frame_consumer=self.dual_uvc_buffer_b.submit,
+            capture_mode=DEFAULT_UVC_CAPTURE_MODE,
+            camera_device_id=camera_info_b["device_id"],
+            camera_name=camera_info_b["name"],
+        )
+        worker_a.camera_opened.connect(self.handle_dual_uvc_camera_opened_a)
+        worker_b.camera_opened.connect(self.handle_dual_uvc_camera_opened_b)
+        worker_a.status_changed.connect(self.handle_dual_uvc_status_a)
+        worker_b.status_changed.connect(self.handle_dual_uvc_status_b)
+        worker_a.finished.connect(self.handle_dual_uvc_worker_finished)
+        worker_b.finished.connect(self.handle_dual_uvc_worker_finished)
+        worker_a.finished.connect(worker_a.deleteLater)
+        worker_b.finished.connect(worker_b.deleteLater)
+        self.dual_uvc_worker_a = worker_a
+        self.dual_uvc_worker_b = worker_b
+        self.dual_uvc_frame_a = None
+        self.dual_uvc_frame_b = None
+        self.dual_uvc_buffer_a.clear()
+        self.dual_uvc_buffer_b.clear()
+        self.dual_uvc_buffer_sequence_a = 0
+        self.dual_uvc_buffer_sequence_b = 0
+        self.dual_uvc_frame_time_a = 0.0
+        self.dual_uvc_frame_time_b = 0.0
+        self.dual_uvc_actual_fps_a = 0.0
+        self.dual_uvc_actual_fps_b = 0.0
+        self.dual_uvc_output_fps_a = 0.0
+        self.dual_uvc_output_fps_b = 0.0
+        self.dual_uvc_frame_count_a = 0
+        self.dual_uvc_frame_count_b = 0
+        now = time.perf_counter()
+        self.dual_uvc_fps_started_a = now
+        self.dual_uvc_fps_started_b = now
+        name_a, name_b = self.dual_uvc_image_names()
+        self.dual_uvc_status_a.setText(
+            f"Opening {name_a} (Camera A, index {camera_a})..."
+        )
+        self.dual_uvc_status_b.setText(
+            f"Opening {name_b} (Camera B, index {camera_b})..."
+        )
+        self.preview_original.set_array(None)
+        self.preview_result.set_array(None)
+        self.update_dual_uvc_button_states()
+        self.dual_uvc_display_timer.start()
+        self.log.append(
+            f"Starting Dual UVC: A={name_a}, "
+            f"{camera_info_a['name']}, index {camera_a} "
+            f"({DEFAULT_UVC_CAPTURE_MODE}), B={name_b}, "
+            f"{camera_info_b['name']}, index {camera_b} "
+            f"({DEFAULT_UVC_CAPTURE_MODE})"
+        )
+        worker_a.start()
+        worker_b.start()
+
+    def stop_dual_uvc_cameras(
+        self, _checked=False, log_message=True, wait_ms=2000
+    ):
+        self.dual_uvc_restart_when_stopped = False
+        self.dual_uvc_display_timer.stop()
+        self.stop_dual_uvc_recording(
+            reason="Dual UVC cameras stopped", log_message=log_message
+        )
+        worker_a = self.dual_uvc_worker_a
+        worker_b = self.dual_uvc_worker_b
+        was_running = worker_a is not None or worker_b is not None
+        for worker in (worker_a, worker_b):
+            if worker is not None:
+                worker.stop()
+
+        all_stopped = True
+        if worker_a is not None:
+            if worker_a.wait(wait_ms):
+                if self.dual_uvc_worker_a is worker_a:
+                    self.dual_uvc_worker_a = None
+            else:
+                all_stopped = False
+        if worker_b is not None:
+            if worker_b.wait(wait_ms):
+                if self.dual_uvc_worker_b is worker_b:
+                    self.dual_uvc_worker_b = None
+            else:
+                all_stopped = False
+
+        if not all_stopped:
+            self.dual_uvc_start_btn.setEnabled(False)
+            self.dual_uvc_stop_btn.setEnabled(False)
+            self.dual_uvc_capture_btn.setEnabled(False)
+            self.dual_uvc_record_start_btn.setEnabled(False)
+            self.dual_uvc_record_stop_btn.setEnabled(False)
+            self.log.append("Dual UVC capture threads are still stopping.")
+            return False
+
+        self.dual_uvc_actual_fps_a = 0.0
+        self.dual_uvc_actual_fps_b = 0.0
+        name_a, name_b = self.dual_uvc_image_names()
+        self.dual_uvc_status_a.setText(f"{name_a} (Camera A) stopped")
+        self.dual_uvc_status_b.setText(f"{name_b} (Camera B) stopped")
+        self.update_dual_uvc_button_states()
+        if was_running and log_message:
+            self.log.append("Dual UVC cameras stopped")
+        return True
+
+    def handle_dual_uvc_camera_opened_a(
+        self, camera_index, actual_width, actual_height, actual_fps
+    ):
+        if self.sender() is not self.dual_uvc_worker_a:
+            return
+        self.dual_uvc_actual_fps_a = float(actual_fps)
+        name_a = self.dual_uvc_image_name_a.currentText()
+        camera_name = getattr(
+            self.dual_uvc_worker_a, "camera_name", f"Camera {camera_index}"
+        )
+        self.dual_uvc_status_a.setText(
+            f"{name_a} (Camera A): {camera_name}, index {camera_index}, "
+            f"{actual_width}x{actual_height}, "
+            f"reported {actual_fps:.1f} FPS"
+        )
+
+    def handle_dual_uvc_camera_opened_b(
+        self, camera_index, actual_width, actual_height, actual_fps
+    ):
+        if self.sender() is not self.dual_uvc_worker_b:
+            return
+        self.dual_uvc_actual_fps_b = float(actual_fps)
+        name_b = self.dual_uvc_image_name_b.currentText()
+        camera_name = getattr(
+            self.dual_uvc_worker_b, "camera_name", f"Camera {camera_index}"
+        )
+        self.dual_uvc_status_b.setText(
+            f"{name_b} (Camera B): {camera_name}, index {camera_index}, "
+            f"{actual_width}x{actual_height}, "
+            f"reported {actual_fps:.1f} FPS"
+        )
+
+    def handle_dual_uvc_status_a(self, message):
+        if self.sender() is self.dual_uvc_worker_a:
+            self.dual_uvc_status_a.setText(message)
+
+    def handle_dual_uvc_status_b(self, message):
+        if self.sender() is self.dual_uvc_worker_b:
+            self.dual_uvc_status_b.setText(message)
+
+    def consume_dual_uvc_latest_frames(self):
+        updated = False
+        frame_a, sequence_a, frame_time_a = self.dual_uvc_buffer_a.take_latest(
+            self.dual_uvc_buffer_sequence_a
+        )
+        if frame_a is not None:
+            self.dual_uvc_buffer_sequence_a = sequence_a
+            self.handle_dual_uvc_frame(
+                "a", frame_a, frame_time_a, submit_recording=False
+            )
+            updated = True
+        frame_b, sequence_b, frame_time_b = self.dual_uvc_buffer_b.take_latest(
+            self.dual_uvc_buffer_sequence_b
+        )
+        if frame_b is not None:
+            self.dual_uvc_buffer_sequence_b = sequence_b
+            self.handle_dual_uvc_frame(
+                "b", frame_b, frame_time_b, submit_recording=False
+            )
+            updated = True
+        if updated:
+            self.submit_dual_uvc_recording_pair()
+
+    def handle_dual_uvc_frame_a(self, frame):
+        if self.sender() is not self.dual_uvc_worker_a:
+            return
+        self.handle_dual_uvc_frame("a", frame)
+
+    def handle_dual_uvc_frame_b(self, frame):
+        if self.sender() is not self.dual_uvc_worker_b:
+            return
+        self.handle_dual_uvc_frame("b", frame)
+
+    def handle_dual_uvc_frame(
+        self, camera_key, frame, frame_time=None, submit_recording=True
+    ):
+        gray = uvc_to_gray(frame)
+        display = (
+            gray.copy()
+            if gray.dtype == np.uint8
+            else raw_to_display_u8(gray, self.raw_max)
+        )
+        now = time.perf_counter() if frame_time is None else float(frame_time)
+        if camera_key == "a":
+            self.dual_uvc_frame_a = display
+            self.dual_uvc_frame_time_a = now
+            self.dual_uvc_frame_count_a += 1
+            elapsed = now - self.dual_uvc_fps_started_a
+            if elapsed >= 0.5:
+                self.dual_uvc_output_fps_a = (
+                    self.dual_uvc_frame_count_a / elapsed
+                )
+                self.dual_uvc_frame_count_a = 0
+                self.dual_uvc_fps_started_a = now
+            self.dual_uvc_status_a.setText(
+                f"{self.dual_uvc_image_name_a.currentText()} "
+                f"(Camera A) {display.shape[1]}x{display.shape[0]} | "
+                f"Output FPS {self.dual_uvc_output_fps_a:.1f}"
+            )
+        else:
+            self.dual_uvc_frame_b = display
+            self.dual_uvc_frame_time_b = now
+            self.dual_uvc_frame_count_b += 1
+            elapsed = now - self.dual_uvc_fps_started_b
+            if elapsed >= 0.5:
+                self.dual_uvc_output_fps_b = (
+                    self.dual_uvc_frame_count_b / elapsed
+                )
+                self.dual_uvc_frame_count_b = 0
+                self.dual_uvc_fps_started_b = now
+            self.dual_uvc_status_b.setText(
+                f"{self.dual_uvc_image_name_b.currentText()} "
+                f"(Camera B) {display.shape[1]}x{display.shape[0]} | "
+                f"Output FPS {self.dual_uvc_output_fps_b:.1f}"
+            )
+
+        dual_page_index = len(self.FUNCTIONS) - 3
+        if self.current_function_index() == dual_page_index:
+            if self.dual_uvc_frame_a is not None:
+                self.current_original = self.dual_uvc_frame_a
+                self.preview_original.set_array(self.dual_uvc_frame_a)
+            if self.dual_uvc_frame_b is not None:
+                self.current_result = self.dual_uvc_frame_b
+                self.preview_result.set_array(self.dual_uvc_frame_b)
+
+        recording_worker = self.dual_uvc_recording_worker
+        if (
+            submit_recording
+            and recording_worker is not None
+            and recording_worker.isRunning()
+            and self.dual_uvc_frame_a is not None
+            and self.dual_uvc_frame_b is not None
+        ):
+            recording_worker.submit(
+                self.dual_uvc_frame_a,
+                self.dual_uvc_frame_b,
+                time.perf_counter(),
+            )
+        self.update_dual_uvc_button_states()
+
+    def submit_dual_uvc_recording_pair(self):
+        recording_worker = self.dual_uvc_recording_worker
+        if (
+            recording_worker is not None
+            and recording_worker.isRunning()
+            and self.dual_uvc_frame_a is not None
+            and self.dual_uvc_frame_b is not None
+        ):
+            recording_worker.submit(
+                self.dual_uvc_frame_a,
+                self.dual_uvc_frame_b,
+                time.perf_counter(),
+            )
+
+    def handle_dual_uvc_worker_finished(self):
+        worker = self.sender()
+        if worker is self.dual_uvc_worker_a:
+            self.dual_uvc_worker_a = None
+            self.dual_uvc_status_a.setText(
+                f"{self.dual_uvc_image_name_a.currentText()} (Camera A) stopped"
+            )
+        elif worker is self.dual_uvc_worker_b:
+            self.dual_uvc_worker_b = None
+            self.dual_uvc_status_b.setText(
+                f"{self.dual_uvc_image_name_b.currentText()} (Camera B) stopped"
+            )
+        else:
+            return
+        self.stop_dual_uvc_recording(
+            reason="A Dual UVC capture thread finished"
+        )
+        self.update_dual_uvc_button_states()
+        if self.dual_uvc_close_pending and (
+            self.dual_uvc_worker_a is None
+            and self.dual_uvc_worker_b is None
+        ):
+            self.dual_uvc_display_timer.stop()
+            self.dual_uvc_close_pending = False
+            QTimer.singleShot(0, self.close)
+        elif self.dual_uvc_restart_when_stopped and (
+            self.dual_uvc_worker_a is None
+            and self.dual_uvc_worker_b is None
+        ):
+            self.dual_uvc_display_timer.stop()
+            self.dual_uvc_restart_when_stopped = False
+            QTimer.singleShot(0, self.start_dual_uvc_cameras)
+
+    def dual_uvc_labels(self):
+        return self.dual_uvc_image_names()
+
+    def save_dual_uvc_overview(self, path):
+        if self.dual_uvc_frame_a is None or self.dual_uvc_frame_b is None:
+            raise ValueError("Both Dual UVC frames are required for overview.")
+        label_a, label_b = self.dual_uvc_labels()
+        comparison_bgr = UvcRecordingThread._compose_frame(
+            self.dual_uvc_frame_a,
+            self.dual_uvc_frame_b,
+            label_a,
+            label_b,
+        )
+        save_rgb_png(
+            path, cv2.cvtColor(comparison_bgr, cv2.COLOR_BGR2RGB)
+        )
+
+    def dual_uvc_camera_manifest(self):
+        camera_info_a = self.selected_camera_info(self.dual_uvc_camera_a)
+        camera_info_b = self.selected_camera_info(self.dual_uvc_camera_b)
+        return {
+            "camera_a": {
+                "image_name": self.dual_uvc_image_name_a.currentText(),
+                "image_name_file_tag": self.dual_uvc_image_name_a.currentData(),
+                "camera_index": camera_info_a["index"],
+                "camera_name": camera_info_a["name"],
+                "camera_device_id": camera_info_a["device_id"],
+                "capture_mode": DEFAULT_UVC_CAPTURE_MODE,
+                "selected_capture_mode": getattr(
+                    self.dual_uvc_worker_a, "selected_capture_mode", None
+                ),
+                "requested_fps": int(self.dual_uvc_fps_a.currentData()),
+                "reported_fps": round(self.dual_uvc_actual_fps_a, 3),
+                "resolution": {
+                    "width": int(self.dual_uvc_frame_a.shape[1]),
+                    "height": int(self.dual_uvc_frame_a.shape[0]),
+                },
+            },
+            "camera_b": {
+                "image_name": self.dual_uvc_image_name_b.currentText(),
+                "image_name_file_tag": self.dual_uvc_image_name_b.currentData(),
+                "camera_index": camera_info_b["index"],
+                "camera_name": camera_info_b["name"],
+                "camera_device_id": camera_info_b["device_id"],
+                "capture_mode": DEFAULT_UVC_CAPTURE_MODE,
+                "selected_capture_mode": getattr(
+                    self.dual_uvc_worker_b, "selected_capture_mode", None
+                ),
+                "requested_fps": int(self.dual_uvc_fps_b.currentData()),
+                "reported_fps": round(self.dual_uvc_actual_fps_b, 3),
+                "resolution": {
+                    "width": int(self.dual_uvc_frame_b.shape[1]),
+                    "height": int(self.dual_uvc_frame_b.shape[0]),
+                },
+            },
+            "software_pair_delta_ms": round(
+                abs(
+                    self.dual_uvc_frame_time_a
+                    - self.dual_uvc_frame_time_b
+                )
+                * 1000.0,
+                3,
+            ),
+        }
+
+    def capture_dual_uvc_pair(self):
+        if not self.dual_uvc_frames_ready():
+            QMessageBox.information(
+                self,
+                "No Dual UVC Frames",
+                "Start both cameras and wait for Camera A and Camera B frames.",
+            )
+            return
+        out = self.make_output("dual_uvc_compare")
+        file_tag_a, file_tag_b = self.dual_uvc_image_file_tags()
+        camera_a_path = out / f"camera_a_{file_tag_a}.png"
+        camera_b_path = out / f"camera_b_{file_tag_b}.png"
+        overview_path = out / "00_dual_uvc_overview.png"
+        save_png(camera_a_path, self.dual_uvc_frame_a)
+        save_png(camera_b_path, self.dual_uvc_frame_b)
+        self.save_dual_uvc_overview(overview_path)
+        manifest = {
+            "format_version": 1,
+            "mode": "dual_uvc_compare",
+            "captured_at": datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "pairing": "latest-frame software pairing; not hardware synchronized",
+            **self.dual_uvc_camera_manifest(),
+            "camera_a_output": camera_a_path.name,
+            "camera_b_output": camera_b_path.name,
+            "overview_output": overview_path.name,
+        }
+        with open(out / "capture.json", "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, ensure_ascii=False, indent=2)
+        with open(
+            out / "capture_summary.txt", "w", encoding="utf-8"
+        ) as summary:
+            summary.write(f"Captured: {manifest['captured_at']}\n")
+            summary.write(
+                f"Camera A ({manifest['camera_a']['image_name']}): "
+                f"{manifest['camera_a']['camera_name']}, "
+                f"index {manifest['camera_a']['camera_index']}, "
+                f"{manifest['camera_a']['resolution']['width']}x"
+                f"{manifest['camera_a']['resolution']['height']}, "
+                f"requested {manifest['camera_a']['capture_mode']}, "
+                f"selected {manifest['camera_a']['selected_capture_mode']}\n"
+            )
+            summary.write(
+                f"Camera B ({manifest['camera_b']['image_name']}): "
+                f"{manifest['camera_b']['camera_name']}, "
+                f"index {manifest['camera_b']['camera_index']}, "
+                f"{manifest['camera_b']['resolution']['width']}x"
+                f"{manifest['camera_b']['resolution']['height']}, "
+                f"requested {manifest['camera_b']['capture_mode']}, "
+                f"selected {manifest['camera_b']['selected_capture_mode']}\n"
+            )
+            summary.write(
+                f"Software pair delta: "
+                f"{manifest['software_pair_delta_ms']:.3f} ms\n"
+            )
+            summary.write(f"Overview: {overview_path.name}\n")
+        self.log.append(f"Saved Dual UVC Camera A: {camera_a_path}")
+        self.log.append(f"Saved Dual UVC Camera B: {camera_b_path}")
+        self.log.append(f"Saved Dual UVC overview: {overview_path}")
+
+    def start_dual_uvc_recording(self, _checked=False):
+        if self.dual_uvc_recording_worker is not None:
+            QMessageBox.information(
+                self,
+                "Recording Active",
+                "Dual UVC recording is already active.",
+            )
+            return
+        if not self.dual_uvc_frames_ready():
+            QMessageBox.information(
+                self,
+                "No Dual UVC Frames",
+                "Start both cameras and wait for Camera A and Camera B frames.",
+            )
+            return
+
+        fps_a = (
+            self.dual_uvc_actual_fps_a
+            if 1.0 <= self.dual_uvc_actual_fps_a <= 240.0
+            else float(self.dual_uvc_fps_a.currentData())
+        )
+        fps_b = (
+            self.dual_uvc_actual_fps_b
+            if 1.0 <= self.dual_uvc_actual_fps_b <= 240.0
+            else float(self.dual_uvc_fps_b.currentData())
+        )
+        recording_fps = min(fps_a, fps_b)
+        out = self.make_output("dual_uvc_recording")
+        video_path = out / "dual_uvc_comparison.avi"
+        overview_path = out / "00_dual_uvc_overview.png"
+        self.save_dual_uvc_overview(overview_path)
+        started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        manifest = {
+            "format_version": 1,
+            "mode": "dual_uvc_recording",
+            "started_at": started_at,
+            "pairing": "latest-frame software pairing; not hardware synchronized",
+            **self.dual_uvc_camera_manifest(),
+            "recording_fps": round(recording_fps, 3),
+            "recording_output": video_path.name,
+            "overview_output": overview_path.name,
+        }
+        with open(out / "recording.json", "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, ensure_ascii=False, indent=2)
+
+        label_a, label_b = self.dual_uvc_labels()
+        worker = UvcRecordingThread(
+            video_path,
+            recording_fps,
+            self,
+            left_label=label_a,
+            right_label=label_b,
+        )
+        worker.finished.connect(self.handle_dual_uvc_recording_finished)
+        worker.finished.connect(worker.deleteLater)
+        self.dual_uvc_recording_worker = worker
+        self.dual_uvc_recording_output_dir = out
+        self.dual_uvc_recording_manifest = manifest
+        self.dual_uvc_recording_stop_reason = None
+        self.dual_uvc_recording_started_perf = time.perf_counter()
+        self.update_dual_uvc_button_states()
+        worker.start()
+        worker.submit(
+            self.dual_uvc_frame_a,
+            self.dual_uvc_frame_b,
+            self.dual_uvc_recording_started_perf,
+        )
+        self.log.append(
+            f"Dual UVC recording started: {video_path} "
+            f"({recording_fps:.3f} FPS, {UVC_RECORDING_FOURCC})"
+        )
+
+    def write_dual_uvc_recording_summary(self, worker, reason):
+        out = self.dual_uvc_recording_output_dir
+        manifest = self.dual_uvc_recording_manifest
+        if out is None or manifest is None:
+            return
+        stats = worker.result_summary or {}
+        manifest["ended_at"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        manifest["stop_reason"] = reason
+        manifest["success"] = worker.error_message is None and bool(
+            stats.get("written_frames", 0)
+        )
+        manifest["error"] = worker.error_message
+        manifest["recording"] = stats
+        with open(out / "recording.json", "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, ensure_ascii=False, indent=2)
+        with open(
+            out / "recording_summary.txt", "w", encoding="utf-8"
+        ) as summary:
+            summary.write(f"Started: {manifest['started_at']}\n")
+            summary.write(f"Ended: {manifest['ended_at']}\n")
+            summary.write(f"Stop reason: {reason}\n")
+            summary.write(f"Success: {manifest['success']}\n")
+            if worker.error_message:
+                summary.write(f"Error: {worker.error_message}\n")
+            summary.write(
+                f"Camera A / B: {manifest['camera_a']['image_name']} "
+                f"(index {manifest['camera_a']['camera_index']}) / "
+                f"{manifest['camera_b']['image_name']} "
+                f"(index {manifest['camera_b']['camera_index']})\n"
+            )
+            summary.write(
+                f"Recording FPS: {manifest['recording_fps']:.3f}\n"
+            )
+            summary.write(
+                f"Duration: {stats.get('duration_seconds', 0.0):.3f} s\n"
+            )
+            summary.write(
+                f"Submitted / written / duplicate frames: "
+                f"{stats.get('submitted_frames', 0)} / "
+                f"{stats.get('written_frames', 0)} / "
+                f"{stats.get('duplicate_frames', 0)}\n"
+            )
+            summary.write(
+                f"Queue / timestamp dropped frames: "
+                f"{stats.get('queue_dropped_frames', 0)} / "
+                f"{stats.get('timestamp_dropped_frames', 0)}\n"
+            )
+            summary.write(
+                f"File size: {stats.get('file_size_bytes', 0)} bytes\n"
+            )
+            summary.write(f"Overview: {manifest['overview_output']}\n")
+
+    def finalize_dual_uvc_recording_worker(self, worker, reason):
+        if worker is not self.dual_uvc_recording_worker:
             return
         try:
-            processed, details = self.process_uvc_frame(self.uvc_original_source)
+            self.write_dual_uvc_recording_summary(worker, reason)
+        except Exception as exc:
+            self.log.append(f"Dual UVC recording summary error: {exc}")
+        out = self.dual_uvc_recording_output_dir
+        video_path = None if out is None else out / "dual_uvc_comparison.avi"
+        if worker.error_message:
+            self.log.append(f"Dual UVC recording error: {worker.error_message}")
+        else:
+            stats = worker.result_summary or {}
+            self.log.append(
+                f"Dual UVC recording stopped: {video_path}; "
+                f"written={stats.get('written_frames', 0)}, "
+                f"duplicates={stats.get('duplicate_frames', 0)}, "
+                f"dropped={stats.get('queue_dropped_frames', 0) + stats.get('timestamp_dropped_frames', 0)}"
+            )
+        self.dual_uvc_recording_worker = None
+        self.dual_uvc_recording_output_dir = None
+        self.dual_uvc_recording_manifest = None
+        self.dual_uvc_recording_stop_reason = None
+        self.dual_uvc_recording_started_perf = 0.0
+        self.update_dual_uvc_button_states()
+
+    def stop_dual_uvc_recording(
+        self,
+        _checked=False,
+        reason=None,
+        wait_ms=5000,
+        log_message=True,
+    ):
+        worker = self.dual_uvc_recording_worker
+        if worker is None:
+            return True
+        stop_reason = reason or "User requested"
+        self.dual_uvc_recording_stop_reason = stop_reason
+        worker.stop()
+        self.dual_uvc_record_start_btn.setEnabled(False)
+        self.dual_uvc_record_stop_btn.setEnabled(False)
+        if not worker.wait(wait_ms):
+            if log_message:
+                self.log.append(
+                    "Dual UVC recording thread is still finishing the AVI file."
+                )
+            return False
+        self.finalize_dual_uvc_recording_worker(worker, stop_reason)
+        return True
+
+    def handle_dual_uvc_recording_finished(self):
+        worker = self.sender()
+        if worker is not self.dual_uvc_recording_worker:
+            return
+        reason = self.dual_uvc_recording_stop_reason
+        if reason is None:
+            reason = (
+                "Recording error"
+                if worker.error_message
+                else "Recording worker finished"
+            )
+        self.finalize_dual_uvc_recording_worker(worker, reason)
+
+    def uvc_result_title(self):
+        return self.uvc_preview_stage_combo.currentText()
+
+    def mark_uvc_processing_config_changed(self, _value=None):
+        if self.uvc_recording_worker is not None:
+            self.stop_uvc_recording(
+                reason="Pipeline configuration changed"
+            )
+        self.uvc_processing_revision += 1
+        if hasattr(self, "uvc_capture_btn"):
+            self.uvc_capture_btn.setEnabled(False)
+        worker = self.uvc_processing_worker
+        if worker is not None and worker.isRunning():
+            try:
+                config = self.build_uvc_processing_config()
+            except Exception as exc:
+                worker.set_config(None)
+                self.uvc_status.setText(f"Pipeline configuration error: {exc}")
+            else:
+                worker.set_config(config)
+
+    def update_uvc_pipeline_ui(self, _value=None):
+        self.rebuild_pipeline_preview_combo(
+            self.uvc_pipeline_editor, self.uvc_preview_stage_combo
+        )
+        self.mark_uvc_processing_config_changed()
+        self.update_uvc_result_title()
+        self.refresh_uvc_processed_preview()
+
+    def update_uvc_result_title(self):
+        if self.current_function_index() == len(self.FUNCTIONS) - 1:
+            title = self.uvc_result_title()
+            self.preview_result.set_title(title)
+            self.preview_result_caption.setText(title)
+
+    def build_uvc_processing_config(self):
+        stages = self.uvc_pipeline_editor.stages()
+        if not any(stage.enabled for stage in stages):
+            raise ValueError("Add and enable at least one UVC algorithm step.")
+        return {
+            "revision": self.uvc_processing_revision,
+            "capture_mode": DEFAULT_UVC_CAPTURE_MODE,
+            "raw_max": self.raw_max,
+            "stages": stages,
+        }
+
+    def refresh_uvc_processed_preview(self):
+        worker = self.uvc_processing_worker
+        if (
+            self.uvc_original_source is None
+            or worker is None
+            or not worker.isRunning()
+        ):
+            return
+        try:
+            config = self.build_uvc_processing_config()
         except Exception as exc:
             message = str(exc)
             if message != self.uvc_last_processing_error:
@@ -2288,115 +4805,304 @@ class ThermalRawToolkit(QMainWindow):
             self.uvc_capture_btn.setEnabled(False)
             self.uvc_status.setText(f"Frame processing error: {message}")
             return
-        self.uvc_last_processing_error = None
-        self.uvc_processed_frame = processed.copy()
-        self.current_result = self.uvc_processed_frame
-        self.preview_result.set_array(processed)
-        self.uvc_capture_btn.setEnabled(True)
-        self.uvc_status.setText(details)
+        worker.submit(self.uvc_original_source, config)
 
-    def update_uvc_percentile_limits(self, _value=None):
-        self.uvc_high_percentile.setMinimum(min(100.0, self.uvc_low_percentile.value() + 0.5))
-        self.uvc_low_percentile.setMaximum(max(0.0, self.uvc_high_percentile.value() - 0.5))
-
-    def reset_uvc_algorithm_settings(self):
-        algorithm_key = self.uvc_algorithm_combo.currentData()
-        reset_items = []
-        if algorithm_key in ("auto_contrast", "auto_contrast_clahe"):
-            self.uvc_high_percentile.setValue(99.0)
-            self.uvc_low_percentile.setValue(1.0)
-            reset_items.append("Percentiles P1.0/P99.0")
-        if algorithm_key in ("clahe", "auto_contrast_clahe"):
-            self.uvc_clahe_clip.setValue(2.0)
-            self.uvc_clahe_grid.setValue(8)
-            reset_items.append("CLAHE clip=2.0, grid=8x8")
-        if algorithm_key == "gamma":
-            self.uvc_gamma.setValue(0.7)
-            reset_items.append("Gamma=0.7")
-        elif algorithm_key == "bilateral":
-            self.uvc_bilateral_strength.setValue(2)
-            reset_items.append("Bilateral strength=2")
-        elif algorithm_key == "unsharp":
-            self.uvc_unsharp_amount.setValue(1.0)
-            reset_items.append("Unsharp amount=1.0")
-        if reset_items:
-            self.log.append(f"Reset {self.uvc_algorithm_combo.currentText()}: {', '.join(reset_items)}")
-            self.refresh_uvc_processed_preview()
-
-    def set_uvc_parameter_visible(self, widget, visible):
-        self.set_form_parameter_visible(self.uvc_form, widget, visible)
-
-    def update_uvc_algorithm_ui(self, _combo_index=None):
-        algorithm_key = self.uvc_algorithm_combo.currentData()
-        self.reset_uvc_fieldscale_state()
-        self.uvc_algorithm_description.setText(
-            IMAGE_ALGORITHM_DESCRIPTIONS.get(algorithm_key, "")
+    def update_uvc_stage_preview(self, _combo_index=None):
+        if self.uvc_processed_frame is None:
+            self.update_uvc_result_title()
+            return
+        selected_pipeline_index = self.uvc_preview_stage_combo.currentData()
+        preview = pipeline_record_image(
+            self.uvc_pipeline_records,
+            selected_pipeline_index,
+            self.uvc_processed_frame,
         )
-        uses_auto_contrast = algorithm_key in ("auto_contrast", "auto_contrast_clahe")
-        uses_clahe = algorithm_key in ("clahe", "auto_contrast_clahe")
-        self.set_uvc_parameter_visible(self.uvc_low_percentile, uses_auto_contrast)
-        self.set_uvc_parameter_visible(self.uvc_high_percentile, uses_auto_contrast)
-        self.uvc_reset_btn.setEnabled(
-            algorithm_key not in (
-                "fieldscale",
-                "hist_equalization",
-                "raw_percentile_preview",
-            )
-        )
-        self.set_uvc_parameter_visible(self.uvc_clahe_clip, uses_clahe)
-        self.set_uvc_parameter_visible(self.uvc_clahe_grid, uses_clahe)
-        self.set_uvc_parameter_visible(self.uvc_gamma, algorithm_key == "gamma")
-        self.set_uvc_parameter_visible(self.uvc_bilateral_strength, algorithm_key == "bilateral")
-        self.set_uvc_parameter_visible(self.uvc_unsharp_amount, algorithm_key == "unsharp")
-        self.preview_result.set_title(self.uvc_result_title())
-        self.preview_result_caption.setText(self.uvc_result_title())
-        self.refresh_uvc_processed_preview()
+        self.current_result = preview
+        if self.current_function_index() == len(self.FUNCTIONS) - 1:
+            self.preview_result.set_array(preview)
+        self.update_uvc_result_title()
 
     def process_uvc_frame(self, original_gray):
-        algorithm_key = self.uvc_algorithm_combo.currentData()
-        details = []
-
-        if self.uvc_apply_nuc.isChecked():
-            processed, conversion_details = self.apply_uvc_nuc(original_gray)
-            details.append(f"NUC K/B ({conversion_details})")
-        elif algorithm_key in ("fieldscale", "raw_percentile_preview"):
-            processed = original_gray.copy()
-        elif original_gray.dtype == np.uint8:
-            processed = original_gray.copy()
-        else:
-            processed = raw_to_display_u8(original_gray, self.raw_max)
-
-        clahe = None
-        if algorithm_key in ("clahe", "auto_contrast_clahe"):
-            clip_limit = self.uvc_clahe_clip.value()
-            grid_size = self.uvc_clahe_grid.value()
-            clahe_settings = (clip_limit, grid_size)
-            if self.uvc_clahe is None or self.uvc_clahe_settings != clahe_settings:
-                self.uvc_clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_size, grid_size))
-                self.uvc_clahe_settings = clahe_settings
-            clahe = self.uvc_clahe
-
-        processed, algorithm_details = apply_image_algorithm(
-            processed,
-            algorithm_key,
-            low_percentile=self.uvc_low_percentile.value(),
-            high_percentile=self.uvc_high_percentile.value(),
-            clahe_clip=self.uvc_clahe_clip.value(),
-            clahe_grid=self.uvc_clahe_grid.value(),
-            gamma=self.uvc_gamma.value(),
-            bilateral_strength=self.uvc_bilateral_strength.value(),
-            unsharp_amount=self.uvc_unsharp_amount.value(),
-            clahe=clahe,
-            input_max=(
-                self.raw_max
-                if processed.dtype.itemsize > 1
-                else 255
-            ),
-            fieldscale_state=self.uvc_fieldscale_state,
-            fieldscale_temporal=algorithm_key == "fieldscale",
+        return process_uvc_pipeline_frame(
+            original_gray,
+            self.build_uvc_processing_config(),
+            clahe_cache={},
+            fieldscale_states={},
         )
-        details.extend(algorithm_details)
-        return processed, " | ".join(details)
+
+    def build_uvc_overview_items(self):
+        input_label = (
+            "Native DN" if self.uvc_pipeline_input_max > 255 else "UVC Gray"
+        )
+        items = [
+            ("00 Original UVC", self.uvc_original_frame, 255),
+            (
+                f"01 Pipeline Input - {input_label}",
+                self.uvc_pipeline_input,
+                self.uvc_pipeline_input_max,
+            ),
+        ]
+        for overview_index, record in enumerate(
+            self.uvc_pipeline_records, start=2
+        ):
+            items.append(
+                (
+                    f"{overview_index:02d} Step {record['pipeline_index']:02d} "
+                    f"{record['name']}",
+                    record["image"],
+                    255,
+                )
+            )
+        return items
+
+    def start_uvc_recording(self, _checked=False):
+        if self.uvc_recording_worker is not None:
+            QMessageBox.information(
+                self, "Recording Active", "UVC recording is already active."
+            )
+            return
+        if (
+            self.uvc_worker is None
+            or self.uvc_original_frame is None
+            or self.uvc_processed_frame is None
+            or self.uvc_pipeline_input is None
+        ):
+            QMessageBox.information(
+                self,
+                "No UVC Frame",
+                "Start the camera and wait for both previews first.",
+            )
+            return
+
+        requested_fps = float(self.uvc_fps_combo.currentData())
+        recording_fps = (
+            self.uvc_actual_fps
+            if 1.0 <= self.uvc_actual_fps <= 240.0
+            else requested_fps
+        )
+        started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        out = self.make_output("uvc_recording")
+        video_path = out / "comparison_pipeline.avi"
+        overview_path = out / "00_pipeline_overview.png"
+        manifest_path = out / "pipeline.json"
+
+        try:
+            save_pipeline_overview_png(
+                overview_path, self.build_uvc_overview_items()
+            )
+            manifest = {
+                "format_version": 1,
+                "mode": "uvc_recording",
+                "started_at": started_at,
+                "capture_mode": DEFAULT_UVC_CAPTURE_MODE,
+                "selected_capture_mode": getattr(
+                    self.uvc_worker, "selected_capture_mode", None
+                ),
+                "camera_index": self.selected_camera_info(
+                    self.uvc_camera_combo
+                )["index"],
+                "camera_name": self.selected_camera_info(
+                    self.uvc_camera_combo
+                )["name"],
+                "camera_device_id": self.selected_camera_info(
+                    self.uvc_camera_combo
+                )["device_id"],
+                "requested_fps": requested_fps,
+                "reported_camera_fps": round(self.uvc_actual_fps, 3),
+                "recording_fps": round(recording_fps, 3),
+                "source_resolution": {
+                    "width": int(self.uvc_original_frame.shape[1]),
+                    "height": int(self.uvc_original_frame.shape[0]),
+                },
+                "recording_layout": "Original UVC | Final Pipeline Output",
+                "recording_output": video_path.name,
+                "overview_output": overview_path.name,
+                "bit_depth": self.bit_depth,
+                "pipeline": self.uvc_pipeline_editor.configuration(),
+                "execution_at_start": pipeline_execution_json(
+                    self.uvc_pipeline_records
+                ),
+            }
+            with open(manifest_path, "w", encoding="utf-8") as destination:
+                json.dump(manifest, destination, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(self, "Recording Error", str(exc))
+            self.log.append(f"UVC recording setup error: {exc}")
+            return
+
+        worker = UvcRecordingThread(video_path, recording_fps, self)
+        worker.finished.connect(self.handle_uvc_recording_finished)
+        worker.finished.connect(worker.deleteLater)
+        self.uvc_recording_worker = worker
+        self.uvc_recording_output_dir = out
+        self.uvc_recording_manifest = manifest
+        self.uvc_recording_stop_reason = None
+        self.uvc_recording_started_perf = time.perf_counter()
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn.setEnabled(True)
+        worker.start()
+        worker.submit(
+            self.uvc_original_frame,
+            self.uvc_processed_frame,
+            self.uvc_recording_started_perf,
+        )
+        self.log.append(
+            f"UVC recording started: {video_path} "
+            f"({recording_fps:.3f} FPS, {UVC_RECORDING_FOURCC})"
+        )
+        self.log.append(f"Saved recording overview: {overview_path}")
+
+    def write_uvc_recording_summary(self, worker, reason):
+        out = self.uvc_recording_output_dir
+        manifest = self.uvc_recording_manifest
+        if out is None or manifest is None:
+            return
+        stats = worker.result_summary or {}
+        error_message = worker.error_message
+        manifest["ended_at"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        manifest["stop_reason"] = reason
+        manifest["success"] = error_message is None and bool(
+            stats.get("written_frames", 0)
+        )
+        manifest["error"] = error_message
+        manifest["recording"] = stats
+        recorded_pipeline_text = " -> ".join(
+            stage["name"]
+            for stage in manifest["pipeline"]
+            if stage.get("enabled")
+        )
+        with open(out / "pipeline.json", "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, ensure_ascii=False, indent=2)
+
+        with open(
+            out / "recording_summary.txt", "w", encoding="utf-8"
+        ) as summary:
+            summary.write(f"Started: {manifest['started_at']}\n")
+            summary.write(f"Ended: {manifest['ended_at']}\n")
+            summary.write(f"Stop reason: {reason}\n")
+            summary.write(f"Success: {manifest['success']}\n")
+            if error_message:
+                summary.write(f"Error: {error_message}\n")
+            summary.write(
+                f"Camera: {manifest['camera_name']} "
+                f"(index {manifest['camera_index']})\n"
+            )
+            summary.write(
+                f"Camera device ID: {manifest['camera_device_id']}\n"
+            )
+            summary.write(f"Capture mode: {manifest['capture_mode']}\n")
+            summary.write(
+                f"Selected capture mode: {manifest['selected_capture_mode']}\n"
+            )
+            summary.write(
+                f"Source resolution: "
+                f"{manifest['source_resolution']['width']}x"
+                f"{manifest['source_resolution']['height']}\n"
+            )
+            summary.write(
+                f"Requested / reported / recording FPS: "
+                f"{manifest['requested_fps']:.3f} / "
+                f"{manifest['reported_camera_fps']:.3f} / "
+                f"{manifest['recording_fps']:.3f}\n"
+            )
+            summary.write(f"Codec: {stats.get('codec', '--')}\n")
+            summary.write(
+                f"Duration: {stats.get('duration_seconds', 0.0):.3f} s\n"
+            )
+            summary.write(
+                f"Submitted / written / duplicate frames: "
+                f"{stats.get('submitted_frames', 0)} / "
+                f"{stats.get('written_frames', 0)} / "
+                f"{stats.get('duplicate_frames', 0)}\n"
+            )
+            summary.write(
+                f"Queue / timestamp dropped frames: "
+                f"{stats.get('queue_dropped_frames', 0)} / "
+                f"{stats.get('timestamp_dropped_frames', 0)}\n"
+            )
+            summary.write(
+                f"File size: {stats.get('file_size_bytes', 0)} bytes\n"
+            )
+            summary.write(f"Overview: {manifest['overview_output']}\n")
+            summary.write(f"Pipeline: {recorded_pipeline_text}\n")
+
+    def finalize_uvc_recording_worker(self, worker, reason):
+        if worker is not self.uvc_recording_worker:
+            return
+        try:
+            self.write_uvc_recording_summary(worker, reason)
+        except Exception as exc:
+            self.log.append(f"UVC recording summary error: {exc}")
+
+        out = self.uvc_recording_output_dir
+        video_path = None if out is None else out / "comparison_pipeline.avi"
+        if worker.error_message:
+            self.log.append(f"UVC recording error: {worker.error_message}")
+            self.uvc_status.setText(
+                f"Recording error: {worker.error_message}"
+            )
+        else:
+            stats = worker.result_summary or {}
+            self.log.append(
+                f"UVC recording stopped: {video_path}; "
+                f"written={stats.get('written_frames', 0)}, "
+                f"duplicates={stats.get('duplicate_frames', 0)}, "
+                f"dropped={stats.get('queue_dropped_frames', 0) + stats.get('timestamp_dropped_frames', 0)}"
+            )
+            self.uvc_status.setText(f"Recording saved: {video_path}")
+
+        self.uvc_recording_worker = None
+        self.uvc_recording_output_dir = None
+        self.uvc_recording_manifest = None
+        self.uvc_recording_stop_reason = None
+        self.uvc_recording_started_perf = 0.0
+        frame_ready = (
+            self.uvc_worker is not None
+            and self.uvc_original_frame is not None
+            and self.uvc_processed_frame is not None
+        )
+        self.uvc_record_start_btn.setEnabled(frame_ready)
+        self.uvc_record_stop_btn.setEnabled(False)
+
+    def stop_uvc_recording(
+        self,
+        _checked=False,
+        reason=None,
+        wait_ms=5000,
+        log_message=True,
+    ):
+        worker = self.uvc_recording_worker
+        if worker is None:
+            return True
+        stop_reason = reason or "User requested"
+        self.uvc_recording_stop_reason = stop_reason
+        worker.stop()
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn.setEnabled(False)
+        if not worker.wait(wait_ms):
+            self.uvc_status.setText("Finishing UVC recording...")
+            if log_message:
+                self.log.append(
+                    "UVC recording thread is still finishing the AVI file."
+                )
+            return False
+        self.finalize_uvc_recording_worker(worker, stop_reason)
+        return True
+
+    def handle_uvc_recording_finished(self):
+        worker = self.sender()
+        if worker is not self.uvc_recording_worker:
+            return
+        reason = self.uvc_recording_stop_reason
+        if reason is None:
+            reason = (
+                "Recording error"
+                if worker.error_message
+                else "Recording worker finished"
+            )
+        self.finalize_uvc_recording_worker(worker, reason)
 
     def start_uvc_camera(self, _checked=False):
         if cv2 is None:
@@ -2404,22 +5110,39 @@ class ThermalRawToolkit(QMainWindow):
             self.log.append(f"\nERROR: {message}")
             QMessageBox.critical(self, "Camera Error", message)
             return
-        if self.uvc_apply_nuc.isChecked():
-            try:
-                self.load_uvc_nuc_tables()
-            except Exception as exc:
-                message = str(exc)
-                self.log.append(f"\nERROR: {message}")
-                QMessageBox.critical(self, "UVC NUC Error", message)
-                return
+        try:
+            processing_config = self.build_uvc_processing_config()
+        except Exception as exc:
+            message = str(exc)
+            self.log.append(f"\nERROR: {message}")
+            QMessageBox.critical(self, "UVC Pipeline Error", message)
+            return
 
         if not self.stop_uvc_camera(log_message=False):
             self.uvc_restart_when_stopped = True
-            self.log.append("Previous capture thread is still stopping; camera will start automatically afterward.")
+            self.log.append(
+                "Previous capture thread is still stopping; camera will start "
+                "automatically afterward."
+            )
             return
         self.uvc_restart_when_stopped = False
-        camera_index = self.uvc_camera_combo.currentData()
+        capture_mode = DEFAULT_UVC_CAPTURE_MODE
+        camera_info = self.selected_camera_info(self.uvc_camera_combo)
+        camera_index = camera_info["index"]
+        if camera_index is None:
+            QMessageBox.warning(
+                self,
+                "Camera Disconnected",
+                "Select a connected camera before starting UVC.",
+            )
+            return
         requested_fps = self.uvc_fps_combo.currentData()
+
+        processing_worker = UvcProcessingThread(self)
+        processing_worker.set_config(processing_config)
+        processing_worker.frame_processed.connect(self.handle_uvc_processed_frame)
+        processing_worker.frame_failed.connect(self.handle_uvc_processing_failed)
+        processing_worker.finished.connect(processing_worker.deleteLater)
         worker = UvcCaptureThread(
             camera_index,
             self.width,
@@ -2427,17 +5150,25 @@ class ThermalRawToolkit(QMainWindow):
             requested_fps,
             UVC_RECONNECT_SECONDS,
             self,
+            frame_consumer=processing_worker.submit_frame,
+            capture_mode=capture_mode,
+            camera_device_id=camera_info["device_id"],
+            camera_name=camera_info["name"],
         )
-        worker.frame_ready.connect(self.handle_uvc_frame)
+        worker.frame_seen.connect(self.handle_uvc_frame_seen)
         worker.camera_opened.connect(self.handle_uvc_camera_opened)
         worker.status_changed.connect(self.handle_uvc_worker_status)
         worker.finished.connect(self.handle_uvc_worker_finished)
         worker.finished.connect(worker.deleteLater)
         self.uvc_worker = worker
-        self.reset_uvc_fieldscale_state()
+        self.uvc_processing_worker = processing_worker
         self.uvc_original_source = None
         self.uvc_original_frame = None
         self.uvc_processed_frame = None
+        self.uvc_pipeline_input = None
+        self.uvc_pipeline_input_max = 255
+        self.uvc_pipeline_records = []
+        self.uvc_pipeline_total_ms = 0.0
         self.uvc_last_processing_error = None
         self.uvc_frame_count = 0
         self.uvc_fps_display = 0.0
@@ -2446,26 +5177,51 @@ class ThermalRawToolkit(QMainWindow):
         self.uvc_last_frame_time = now
         self.uvc_waiting_for_frame = False
         self.uvc_reconnect_requested = False
+        self.uvc_actual_fps = 0.0
         self.preview_original.set_array(None)
         self.preview_result.set_array(None)
         self.uvc_watchdog_timer.start()
         self.uvc_start_btn.setEnabled(False)
         self.uvc_stop_btn.setEnabled(True)
         self.uvc_capture_btn.setEnabled(False)
-        self.uvc_status.setText(f"Opening camera {camera_index}...")
-        self.log.append(f"Starting camera {camera_index} in background capture thread...")
-        if self.uvc_apply_nuc.isChecked():
-            self.log.append(
-                f"UVC processing order: NUC ({Path(self.uvc_nuc_k_file.text()).name}, "
-                f"{Path(self.uvc_nuc_b_file.text()).name}) -> {self.uvc_algorithm_combo.currentText()}"
-            )
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn.setEnabled(False)
+        self.uvc_status.setText(
+            f"Opening {camera_info['name']} (Camera {camera_index}, "
+            f"{capture_mode})..."
+        )
+        self.log.append(
+            f"Starting {camera_info['name']} (Camera {camera_index}) in "
+            f"{capture_mode} mode "
+            "using the background capture thread..."
+        )
+        processing_order = self.uvc_pipeline_editor.summary()
+        self.log.append(f"UVC processing order: {processing_order}")
+        self.log.append(
+            "UVC processor uses latest-frame-wins; pending old frames are replaced."
+        )
+        processing_worker.start()
         worker.start()
+
+    def stop_uvc_processing_worker(self, wait_ms=5000):
+        worker = self.uvc_processing_worker
+        if worker is None:
+            return True
+        worker.stop()
+        if worker.isRunning() and not worker.wait(wait_ms):
+            return False
+        self.uvc_processing_worker = None
+        return True
 
     def stop_uvc_camera(self, _checked=False, log_message=True):
         self.uvc_restart_when_stopped = False
-        self.reset_uvc_fieldscale_state()
+        self.stop_uvc_recording(
+            reason="Camera stopped", log_message=log_message
+        )
         worker = self.uvc_worker
-        was_running = worker is not None
+        was_running = (
+            worker is not None or self.uvc_processing_worker is not None
+        )
         self.uvc_watchdog_timer.stop()
         if worker is not None:
             worker.stop()
@@ -2473,32 +5229,55 @@ class ThermalRawToolkit(QMainWindow):
                 self.uvc_start_btn.setEnabled(False)
                 self.uvc_stop_btn.setEnabled(False)
                 self.uvc_capture_btn.setEnabled(False)
+                self.uvc_record_start_btn.setEnabled(False)
+                self.uvc_record_stop_btn.setEnabled(False)
                 self.uvc_status.setText("Camera capture thread is stopping...")
                 return False
             self.uvc_worker = None
+        if not self.stop_uvc_processing_worker():
+            self.uvc_start_btn.setEnabled(False)
+            self.uvc_stop_btn.setEnabled(False)
+            self.uvc_capture_btn.setEnabled(False)
+            self.uvc_record_start_btn.setEnabled(False)
+            self.uvc_record_stop_btn.setEnabled(False)
+            self.uvc_status.setText("UVC processing thread is stopping...")
+            return False
         self.uvc_start_btn.setEnabled(True)
         self.uvc_stop_btn.setEnabled(False)
         self.uvc_capture_btn.setEnabled(False)
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn.setEnabled(False)
+        self.uvc_actual_fps = 0.0
         self.uvc_status.setText("Camera stopped")
         if was_running and log_message:
             self.log.append("Camera stopped")
         return True
 
     def switch_uvc_camera(self, _combo_index):
-        if self.uvc_worker is None:
-            return
-        self.start_uvc_camera()
+        if self.uvc_worker is not None:
+            self.start_uvc_camera()
 
-    def handle_uvc_camera_opened(self, camera_index, actual_width, actual_height, actual_fps):
+    def handle_uvc_camera_opened(
+        self, camera_index, actual_width, actual_height, actual_fps
+    ):
         if self.sender() is not self.uvc_worker:
             return
+        self.uvc_actual_fps = float(actual_fps)
         self.uvc_last_frame_time = time.perf_counter()
         self.uvc_reconnect_requested = False
+        camera_name = getattr(
+            self.uvc_worker, "camera_name", f"Camera {camera_index}"
+        )
         self.uvc_status.setText(
-            f"Camera {camera_index} opened: {actual_width}x{actual_height}, reported {actual_fps:.1f} FPS; waiting for frame..."
+            f"{camera_name} (Camera {camera_index}) opened: "
+            f"{actual_width}x{actual_height}, "
+            f"reported {actual_fps:.1f} FPS; waiting for frame..."
         )
         self.log.append(
-            f"Camera {camera_index} opened: {actual_width}x{actual_height}, requested {self.uvc_fps_combo.currentData()} FPS, reported {actual_fps:.1f} FPS"
+            f"{camera_name} (Camera {camera_index}) opened: "
+            f"{actual_width}x{actual_height}, "
+            f"requested {self.uvc_fps_combo.currentData()} FPS, "
+            f"reported {actual_fps:.1f} FPS"
         )
 
     def handle_uvc_worker_status(self, message):
@@ -2509,19 +5288,27 @@ class ThermalRawToolkit(QMainWindow):
     def handle_uvc_worker_finished(self):
         if self.sender() is not self.uvc_worker:
             return
+        self.stop_uvc_recording(reason="Camera capture thread finished")
         restart = self.uvc_restart_when_stopped
         close_pending = self.uvc_close_pending
         self.uvc_restart_when_stopped = False
         self.uvc_worker = None
+        self.stop_uvc_processing_worker()
         self.uvc_watchdog_timer.stop()
         self.uvc_start_btn.setEnabled(True)
         self.uvc_stop_btn.setEnabled(False)
         self.uvc_capture_btn.setEnabled(False)
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn.setEnabled(False)
+        self.uvc_actual_fps = 0.0
         self.uvc_status.setText("Camera stopped")
         if close_pending:
             self.uvc_close_pending = False
             QTimer.singleShot(0, self.close)
-        elif restart and self.function_combo.currentIndex() == len(self.FUNCTIONS) - 1:
+        elif (
+            restart
+            and self.current_function_index() == len(self.FUNCTIONS) - 1
+        ):
             QTimer.singleShot(0, self.start_uvc_camera)
 
     def force_close_after_uvc_timeout(self):
@@ -2534,7 +5321,29 @@ class ThermalRawToolkit(QMainWindow):
                 QTimer.singleShot(500, self.force_close_after_uvc_timeout)
                 return
         self.uvc_worker = None
+        self.stop_uvc_processing_worker(wait_ms=500)
         self.uvc_close_pending = False
+        QTimer.singleShot(0, self.close)
+
+    def force_close_after_dual_uvc_timeout(self):
+        if not self.dual_uvc_close_pending:
+            return
+        self.dual_uvc_display_timer.stop()
+        still_running = False
+        for worker in (self.dual_uvc_worker_a, self.dual_uvc_worker_b):
+            if worker is not None and worker.isRunning():
+                worker.terminate()
+                if not worker.wait(500):
+                    still_running = True
+        if still_running:
+            QTimer.singleShot(500, self.force_close_after_dual_uvc_timeout)
+            return
+        self.dual_uvc_worker_a = None
+        self.dual_uvc_worker_b = None
+        self.stop_dual_uvc_recording(
+            reason="Application closing", wait_ms=500
+        )
+        self.dual_uvc_close_pending = False
         QTimer.singleShot(0, self.close)
 
     def check_uvc_stream(self):
@@ -2546,131 +5355,337 @@ class ThermalRawToolkit(QMainWindow):
             return
         if not self.uvc_waiting_for_frame:
             self.uvc_waiting_for_frame = True
-            self.log.append("UVC frame paused; keeping the last image (possible FFC).")
-        self.uvc_status.setText(
-            f"Waiting for UVC frame {elapsed:.1f}s (possible FFC); last image retained."
-        )
-        if elapsed >= UVC_RECONNECT_SECONDS and not self.uvc_reconnect_requested:
-            self.uvc_reconnect_requested = True
             self.log.append(
-                f"No UVC frame for {elapsed:.1f}s; requesting automatic reconnect for camera {self.uvc_camera_combo.currentData()}."
+                "UVC frame paused; keeping the last image (possible FFC)."
+            )
+        self.uvc_status.setText(
+            f"Waiting for UVC frame {elapsed:.1f}s (possible FFC); "
+            "last image retained."
+        )
+        if (
+            elapsed >= UVC_RECONNECT_SECONDS
+            and not self.uvc_reconnect_requested
+        ):
+            self.uvc_reconnect_requested = True
+            camera_info = self.selected_camera_info(self.uvc_camera_combo)
+            self.log.append(
+                f"No UVC frame for {elapsed:.1f}s; requesting automatic "
+                f"reconnect for {camera_info['name']} "
+                f"(Camera {camera_info['index']})."
             )
             worker.force_reconnect()
 
-    def handle_uvc_frame(self, frame):
+    def handle_uvc_frame_seen(self, frame_time):
         if self.sender() is not self.uvc_worker:
             return
-        now = time.perf_counter()
-        self.uvc_last_frame_time = now
+        self.uvc_last_frame_time = frame_time
         self.uvc_reconnect_requested = False
         if self.uvc_waiting_for_frame:
             self.uvc_waiting_for_frame = False
             self.log.append("UVC stream resumed.")
 
+    def handle_uvc_frame(self, frame):
+        if self.sender() is not self.uvc_worker:
+            return
+        processing_worker = self.uvc_processing_worker
+        if processing_worker is None or not processing_worker.isRunning():
+            return
         try:
-            original_gray = uvc_to_gray(frame)
-            processed_gray, processing_details = self.process_uvc_frame(original_gray)
+            config = self.build_uvc_processing_config()
         except Exception as exc:
-            message = str(exc)
-            if message != self.uvc_last_processing_error:
-                self.log.append(f"UVC frame processing error: {message}")
-            self.uvc_last_processing_error = message
-            self.uvc_processed_frame = None
-            self.current_result = None
-            self.preview_result.set_array(None)
-            self.uvc_capture_btn.setEnabled(False)
-            self.uvc_status.setText(f"Frame processing error: {message}")
+            self.handle_uvc_processing_error(str(exc))
+            return
+        processing_worker.submit(frame, config)
+
+    def handle_uvc_processed_frame(self, payload):
+        if self.sender() is not self.uvc_processing_worker:
+            return
+        if payload["revision"] != self.uvc_processing_revision:
             return
         self.uvc_last_processing_error = None
-        self.uvc_original_source = original_gray.copy()
-        if original_gray.dtype == np.uint8:
-            self.uvc_original_frame = original_gray.copy()
-        else:
-            self.uvc_original_frame = raw_to_display_u8(original_gray, self.raw_max)
-        self.uvc_processed_frame = processed_gray.copy()
+        self.uvc_original_source = payload["original_source"]
+        self.uvc_original_frame = payload["original_display"]
+        self.uvc_pipeline_input = payload["pipeline_input"]
+        self.uvc_pipeline_input_max = payload["pipeline_input_max"]
+        self.uvc_processed_frame = payload["final_image"]
+        self.uvc_pipeline_records = payload["records"]
+        self.uvc_pipeline_total_ms = payload["total_ms"]
         self.current_original = self.uvc_original_frame
-        self.current_result = self.uvc_processed_frame
         self.preview_original.set_array(self.uvc_original_frame)
-        self.preview_result.set_array(processed_gray)
+        self.update_uvc_stage_preview()
         self.uvc_capture_btn.setEnabled(True)
 
+        now = time.perf_counter()
+        recording_worker = self.uvc_recording_worker
+        if recording_worker is not None and recording_worker.isRunning():
+            recording_worker.submit(
+                self.uvc_original_frame,
+                self.uvc_processed_frame,
+                now,
+            )
+            self.uvc_record_start_btn.setEnabled(False)
+            self.uvc_record_stop_btn.setEnabled(True)
+        elif recording_worker is None:
+            self.uvc_record_start_btn.setEnabled(True)
+            self.uvc_record_stop_btn.setEnabled(False)
+        else:
+            self.uvc_record_start_btn.setEnabled(False)
+            self.uvc_record_stop_btn.setEnabled(False)
         self.uvc_frame_count += 1
         elapsed = now - self.uvc_last_time
         if elapsed >= 0.5:
             self.uvc_fps_display = self.uvc_frame_count / elapsed
             self.uvc_frame_count = 0
             self.uvc_last_time = now
-        self.uvc_status.setText(
-            f"Camera {self.uvc_camera_combo.currentData()} | {original_gray.shape[1]}x{original_gray.shape[0]} | "
-            f"FPS {self.uvc_fps_display:.1f} | {self.uvc_algorithm_combo.currentText()} | {processing_details}"
+        requested_fps = self.uvc_fps_combo.currentData()
+        budget_ms = 1000.0 / requested_fps
+        budget_text = (
+            "OVER BUDGET"
+            if self.uvc_pipeline_total_ms > budget_ms
+            else "within budget"
         )
+        detail_parts = list(payload["preprocessing_details"])
+        detail_parts.extend(
+            f"S{record['pipeline_index']} {record['name']} "
+            f"{record['elapsed_ms']:.1f}ms"
+            for record in self.uvc_pipeline_records
+        )
+        detail_text = " | ".join(detail_parts)
+        recording_text = ""
+        if recording_worker is not None and recording_worker.isRunning():
+            recording_text = (
+                f"REC {max(0.0, now - self.uvc_recording_started_perf):.1f}s | "
+            )
+        selected_capture_mode = getattr(
+            self.uvc_worker, "selected_capture_mode", None
+        )
+        selected_capture_name = UvcCaptureThread._capture_mode_name(
+            selected_capture_mode or DEFAULT_UVC_CAPTURE_MODE
+        )
+        camera_info = self.selected_camera_info(self.uvc_camera_combo)
+        self.uvc_status.setText(
+            recording_text
+            + f"{camera_info['name']} (Camera {camera_info['index']}) | "
+            f"Capture {selected_capture_name} | "
+            f"{self.uvc_original_frame.shape[1]}x"
+            f"{self.uvc_original_frame.shape[0]} | "
+            f"Output FPS {self.uvc_fps_display:.1f} | "
+            f"Pipeline {self.uvc_pipeline_total_ms:.1f} ms / "
+            f"{budget_ms:.1f} ms ({budget_text})"
+            + (f" | {detail_text}" if detail_text else "")
+        )
+
+    def handle_uvc_processing_error(self, message):
+        if self.uvc_recording_worker is not None:
+            self.stop_uvc_recording(reason="UVC processing error")
+        if message != self.uvc_last_processing_error:
+            self.log.append(f"UVC frame processing error: {message}")
+        self.uvc_last_processing_error = message
+        self.uvc_processed_frame = None
+        self.uvc_pipeline_records = []
+        self.current_result = None
+        self.preview_result.set_array(None)
+        self.uvc_capture_btn.setEnabled(False)
+        self.uvc_record_start_btn.setEnabled(False)
+        self.uvc_record_stop_btn.setEnabled(False)
+        self.uvc_status.setText(f"Frame processing error: {message}")
+
+    def handle_uvc_processing_failed(self, payload):
+        if self.sender() is not self.uvc_processing_worker:
+            return
+        if payload.get("revision") != self.uvc_processing_revision:
+            return
+        self.handle_uvc_processing_error(payload["message"])
 
     def capture_uvc_pair(self):
         if self.uvc_original_frame is None or self.uvc_processed_frame is None:
-            QMessageBox.information(self, "No UVC Frame", "Start the camera and wait for a frame first.")
+            QMessageBox.information(
+                self,
+                "No UVC Frame",
+                "Start the camera and wait for a frame first.",
+            )
             return
-        algorithm_key = self.uvc_algorithm_combo.currentData()
         out = self.make_output("uvc_algorithm_compare")
         original_path = out / "original.png"
-        nuc_tag = "nuc_" if self.uvc_apply_nuc.isChecked() else ""
-        processed_path = out / f"result_{nuc_tag}{algorithm_key}.png"
+        pipeline_input_path = out / "pipeline_input.png"
+        processed_path = out / "final_pipeline.png"
+        comparison_path = out / "comparison_pipeline.png"
+        overview_path = out / "00_pipeline_overview.png"
         save_png(original_path, self.uvc_original_frame)
+        save_png(pipeline_input_path, self.uvc_pipeline_input)
+        step_output_files = {}
+        if self.uvc_save_intermediates.isChecked():
+            for record in self.uvc_pipeline_records:
+                step_path = out / (
+                    f"step_{record['pipeline_index']:02d}_"
+                    f"{record['algorithm']}.png"
+                )
+                save_png(step_path, record["image"])
+                step_output_files[record["pipeline_index"]] = step_path.name
         save_png(processed_path, self.uvc_processed_frame)
+        save_uvc_comparison_png(
+            comparison_path,
+            self.uvc_original_frame,
+            self.uvc_processed_frame,
+            "Final Pipeline Output",
+        )
+        input_label = (
+            "Native DN" if self.uvc_pipeline_input_max > 255 else "UVC Gray"
+        )
+        overview_items = [
+            ("00 Original UVC", self.uvc_original_frame, 255),
+            (
+                f"01 Pipeline Input - {input_label}",
+                self.uvc_pipeline_input,
+                self.uvc_pipeline_input_max,
+            ),
+        ]
+        for overview_index, record in enumerate(
+            self.uvc_pipeline_records, start=2
+        ):
+            overview_items.append(
+                (
+                    f"{overview_index:02d} Step {record['pipeline_index']:02d} "
+                    f"{record['name']}",
+                    record["image"],
+                    255,
+                )
+            )
+        save_pipeline_overview_png(overview_path, overview_items)
+        manifest = {
+            "format_version": 1,
+            "mode": "uvc_algorithm_compare",
+            "capture_mode": DEFAULT_UVC_CAPTURE_MODE,
+            "selected_capture_mode": getattr(
+                self.uvc_worker, "selected_capture_mode", None
+            ),
+            "camera_index": self.selected_camera_info(
+                self.uvc_camera_combo
+            )["index"],
+            "camera_name": self.selected_camera_info(
+                self.uvc_camera_combo
+            )["name"],
+            "camera_device_id": self.selected_camera_info(
+                self.uvc_camera_combo
+            )["device_id"],
+            "requested_fps": self.uvc_fps_combo.currentData(),
+            "resolution": {
+                "width": int(self.uvc_original_frame.shape[1]),
+                "height": int(self.uvc_original_frame.shape[0]),
+            },
+            "selected_thermal_resolution": {
+                "width": self.width,
+                "height": self.height,
+            },
+            "bit_depth": self.bit_depth,
+            "pipeline": self.uvc_pipeline_editor.configuration(),
+            "execution": pipeline_execution_json(self.uvc_pipeline_records),
+            "total_ms": round(self.uvc_pipeline_total_ms, 3),
+            "original_output": original_path.name,
+            "pipeline_input_output": pipeline_input_path.name,
+            "final_output": processed_path.name,
+            "comparison_output": comparison_path.name,
+            "overview_output": overview_path.name,
+        }
+        for execution in manifest["execution"]:
+            output_file = step_output_files.get(execution["pipeline_index"])
+            if output_file:
+                execution["output_file"] = output_file
+        with open(out / "pipeline.json", "w", encoding="utf-8") as destination:
+            json.dump(manifest, destination, ensure_ascii=False, indent=2)
+        with open(out / "pipeline_summary.txt", "w", encoding="utf-8") as summary:
+            summary.write(
+                f"Camera: {manifest['camera_name']} "
+                f"(index {manifest['camera_index']})\n"
+            )
+            summary.write(
+                f"Camera device ID: {manifest['camera_device_id']}\n"
+            )
+            summary.write(f"Capture mode: {manifest['capture_mode']}\n")
+            summary.write(
+                f"Selected capture mode: {manifest['selected_capture_mode']}\n"
+            )
+            summary.write(
+                f"Actual resolution: {manifest['resolution']['width']}x"
+                f"{manifest['resolution']['height']}\n"
+            )
+            summary.write(f"Overview: {overview_path.name}\n")
+            summary.write(f"Pipeline: {self.uvc_pipeline_editor.summary()}\n")
+            for execution in manifest["execution"]:
+                summary.write(
+                    f"Step {execution['pipeline_index']}: {execution['name']} - "
+                    f"{execution['elapsed_ms']:.3f} ms - "
+                    f"{' | '.join(execution['details'])}\n"
+                )
+            summary.write(f"Total: {self.uvc_pipeline_total_ms:.3f} ms\n")
         self.log.append(f"Saved: {original_path}")
         self.log.append(f"Saved: {processed_path}")
+        self.log.append(f"Saved comparison: {comparison_path}")
+        self.log.append(f"Saved overview: {overview_path}")
+        self.log.append(f"Pipeline settings: {out / 'pipeline.json'}")
 
     def save_current_preview(self):
         if self.current_result is None:
-            QMessageBox.information(self,"No Preview","Run a function first."); return
-        function_index = self.function_combo.currentIndex()
-        is_uvc_algorithm = self.FUNCTIONS[function_index] == "UVC Algorithm Compare"
+            QMessageBox.information(
+                self, "No Preview", "Run a function first."
+            )
+            return
+        function_index = self.current_function_index()
+        is_uvc_algorithm = (
+            self.FUNCTIONS[function_index] == "UVC Algorithm Compare"
+        )
         if is_uvc_algorithm:
-            if self.uvc_original_frame is None or self.uvc_processed_frame is None:
+            if self.uvc_original_frame is None:
                 QMessageBox.information(
                     self,
                     "No UVC Frame",
                     "Start the camera and wait for both previews first.",
                 )
                 return
-        out=self.make_output("manual_preview")
-        if is_uvc_algorithm:
+            out = self.make_output("manual_preview")
             original = self.uvc_original_frame.copy()
-            processed = self.uvc_processed_frame.copy()
-            algorithm_key = self.uvc_algorithm_combo.currentData()
+            processed = self.current_result.copy()
             algorithm_title = self.uvc_result_title()
-            nuc_tag = "nuc_" if self.uvc_apply_nuc.isChecked() else ""
             original_path = out / "original_uvc.png"
-            processed_path = out / f"processed_{nuc_tag}{algorithm_key}.png"
-            comparison_path = out / f"comparison_{nuc_tag}{algorithm_key}.png"
+            processed_path = out / "processed_selected_pipeline.png"
+            comparison_path = out / "comparison_selected_pipeline.png"
             save_png(original_path, original)
             save_png(processed_path, processed)
             save_uvc_comparison_png(
                 comparison_path, original, processed, algorithm_title
             )
-            self.log.append(f"Saved UVC algorithm: {algorithm_title}")
+            self.log.append(f"Saved UVC preview: {algorithm_title}")
             self.log.append(f"Saved original: {original_path}")
             self.log.append(f"Saved processed: {processed_path}")
             self.log.append(f"Saved comparison: {comparison_path}")
             return
 
-        path=out/"preview.png"
-        is_bpr_marking = self.FUNCTIONS[function_index] == "BPR Bad Pixel Marking"
+        out = self.make_output("manual_preview")
+        path = out / "preview.png"
+        is_bpr_marking = (
+            self.FUNCTIONS[function_index] == "BPR Bad Pixel Marking"
+        )
         if is_bpr_marking:
-            preview_to_save = np.clip(self.current_result, 0, 255).astype(np.uint8)
-        elif function_index == len(self.FUNCTIONS) - 1:
-            preview_to_save = self.current_result
+            preview_to_save = np.clip(
+                self.current_result, 0, 255
+            ).astype(np.uint8)
         elif function_index == 4:
-            preview_to_save = signed_delta_to_display_u8(self.current_result, self.raw_max)
+            preview_to_save = signed_delta_to_display_u8(
+                self.current_result, self.raw_max
+            )
         elif function_index in (0, 1, 2, 3, 5):
-            preview_to_save = raw_to_display_u8(self.current_result, self.raw_max)
+            preview_to_save = raw_to_display_u8(
+                self.current_result, self.raw_max
+            )
         else:
-            preview_to_save = np.clip(self.current_result, 0, 255).astype(np.uint8)
+            preview_to_save = np.clip(
+                self.current_result, 0, 255
+            ).astype(np.uint8)
         if is_bpr_marking:
             save_rgb_png(path, preview_to_save)
         else:
             save_png(path, preview_to_save)
         self.log.append(f"Saved preview: {path}")
-
     def open_last_result(self):
         if not self.last_output_dir or not os.path.isdir(self.last_output_dir):
             QMessageBox.information(self,"No Result","No result folder yet."); return
@@ -2681,7 +5696,55 @@ class ThermalRawToolkit(QMainWindow):
 
     def closeEvent(self, event):
         self.uvc_restart_when_stopped = False
+        self.dual_uvc_restart_when_stopped = False
+        self.camera_refresh_timer.stop()
         self.uvc_watchdog_timer.stop()
+        self.dual_uvc_display_timer.stop()
+        if not self.stop_dual_uvc_recording(
+            reason="Application closing", wait_ms=3000
+        ):
+            QTimer.singleShot(500, self.close)
+            event.ignore()
+            return
+        dual_workers = (
+            self.dual_uvc_worker_a,
+            self.dual_uvc_worker_b,
+        )
+        if any(
+            worker is not None and worker.isRunning()
+            for worker in dual_workers
+        ):
+            if not self.dual_uvc_close_pending:
+                self.dual_uvc_close_pending = True
+                self.dual_uvc_start_btn.setEnabled(False)
+                self.dual_uvc_stop_btn.setEnabled(False)
+                self.dual_uvc_capture_btn.setEnabled(False)
+                self.dual_uvc_record_start_btn.setEnabled(False)
+                self.dual_uvc_record_stop_btn.setEnabled(False)
+                self.dual_uvc_status_a.setText(
+                    f"Stopping {self.dual_uvc_image_name_a.currentText()} before exit..."
+                )
+                self.dual_uvc_status_b.setText(
+                    f"Stopping {self.dual_uvc_image_name_b.currentText()} before exit..."
+                )
+                for dual_worker in dual_workers:
+                    if dual_worker is not None:
+                        dual_worker.stop()
+                QTimer.singleShot(
+                    UVC_CLOSE_TIMEOUT_MS,
+                    self.force_close_after_dual_uvc_timeout,
+                )
+            event.ignore()
+            return
+        self.dual_uvc_worker_a = None
+        self.dual_uvc_worker_b = None
+        if not self.stop_uvc_recording(
+            reason="Application closing", wait_ms=3000
+        ):
+            self.uvc_status.setText("Finishing recording before exit...")
+            QTimer.singleShot(500, self.close)
+            event.ignore()
+            return
         worker = self.uvc_worker
         if worker is not None and worker.isRunning():
             if not self.uvc_close_pending:
@@ -2689,6 +5752,8 @@ class ThermalRawToolkit(QMainWindow):
                 self.uvc_start_btn.setEnabled(False)
                 self.uvc_stop_btn.setEnabled(False)
                 self.uvc_capture_btn.setEnabled(False)
+                self.uvc_record_start_btn.setEnabled(False)
+                self.uvc_record_stop_btn.setEnabled(False)
                 self.uvc_status.setText("Stopping camera before exit...")
                 worker.stop()
                 QTimer.singleShot(
@@ -2698,6 +5763,7 @@ class ThermalRawToolkit(QMainWindow):
             event.ignore()
             return
         self.uvc_worker = None
+        self.stop_uvc_processing_worker()
         self.uvc_close_pending = False
         super().closeEvent(event)
 

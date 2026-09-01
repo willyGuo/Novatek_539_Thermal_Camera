@@ -1,4 +1,4 @@
-Thermal RAW Toolkit v1.0.0
+Thermal RAW Toolkit v1.1.0
 ==========================
 
 Run:
@@ -39,32 +39,82 @@ Functions:
      - Show table/unique/duplicate/marked counts and every x,y coordinate in the UI
      - The shared Font Size control adjusts both Information / Log and Bad Pixel Information
      - Save the marked PNG, base PNG, normalized coordinate CSV, and summary TXT
-  8. RAW Algorithm Compare
-     - Load one RAW file and compare its fixed Bit Depth preview with a selected algorithm
-     - Algorithms match UVC Algorithm Compare: Auto Contrast, Fieldscale Firmware Core,
-       Histogram Equalization, CLAHE, Gamma, Bilateral Denoise, Unsharp Mask,
-       Auto Contrast + CLAHE, and P1/P99 Percentile Preview (Original Values)
-     - Fieldscale uses original RAW DN with the firmware 8x8 grid, 400 RAW14-DN
-       max/min difference, seven message passes, and no Gamma/CLAHE
-     - P1/P99 Percentile Preview matches raw_nuc_apply_percentile.py's preview stage
-       without NUC: calculate P1/P99 on original RAW16 values, then map to 8-bit
-     - Save original_fixed.png and result_<algorithm>.png
-  9. UVC Algorithm Compare
-     - Live Original / selected algorithm comparison
-     - Optional Novatek K/B NUC preprocessing before the selected image algorithm
-     - K/B dimensions must match Resolution; 8-bit UVC is linearly mapped to Bit Depth DN before NUC
-     - Right-side algorithms: Auto Contrast, Fieldscale Firmware Core,
-       Histogram Equalization, CLAHE, Gamma, Bilateral Denoise, Unsharp Mask,
-       and Auto Contrast + CLAHE
-     - UVC Fieldscale runs in the available grayscale domain with an equivalent
-       RAW14 threshold and current-10% / previous-90% temporal field smoothing
-     - Percentile stretching runs only when Auto Contrast or P1/P99 Percentile Preview is selected
-     - Reset Algorithm Defaults restores the selected algorithm's parameters
+  8. Dual UVC Compare
+     - Open Camera A and Camera B in two independent capture threads
+     - Each camera selector shows the Windows camera friendly name and current
+       OpenCV index, plus its own Image Name and Requested FPS
+     - Camera devices are checked every second; hot-plug updates both selectors
+       automatically, while Refresh Cameras provides a manual refresh
+     - Selection is preserved by Windows device ID instead of unstable index;
+       a removed camera is marked Disconnected and its worker waits for replug
+     - Capture uses internal Auto Detect with no mode selector: try Novatek MJPG
+       first, then fall back to the camera's native format automatically when
+       opening, format negotiation, or initial frame reading fails
+     - Status and saved metadata record the mode actually selected by Auto Detect
+     - Image Name choices are PEGA, 天淵, and 方見; defaults are Camera A = PEGA
+       and Camera B = 天淵
+     - Camera indexes must differ; each camera keeps worker-owned capture release
+     - Display the two latest UVC frames side by side; pairing is software-based
+       latest-frame pairing and is not hardware-trigger synchronization
+     - Each input uses a latest-frame mailbox so pending old frames are replaced
+       instead of accumulating GUI latency
+     - The selected names appear in preview captions, overview/recording labels,
+       capture metadata, and recording metadata
+     - Capture Pair saves name-tagged files such as camera_a_PEGA.png and
+       camera_b_TianYuan.png, plus
+       00_dual_uvc_overview.png, capture.json, and capture_summary.txt
+     - Start Recording / Stop Recording saves dual_uvc_comparison.avi (MJPG),
+       00_dual_uvc_overview.png, recording.json, and recording_summary.txt
+     - Recording FPS uses the lower valid reported FPS of Camera A and Camera B
+     - Camera stop, page change, setting change, and application exit safely
+       finish recording and stop both capture workers
+  9. RAW Algorithm Compare
+     - Build an ordered pipeline with any number of enabled steps
+     - Add, remove, repeat, enable/disable, move up, and move down independently
+     - Available steps: Auto Contrast, Fieldscale Firmware Core, Histogram
+       Equalization, CLAHE, Gamma, Bilateral Denoise, and Unsharp Mask
+     - Every repeated step owns independent parameters
+     - Input Mapping is fixed before the pipeline: Fixed Bit Depth Scale, or
+       P1/P99 calculated from original RAW DN
+     - Compatibility rule: when Fixed Bit Depth is selected and Fieldscale is
+       the first enabled step, Fieldscale receives original RAW DN; later steps
+       receive its 8-bit output
+     - Fieldscale retains the firmware 8x8 grid, 400 RAW14-DN max/min difference,
+       seven message passes, and no built-in Gamma/CLAHE
+     - Right Preview can inspect the final output or any enabled step
+     - Save original, mapped/native input, final, optional step PNGs,
+       pipeline.json, and pipeline_summary.txt in a timestamped result folder
+     - Every Run also saves 00_pipeline_overview.png: Original, Pipeline Input,
+       and every enabled step arranged in order with numbered algorithm labels
+  10. UVC Algorithm Compare
+     - Live Original / ordered algorithm pipeline comparison
+     - Capture uses internal Auto Detect with no mode selector: try Novatek MJPG
+       first, then automatically fall back to the camera's native format
+     - Status and saved metadata record the mode actually selected by Auto Detect
+     - Add, remove, repeat, enable/disable, and reorder the same steps as RAW
+     - Each Fieldscale step has independent current-10% / previous-90% temporal state
+     - Right Preview can show the final output or any enabled step
      - CAMERA_INDEX switching (Camera 0 ~ 9)
+     - The selector shows Windows friendly names, updates every second for
+       hot-plug, and also provides a manual Refresh Cameras button
+     - Selection is preserved by Windows device ID; saved metadata includes the
+       friendly name, device ID, current index, and actual selected capture mode
      - Requested FPS options: 30 FPS or 60 FPS
-     - Only the selected algorithm's parameter rows are shown
-     - Capture original and processed PNG pair
-     - Background capture keeps the UI responsive during FFC pauses
+     - Status displays output FPS, total pipeline time, per-step time, and frame budget
+     - Camera capture and pipeline processing use separate workers; pending old
+       frames are replaced by the newest frame instead of accumulating latency
+     - Capture original, pipeline input, final, combined comparison, optional
+       step PNGs, pipeline.json, and pipeline_summary.txt
+     - Every Capture Pair also saves 00_pipeline_overview.png with Original UVC,
+       Pipeline Input, and every enabled step in numbered execution order
+     - Start Recording / Stop Recording saves synchronized Original UVC and
+       Final Pipeline Output side by side as comparison_pipeline.avi (MJPG)
+     - Video encoding runs in a separate worker. Timestamp-based duplicate/drop
+       handling preserves constant-FPS playback when processing or FFC pauses
+     - Each recording folder also saves 00_pipeline_overview.png, pipeline.json,
+       and recording_summary.txt with duration, frame, drop, and file-size data
+     - Camera stop/switch, pipeline changes, processing errors, and application
+       exit safely finish the active AVI before the UVC workers are released
      - Keeps the last frame and automatically reconnects after 5 seconds without frames
 
 Result saving:
