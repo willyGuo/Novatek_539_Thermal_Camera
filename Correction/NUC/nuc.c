@@ -634,8 +634,8 @@ static int nuc_wait_sensor_temp_point(UINT32 point)
 {
 	char buf[16];
 
-	printf("\nSensor temperature calibration point %u/%u.\n",
-	       point + 1, NUC_FIVE_POINT_COUNT);
+	printf("\nSensor temperature calibration point %u (capture once).\n",
+	       point + 1);
 	printf("Set and stabilize the sensor temperature, then press Enter.\n");
 	printf(">> ");
 	if (fgets(buf, sizeof(buf), stdin) == 0) {
@@ -1857,30 +1857,33 @@ int nuc_five_point_sensor_temp_calibration(void)
 		goto exit;
 	}
 
+	printf("Perform Low/High calibration once; reuse identical K/B for points 1-5.\n");
+	if (nuc_wait_sensor_temp_point(0) != 0) {
+		goto exit;
+	}
+	if (sensor_temp_read(&temperatures[0]) != 0) {
+		printf("read sensor temperature point 1 fail\n");
+		goto exit;
+	}
+	printf("Sensor temperature = %.4f C (same value saved for points 1-5)\n",
+	       temperatures[0]);
+
+	if (nuc_capture_two_point(low_raw, high_raw, frame_raw, raw_sum) != 0) {
+		printf("capture Low/High temperature RAW fail\n");
+		goto exit;
+	}
+	if (nuc_build_table(low_raw, high_raw,
+			    (UINT16 *)g_nuc.k_va,
+			    (UINT16 *)g_nuc.b_va) != 0) {
+		printf("NUC calibration rejected; abort calibration\n");
+		goto exit;
+	}
+
+	/* Preserve the five-file-pair format without repeating acquisition.
+	 * Equal sensor temperatures intentionally use the existing point-1 fallback.
+	 */
 	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
-		if (nuc_wait_sensor_temp_point(point) != 0) {
-			goto exit;
-		}
-		if (sensor_temp_read(&temperatures[point]) != 0) {
-			printf("read sensor temperature point %u fail\n", point + 1);
-			goto exit;
-		}
-		printf("Sensor temperature point %u = %.4f C\n",
-		       point + 1, temperatures[point]);
-
-		if (nuc_capture_two_point(low_raw, high_raw,
-					  frame_raw, raw_sum) != 0) {
-			printf("capture sensor temperature point %u fail\n", point + 1);
-			goto exit;
-		}
-
-		if (nuc_build_table(low_raw, high_raw,
-				    (UINT16 *)g_nuc.k_va,
-				    (UINT16 *)g_nuc.b_va) != 0) {
-			printf("NUC calibration point %u rejected; abort calibration\n",
-			       point + 1);
-			goto exit;
-		}
+		temperatures[point] = temperatures[0];
 		if (nuc_stage_sensor_temp_table(point) != 0) {
 			goto exit;
 		}
@@ -1891,7 +1894,7 @@ int nuc_five_point_sensor_temp_calibration(void)
 		goto exit;
 	}
 
-	printf("5 point Sensor Temperature NUC calibration done\n");
+	printf("Sensor Temperature NUC calibration done: identical K/B saved to points 1-5\n");
 	ret = 0;
 
 exit:
@@ -2087,7 +2090,7 @@ int nuc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("NUC menu\n");
-		printf(" 1. 5 point Sensor Temperature NUC calibration\n");
+		printf(" 1. Sensor Temperature NUC calibration (capture once, copy to 5 points)\n");
 		printf(" 2. 5 point Blackbody Temperature NUC calibration (save RAW/K/B)\n");
 		printf(" 3. Toggle per-pixel Blackbody Dynamic NUC\n");
 		printf(" 4. Reload Sensor Temperature K/B table\n");

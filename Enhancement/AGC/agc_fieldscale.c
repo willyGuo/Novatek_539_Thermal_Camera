@@ -5,7 +5,7 @@
  *
  * The original OpenCV/C++ implementation is Copyright (c) 2025 nowroad
  * and distributed under the MIT License.  See FIELDSCALE_LICENSE.txt.
- * This adaptation keeps the 8x8 min/max fields, extrema suppression,
+ * This adaptation keeps configurable min/max fields, extrema suppression,
  * message passing, bilinear field expansion, and video temporal smoothing.
  * Gamma and CLAHE are intentionally omitted for the firmware pipeline.
  */
@@ -19,17 +19,56 @@
 #include <string.h>
 
 #include "agc_mode.h"
+#if defined(__LINUX)
+#include <pthread.h>
+#else
+#include <FreeRTOS_POSIX.h>
+#include <FreeRTOS_POSIX/pthread.h>
+#endif
+
+static pthread_mutex_t g_fieldscale_params_lock = PTHREAD_MUTEX_INITIALIZER;
+#define FIELDSCALE_DEFAULT_PARAMS {8U, 2U, 400U, 1U, 7U, 90U}
+static const AGC_FIELDSCALE_PARAMS g_fieldscale_defaults = FIELDSCALE_DEFAULT_PARAMS;
+static AGC_FIELDSCALE_PARAMS g_fieldscale_params = FIELDSCALE_DEFAULT_PARAMS;
+
+void agc_fieldscale_get_default_params(AGC_FIELDSCALE_PARAMS *params)
+{
+    if (params != NULL) *params = g_fieldscale_defaults;
+}
+
+int agc_fieldscale_validate_params(const AGC_FIELDSCALE_PARAMS *p)
+{
+    if (p == NULL || (p->grid_size != 2U && p->grid_size != 4U &&
+        p->grid_size != 8U && p->grid_size != 16U && p->grid_size != 32U) ||
+        p->les_distance < 1U || p->les_distance > 31U ||
+        p->les_threshold > 16383U || p->message_distance < 1U ||
+        p->message_distance > 31U || p->message_iterations > 32U ||
+        p->temporal_previous_percent > 99U) {
+        return -1;
+    }
+    return 0;
+}
+
+int agc_fieldscale_set_params(const AGC_FIELDSCALE_PARAMS *params)
+{
+    if (agc_fieldscale_validate_params(params) != 0) return -1;
+    pthread_mutex_lock(&g_fieldscale_params_lock);
+    g_fieldscale_params = *params;
+    pthread_mutex_unlock(&g_fieldscale_params_lock);
+    return 0;
+}
+
+void agc_fieldscale_get_params(AGC_FIELDSCALE_PARAMS *params)
+{
+    if (params == NULL) return;
+    pthread_mutex_lock(&g_fieldscale_params_lock);
+    *params = g_fieldscale_params;
+    pthread_mutex_unlock(&g_fieldscale_params_lock);
+}
 
 #define FIELDSCALE_RAW14_MAX             16383U
 #define FIELDSCALE_GRID_FRAC_BITS        8U
 #define FIELDSCALE_GRID_FRAC_ONE         (1U << FIELDSCALE_GRID_FRAC_BITS)
-#define FIELDSCALE_EXTREMA_DISTANCE      2
-#define FIELDSCALE_MAX_DIFF_RAW14        400U
-#define FIELDSCALE_MIN_DIFF_RAW14        400U
-#define FIELDSCALE_MESSAGE_ITERATIONS    7U
-#define FIELDSCALE_TEMPORAL_CURRENT      1U
-#define FIELDSCALE_TEMPORAL_PREVIOUS     9U
-#define FIELDSCALE_TEMPORAL_TOTAL        10U
 #define FIELDSCALE_INTERP_ONE            65536U
 #define FIELDSCALE_LATENCY_FRAME_COUNT   60U
 #define MENU_OPTION_REFRESH              (-2)
@@ -83,7 +122,7 @@ static int agc_fieldscale_read_option(void)
 
 static uint32_t fieldscale_grid_index(uint32_t x, uint32_t y)
 {
-	return y * AGC_FIELDSCALE_GRID_WIDTH + x;
+	return y * AGC_FIELDSCALE_GRID_MAX + x;
 }
 
 static void fieldscale_grid_min_max(const uint16_t *input,
@@ -91,27 +130,26 @@ static void fieldscale_grid_min_max(const uint16_t *input,
 				    uint32_t width,
 				    uint32_t height,
 				    uint32_t *min_grid,
-				    uint32_t *max_grid)
+				    uint32_t *max_grid,
+                                    const AGC_FIELDSCALE_PARAMS *params)
 {
-	uint32_t patch_width = width / AGC_FIELDSCALE_GRID_WIDTH;
-	uint32_t patch_height = height / AGC_FIELDSCALE_GRID_HEIGHT;
 	uint32_t grid_x;
 	uint32_t grid_y;
 
-	for (grid_y = 0; grid_y < AGC_FIELDSCALE_GRID_HEIGHT; grid_y++) {
-		for (grid_x = 0; grid_x < AGC_FIELDSCALE_GRID_WIDTH; grid_x++) {
+	for (grid_y = 0; grid_y < params->grid_size; grid_y++) {
+		for (grid_x = 0; grid_x < params->grid_size; grid_x++) {
 			uint32_t min_value = FIELDSCALE_RAW14_MAX;
 			uint32_t max_value = 0U;
-			uint32_t start_x = grid_x * patch_width;
-			uint32_t start_y = grid_y * patch_height;
+			uint32_t start_x = grid_x * width / params->grid_size;
+			uint32_t start_y = grid_y * height / params->grid_size;
 			uint32_t x;
 			uint32_t y;
 
-			for (y = start_y; y < start_y + patch_height; y++) {
+			for (y = start_y; y < (grid_y + 1U) * height / params->grid_size; y++) {
 				const uint16_t *row = (const uint16_t *)(
 					(const uint8_t *)input +
 					(size_t)y * input_stride_bytes);
-				for (x = start_x; x < start_x + patch_width; x++) {
+				for (x = start_x; x < (grid_x + 1U) * width / params->grid_size; x++) {
 					uint32_t value = row[x] & FIELDSCALE_RAW14_MAX;
 					if (value < min_value) {
 						min_value = value;
@@ -133,15 +171,16 @@ static void fieldscale_grid_min_max(const uint16_t *input,
 static void fieldscale_suppress_extrema(const uint32_t *grid,
 					uint32_t *result,
 					uint32_t threshold_q8,
-					int suppress_maximum)
+					int suppress_maximum,
+                                        const AGC_FIELDSCALE_PARAMS *params)
 {
 	uint32_t x;
 	uint32_t y;
 
 	memcpy(result, grid,
 	       AGC_FIELDSCALE_GRID_COUNT * sizeof(result[0]));
-	for (y = 0; y < AGC_FIELDSCALE_GRID_HEIGHT; y++) {
-		for (x = 0; x < AGC_FIELDSCALE_GRID_WIDTH; x++) {
+	for (y = 0; y < params->grid_size; y++) {
+		for (x = 0; x < params->grid_size; x++) {
 			uint64_t sum = 0U;
 			uint32_t count = 0U;
 			uint32_t neighbor_min = UINT32_MAX;
@@ -151,17 +190,17 @@ static void fieldscale_suppress_extrema(const uint32_t *grid,
 			uint32_t current;
 			uint32_t mean;
 
-			for (dy = -FIELDSCALE_EXTREMA_DISTANCE;
-			     dy <= FIELDSCALE_EXTREMA_DISTANCE; dy++) {
-				for (dx = -FIELDSCALE_EXTREMA_DISTANCE;
-				     dx <= FIELDSCALE_EXTREMA_DISTANCE; dx++) {
+			for (dy = -(int)params->les_distance;
+			     dy <= (int)params->les_distance; dy++) {
+				for (dx = -(int)params->les_distance;
+				     dx <= (int)params->les_distance; dx++) {
 					int nx = (int)x + dx;
 					int ny = (int)y + dy;
 					uint32_t value;
 
 					if ((dx == 0 && dy == 0) || nx < 0 || ny < 0 ||
-					    nx >= (int)AGC_FIELDSCALE_GRID_WIDTH ||
-					    ny >= (int)AGC_FIELDSCALE_GRID_HEIGHT) {
+					    nx >= (int)params->grid_size ||
+					    ny >= (int)params->grid_size) {
 						continue;
 					}
 					value = grid[fieldscale_grid_index(
@@ -199,13 +238,14 @@ static void fieldscale_suppress_extrema(const uint32_t *grid,
 
 static void fieldscale_message_pass(const uint32_t *grid,
 				    uint32_t *result,
-				    int increase)
+				    int increase,
+                                    const AGC_FIELDSCALE_PARAMS *params)
 {
 	uint32_t x;
 	uint32_t y;
 
-	for (y = 0; y < AGC_FIELDSCALE_GRID_HEIGHT; y++) {
-		for (x = 0; x < AGC_FIELDSCALE_GRID_WIDTH; x++) {
+	for (y = 0; y < params->grid_size; y++) {
+		for (x = 0; x < params->grid_size; x++) {
 			uint64_t sum = grid[fieldscale_grid_index(x, y)];
 			uint32_t count = 1U;
 			uint32_t current = (uint32_t)sum;
@@ -213,13 +253,13 @@ static void fieldscale_message_pass(const uint32_t *grid,
 			int dx;
 			int dy;
 
-			for (dy = -1; dy <= 1; dy++) {
-				for (dx = -1; dx <= 1; dx++) {
+			for (dy = -(int)params->message_distance; dy <= (int)params->message_distance; dy++) {
+				for (dx = -(int)params->message_distance; dx <= (int)params->message_distance; dx++) {
 					int nx = (int)x + dx;
 					int ny = (int)y + dy;
 					if ((dx == 0 && dy == 0) || nx < 0 || ny < 0 ||
-					    nx >= (int)AGC_FIELDSCALE_GRID_WIDTH ||
-					    ny >= (int)AGC_FIELDSCALE_GRID_HEIGHT) {
+					    nx >= (int)params->grid_size ||
+					    ny >= (int)params->grid_size) {
 						continue;
 					}
 					sum += grid[fieldscale_grid_index(
@@ -280,9 +320,11 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 			     uint32_t height,
 			     AGC_FIELDSCALE_STATE *state)
 {
-	uint32_t min_grid[AGC_FIELDSCALE_GRID_COUNT];
-	uint32_t max_grid[AGC_FIELDSCALE_GRID_COUNT];
-	uint32_t scratch[AGC_FIELDSCALE_GRID_COUNT];
+	AGC_FIELDSCALE_PARAMS frame_params;
+	const AGC_FIELDSCALE_PARAMS *params = &frame_params;
+	uint32_t min_grid[AGC_FIELDSCALE_GRID_COUNT] = {0};
+	uint32_t max_grid[AGC_FIELDSCALE_GRID_COUNT] = {0};
+	uint32_t scratch[AGC_FIELDSCALE_GRID_COUNT] = {0};
 	uint32_t x;
 	uint32_t y;
 	uint32_t iteration;
@@ -291,9 +333,10 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 	int64_t source_x_step_q16;
 	int64_t source_y_step_q16;
 
+	agc_fieldscale_get_params(&frame_params);
 	if (input == NULL || output == NULL || state == NULL ||
-	    width < AGC_FIELDSCALE_GRID_WIDTH ||
-	    height < AGC_FIELDSCALE_GRID_HEIGHT ||
+	    width < params->grid_size ||
+	    height < params->grid_size ||
 	    input_stride_bytes < width * sizeof(uint16_t) ||
 	    output_stride_bytes < width * sizeof(uint16_t) ||
 	    (input_stride_bytes & 1U) != 0U ||
@@ -301,35 +344,39 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
 	}
 
+    if (memcmp(&state->previous_params, params, sizeof(*params)) != 0) {
+        state->temporal_valid = 0;
+        state->previous_params = *params;
+    }
 	fieldscale_grid_min_max(input, input_stride_bytes, width, height,
-				min_grid, max_grid);
+				min_grid, max_grid, params);
 	fieldscale_suppress_extrema(max_grid, scratch,
-		FIELDSCALE_MAX_DIFF_RAW14 * FIELDSCALE_GRID_FRAC_ONE, 1);
+		params->les_threshold * FIELDSCALE_GRID_FRAC_ONE, 1, params);
 	memcpy(max_grid, scratch, sizeof(max_grid));
 	fieldscale_suppress_extrema(max_grid, scratch,
-		FIELDSCALE_MIN_DIFF_RAW14 * FIELDSCALE_GRID_FRAC_ONE, 0);
+		params->les_threshold * FIELDSCALE_GRID_FRAC_ONE, 0, params);
 	memcpy(max_grid, scratch, sizeof(max_grid));
 
-	for (iteration = 0; iteration < FIELDSCALE_MESSAGE_ITERATIONS;
+	for (iteration = 0; iteration < params->message_iterations;
 	     iteration++) {
-		fieldscale_message_pass(min_grid, scratch, 0);
+		fieldscale_message_pass(min_grid, scratch, 0, params);
 		memcpy(min_grid, scratch, sizeof(min_grid));
-		fieldscale_message_pass(max_grid, scratch, 1);
+		fieldscale_message_pass(max_grid, scratch, 1, params);
 		memcpy(max_grid, scratch, sizeof(max_grid));
 	}
 
 	if (state->temporal_valid) {
 		for (x = 0; x < AGC_FIELDSCALE_GRID_COUNT; x++) {
-			min_grid[x] = (min_grid[x] * FIELDSCALE_TEMPORAL_CURRENT +
+			min_grid[x] = (min_grid[x] * (100U - params->temporal_previous_percent) +
 				state->previous_min_q8[x] *
-				FIELDSCALE_TEMPORAL_PREVIOUS +
-				FIELDSCALE_TEMPORAL_TOTAL / 2U) /
-				FIELDSCALE_TEMPORAL_TOTAL;
-			max_grid[x] = (max_grid[x] * FIELDSCALE_TEMPORAL_CURRENT +
+				params->temporal_previous_percent +
+				100U / 2U) /
+				100U;
+			max_grid[x] = (max_grid[x] * (100U - params->temporal_previous_percent) +
 				state->previous_max_q8[x] *
-				FIELDSCALE_TEMPORAL_PREVIOUS +
-				FIELDSCALE_TEMPORAL_TOTAL / 2U) /
-				FIELDSCALE_TEMPORAL_TOTAL;
+				params->temporal_previous_percent +
+				100U / 2U) /
+				100U;
 		}
 	}
 	memcpy(state->previous_min_q8, min_grid, sizeof(min_grid));
@@ -338,13 +385,13 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 
 	/* OpenCV INTER_LINEAR pixel-center coordinates, advanced incrementally. */
 	source_x_start_q16 =
-		((int64_t)AGC_FIELDSCALE_GRID_WIDTH * 32768) / width - 32768;
+		((int64_t)params->grid_size * 32768) / width - 32768;
 	source_x_step_q16 =
-		((int64_t)AGC_FIELDSCALE_GRID_WIDTH * 65536) / width;
+		((int64_t)params->grid_size * 65536) / width;
 	source_y_q16 =
-		((int64_t)AGC_FIELDSCALE_GRID_HEIGHT * 32768) / height - 32768;
+		((int64_t)params->grid_size * 32768) / height - 32768;
 	source_y_step_q16 =
-		((int64_t)AGC_FIELDSCALE_GRID_HEIGHT * 65536) / height;
+		((int64_t)params->grid_size * 65536) / height;
 	for (y = 0; y < height; y++) {
 		const uint16_t *input_row = (const uint16_t *)(
 			(const uint8_t *)input + (size_t)y * input_stride_bytes);
@@ -356,7 +403,7 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 		int64_t source_x_q16 = source_x_start_q16;
 
 		fieldscale_interpolation_from_q16(source_y_q16,
-			AGC_FIELDSCALE_GRID_HEIGHT, &y0, &y1, &fy);
+			params->grid_size, &y0, &y1, &fy);
 		for (x = 0; x < width; x++) {
 			uint32_t x0;
 			uint32_t x1;
@@ -372,7 +419,7 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 			uint32_t value_q8;
 
 			fieldscale_interpolation_from_q16(source_x_q16,
-				AGC_FIELDSCALE_GRID_WIDTH, &x0, &x1, &fx);
+				params->grid_size, &x0, &x1, &fx);
 			min_top = fieldscale_lerp_q16(
 				min_grid[fieldscale_grid_index(x0, y0)],
 				min_grid[fieldscale_grid_index(x1, y0)], fx);
@@ -509,8 +556,14 @@ int agc_fieldscale_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("selected runtime AGC: %s\n",
 		       agc_mode_name(agc_mode_get()));
-		printf("core: 8x8 local Min/Max fields, 7 message passes\n");
-		printf("video temporal smoothing: current 10%%, previous 90%%\n");
+        {
+            AGC_FIELDSCALE_PARAMS p;
+            agc_fieldscale_get_params(&p);
+            printf("core: %ux%u, LES distance %u, threshold %u RAW14 DN\n",
+                   p.grid_size, p.grid_size, p.les_distance, p.les_threshold);
+            printf("message distance %u, passes %u; temporal previous %u%%\n",
+                   p.message_distance, p.message_iterations, p.temporal_previous_percent);
+        }
 		printf("output: local stretch -> RAW14 0..16383\n");
 		printf("Gamma/CLAHE: not included in this firmware stage\n");
 		printf("latency test: %s (%" PRIu32 "/%u frames)\n",
@@ -530,7 +583,10 @@ int agc_fieldscale_menu_run(void)
 				break;
 			}
 			if (!agc_fieldscale_is_enabled()) {
-				agc_fieldscale_set_enabled(1);
+				if (agc_mode_request(AGC_MODE_FIELDSCALE_CPU) != 0) {
+                    printf("Select Fieldscale in CFG and restart Liveview before testing\n");
+                    break;
+                }
 				printf("Fieldscale AGC selected for runtime latency test "
 				       "(CFG is unchanged)\n");
 			}

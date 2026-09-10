@@ -11,7 +11,7 @@
 #include "../Config/app_config.h"
 #include "../Device/FOS/fos.h"
 #include "../Enhancement/AGC/agc_mode.h"
-#include "../Enhancement/ISP/videoproc_isp.h"
+#include "../ISP/menu.h"
 #include "../Diagnostics/diagnostics_menu.h"
 #include "../app.h"
 #include "liveview.h"
@@ -68,7 +68,7 @@ int menu_run(void)
 		printf(" 6. TDC\n");
 		printf(" 7. AGC\n");
 		printf(" 8. FOS\n");
-		printf(" 9. VideoProc / ISP\n");
+		printf(" 9. ISP\n");
 		printf("10. Image Pipeline Diagnostics\n");
 		printf(" q. Quit\n");
 		printf("----------------------------------------\n");
@@ -108,7 +108,7 @@ int menu_run(void)
 			break;
 
 		case 9:
-			ret = videoproc_isp_menu_run();
+			ret = isp_menu_run();
 			break;
 
 		case 10:

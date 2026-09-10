@@ -10,6 +10,7 @@ HDAL_LIB_PATH = $(NVT_HDAL_DIR)/output
 VOS_LIB_PATH = $(NVT_VOS_DIR)/output
 # INC FLAGs
 EXTRA_INCLUDE += \
+	-I$(NVT_HDAL_DIR)/vendor/cv/include \
 	-I$(HDAL_INC_PATH) \
 	-I$(VOS_INC_PATH) \
 	-I$(NVT_VOS_DIR)/include \
@@ -28,6 +29,7 @@ EXTRA_LDFLAGS = \
 	-L$(HDAL_LIB_PATH) -lhdal -lm -lpthread \
 	-L$(NVT_HDAL_DIR)/vendor/output -lvendor_media -lvendor_isp \
 	-L$(NVT_HDAL_DIR)/vendor/output -lprebuilt_isp \
+	-L$(NVT_HDAL_DIR)/vendor/output -lvendor_cv -lprebuilt_cv \
 	-L$(VOS_LIB_PATH) -lvos \
 	-L$(LIBRARY_DIR)/output \
 	-L$(NVT_DRIVER_DIR)/output \
@@ -46,6 +48,8 @@ SRC += \
 	Config/app_config.c \
 	Config/hardware_config.c \
 	Pipeline/liveview.c \
+	ISP/Pseudo/pseudo.c \
+	ISP/VPE/vpe_mirror.c \
 	Pipeline/Output/video_output.c \
 	Pipeline/UVC/uvc_output.c \
 	Pipeline/RTSP/rtsp_output.c \
@@ -57,8 +61,11 @@ SRC += \
 	Enhancement/AGC/agc_fieldscale.c \
 	Enhancement/AGC/agc_histogram_p1_p99.c \
 	Enhancement/AGC/agc_min_max_tone_curve.c \
+	Enhancement/CLAHE/clahe.c \
+	Enhancement/CLAHE/clahe_frame.c \
 	Enhancement/Gamma/gamma.c \
-	Enhancement/ISP/videoproc_isp.c \
+	ISP/menu.c \
+	ISP/videoproc/videoproc_isp.c \
 	Diagnostics/diagnostics_menu.c \
 	Diagnostics/ISP/isp_ob_runtime_diagnostic.c \
 	Diagnostics/ISP/isp_raw_to_y_step_diagnostic.c \

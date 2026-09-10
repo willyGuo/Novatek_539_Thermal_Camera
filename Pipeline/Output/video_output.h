@@ -31,6 +31,8 @@ HD_RESULT video_output_open(VIDEO_OUTPUT *output, VIDEO_OUTPUT_MODE mode,
 HD_RESULT video_output_start(VIDEO_OUTPUT *output);
 HD_RESULT video_output_stop(VIDEO_OUTPUT *output);
 HD_RESULT video_output_close(VIDEO_OUTPUT *output);
+HD_RESULT video_output_push_frame(VIDEO_OUTPUT *output,
+	HD_VIDEO_FRAME *frame);
 HD_RESULT video_output_request_encoded_snapshot(VIDEO_OUTPUT *output,
 	const char *file_path);
 

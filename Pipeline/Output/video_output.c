@@ -127,6 +127,29 @@ HD_RESULT video_output_close(VIDEO_OUTPUT *output)
 	return ret;
 }
 
+HD_RESULT video_output_push_frame(VIDEO_OUTPUT *output,
+	HD_VIDEO_FRAME *frame)
+{
+	HD_PATH_ID enc_path;
+
+	if (output == NULL || frame == NULL || !output->opened) {
+		return HD_ERR_NG;
+	}
+
+	switch (output->mode) {
+	case VIDEO_OUTPUT_MODE_UVC:
+		enc_path = output->backend.uvc.enc_path;
+		break;
+	case VIDEO_OUTPUT_MODE_RTSP:
+		enc_path = output->backend.rtsp.enc_path;
+		break;
+	default:
+		return HD_ERR_NG;
+	}
+
+	return hd_videoenc_push_in_buf(enc_path, frame, NULL, 100);
+}
+
 HD_RESULT video_output_request_encoded_snapshot(VIDEO_OUTPUT *output,
 	const char *file_path)
 {

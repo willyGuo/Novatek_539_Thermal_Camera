@@ -8,6 +8,8 @@ int liveview_restart(void);
 int liveview_is_running(void);
 int liveview_get_result(void);
 int liveview_get_shutter_fault(void);
+void liveview_set_mirror(int enabled);
+int liveview_get_mirror(void);
 int liveview_set_fps(unsigned int fps);
 unsigned int liveview_get_fps(void);
 int liveview_set_output_mode(unsigned int mode);

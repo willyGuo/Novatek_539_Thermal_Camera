@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #include "agc_fieldscale.h"
 #include "agc_histogram_p1_p99.h"
@@ -11,6 +12,43 @@
 #define MENU_OPTION_REFRESH (-2)
 
 static AGC_MODE g_agc_mode = AGC_MODE_OFF;
+static AGC_MODE g_session_mode = AGC_MODE_OFF;
+static int g_requested_mode = -1;
+static pthread_mutex_t g_mode_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void agc_mode_begin_session(void)
+{
+    pthread_mutex_lock(&g_mode_lock);
+    g_session_mode = g_agc_mode;
+    g_requested_mode = -1;
+    pthread_mutex_unlock(&g_mode_lock);
+}
+
+/* A different algorithm is saved for restart, not switched live. */
+int agc_mode_request(AGC_MODE mode)
+{
+    int ret = 0;
+    pthread_mutex_lock(&g_mode_lock);
+    if (mode != AGC_MODE_OFF && mode != g_session_mode) {
+        g_requested_mode = -1;
+        ret = 1;
+    } else {
+        g_requested_mode = (int)mode;
+    }
+    pthread_mutex_unlock(&g_mode_lock);
+    return ret;
+}
+
+int agc_mode_take_request(void)
+{
+    int mode;
+    pthread_mutex_lock(&g_mode_lock);
+    mode = g_requested_mode;
+    g_requested_mode = -1;
+    pthread_mutex_unlock(&g_mode_lock);
+    return mode;
+}
+
 
 int agc_mode_set(AGC_MODE mode)
 {
@@ -21,13 +59,19 @@ int agc_mode_set(AGC_MODE mode)
 		return -1;
 	}
 
+	pthread_mutex_lock(&g_mode_lock);
 	g_agc_mode = mode;
+	pthread_mutex_unlock(&g_mode_lock);
 	return 0;
 }
 
 AGC_MODE agc_mode_get(void)
 {
-	return g_agc_mode;
+	AGC_MODE mode;
+	pthread_mutex_lock(&g_mode_lock);
+	mode = g_agc_mode;
+	pthread_mutex_unlock(&g_mode_lock);
+	return mode;
 }
 
 const char *agc_mode_name(AGC_MODE mode)
@@ -111,8 +155,8 @@ int agc_menu_run(void)
 			break;
 
 		case 4:
-			agc_mode_set(AGC_MODE_OFF);
-			printf("All runtime AGC modes disabled\n");
+			agc_mode_request(AGC_MODE_OFF);
+			printf("AGC off requested for next RAW frame\n");
 			printf("Saved CFG is unchanged; a Liveview restart may restore it\n");
 			break;
 

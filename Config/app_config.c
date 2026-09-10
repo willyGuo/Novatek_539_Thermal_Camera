@@ -1,6 +1,8 @@
 #include "app_config.h"
+#include "../Enhancement/CLAHE/clahe.h"
 
 #include <errno.h>
+#include <stddef.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,8 +23,10 @@
 #include "../Enhancement/AGC/agc_histogram_p1_p99.h"
 #include "../Enhancement/AGC/agc_min_max_tone_curve.h"
 #include "../Enhancement/AGC/agc_mode.h"
-#include "../Enhancement/ISP/videoproc_isp.h"
+#include "../ISP/videoproc/videoproc_isp.h"
+#include "../ISP/menu.h"
 #include "../Pipeline/liveview.h"
+#include "../ISP/Pseudo/pseudo.h"
 
 #define APP_CONFIG_DIR "/mnt/sd"
 #define APP_CONFIG_PATH "/mnt/sd/tiffany_thermal.cfg"
@@ -35,6 +39,8 @@ typedef struct {
 	int boot_load;
 	unsigned int fps;
 	unsigned int output_mode;
+	int liveview_mirror;
+	int pseudo_color_mode;
 	unsigned int startup_skip_frames;
 	unsigned int runtime_skip_frames;
 	int nuc_correction;
@@ -52,6 +58,8 @@ typedef struct {
 	int agc_histogram_p1_p99_enable;
 	int agc_min_max_tone_curve_enable;
 	int agc_fieldscale_enable;
+	AGC_FIELDSCALE_PARAMS fieldscale;
+	CLAHE_PARAMS clahe;
 	int videoproc_af_enable;
 	int videoproc_wdr_enable;
 	int videoproc_defog_enable;
@@ -59,6 +67,38 @@ typedef struct {
 } APP_CONFIG_VALUES;
 
 static APP_CONFIG_VALUES g_app_config;
+
+typedef struct {
+    const char *key;
+    const char *label;
+    size_t offset;
+    int minimum;
+    int maximum;
+} FIELDSCALE_CFG_ITEM;
+
+static const FIELDSCALE_CFG_ITEM fieldscale_items[] = {
+    {"agc_fieldscale_grid_size", "Grid size (2/4/8/16/32 per axis)", offsetof(AGC_FIELDSCALE_PARAMS, grid_size), 2, 32},
+    {"agc_fieldscale_les_distance", "LES Distance (grid cells)", offsetof(AGC_FIELDSCALE_PARAMS, les_distance), 1, 31},
+    {"agc_fieldscale_les_threshold", "LES Threshold TLES (RAW14 DN)", offsetof(AGC_FIELDSCALE_PARAMS, les_threshold), 0, 16383},
+    {"agc_fieldscale_message_distance", "Message Passing Distance (grid cells)", offsetof(AGC_FIELDSCALE_PARAMS, message_distance), 1, 31},
+    {"agc_fieldscale_message_iterations", "Message Passing iterations N (0: bypass)", offsetof(AGC_FIELDSCALE_PARAMS, message_iterations), 0, 32},
+    {"agc_fieldscale_temporal_previous_percent", "Temporal Smoothing (previous %, 0: off)", offsetof(AGC_FIELDSCALE_PARAMS, temporal_previous_percent), 0, 99}
+};
+#define FIELDSCALE_CFG_COUNT (sizeof(fieldscale_items) / sizeof(fieldscale_items[0]))
+
+static int cfg_fieldscale_index(const char *key)
+{
+    unsigned int i;
+    for (i = 0; i < FIELDSCALE_CFG_COUNT; i++) {
+        if (strcmp(key, fieldscale_items[i].key) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static uint32_t *cfg_fieldscale_value(AGC_FIELDSCALE_PARAMS *p, unsigned int i)
+{
+    return (uint32_t *)((unsigned char *)p + fieldscale_items[i].offset);
+}
 
 static int app_config_read_option(void)
 {
@@ -133,8 +173,11 @@ static void cfg_initialize_from_runtime(void)
 
 	memset(&g_app_config, 0, sizeof(g_app_config));
 	g_app_config.boot_load = 1;
+	clahe_get_params(&g_app_config.clahe);
 	g_app_config.fps = liveview_get_fps();
 	g_app_config.output_mode = liveview_get_output_mode();
+	g_app_config.liveview_mirror = liveview_get_mirror();
+	g_app_config.pseudo_color_mode = pseudo_get_mode();
 	g_app_config.startup_skip_frames =
 		liveview_get_startup_skip_frames();
 	g_app_config.runtime_skip_frames =
@@ -163,6 +206,7 @@ static void cfg_initialize_from_runtime(void)
 	g_app_config.agc_min_max_tone_curve_enable =
 		agc_min_max_tone_curve_is_enabled();
 	g_app_config.agc_fieldscale_enable = agc_fieldscale_is_enabled();
+	agc_fieldscale_get_params(&g_app_config.fieldscale);
 	g_app_config.videoproc_af_enable = videoproc_isp_is_af_enabled();
 	g_app_config.videoproc_wdr_enable = videoproc_isp_is_wdr_enabled();
 	g_app_config.videoproc_defog_enable = videoproc_isp_is_defog_enabled();
@@ -217,6 +261,18 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 {
 	long int_value;
 	float float_value;
+    int fieldscale_index = cfg_fieldscale_index(key);
+
+    if (fieldscale_index >= 0) {
+        AGC_FIELDSCALE_PARAMS params = config->fieldscale;
+        const FIELDSCALE_CFG_ITEM *item = &fieldscale_items[fieldscale_index];
+        if (cfg_parse_long(value, &int_value) != 0 ||
+            int_value < item->minimum || int_value > item->maximum) return -1;
+        *cfg_fieldscale_value(&params, (unsigned int)fieldscale_index) = (uint32_t)int_value;
+        if (agc_fieldscale_validate_params(&params) != 0) return -1;
+        config->fieldscale = params;
+        return 0;
+    }
 
 	if (strcmp(key, "cfg_boot_load") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
@@ -228,6 +284,23 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 		if (cfg_parse_long(value, &int_value) != 0 ||
 		    (int_value != 0 && int_value != 1)) return -1;
 		config->output_mode = (unsigned int)int_value;
+	} else if (strcmp(key, "liveview_mirror") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0 ||
+		    (int_value != 0 && int_value != 1)) return -1;
+		config->liveview_mirror = (int)int_value;
+	} else if (strcmp(key, "clahe_enable") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || (int_value != 0 && int_value != 1)) return -1;
+        config->clahe.enable = (int)int_value;
+    } else if (strcmp(key, "clahe_tile_size") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 ||
+            (int_value != 8 && int_value != 16 && int_value != 32)) return -1;
+        config->clahe.tile_size = (int)int_value;
+    } else if (strcmp(key, "clahe_clip_limit") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || int_value < 4 || int_value > 128) return -1;
+        config->clahe.clip_limit = (int)int_value;
+	} else if (strcmp(key, "pseudo_color_mode") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0 || int_value < 0 || int_value > 3) return -1;
+		config->pseudo_color_mode = (int)int_value;
 	} else if (strcmp(key, "startup_skip_frames") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0 || int_value < 0) return -1;
 		config->startup_skip_frames = (unsigned int)int_value;
@@ -339,12 +412,16 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	unsigned int point;
 	int apply_result = 0;
 
+	if (agc_fieldscale_set_params(&config->fieldscale) != 0) return -1;
+
 	if (liveview_set_fps(config->fps) != 0) {
 		apply_result = -1;
 	}
 	if (liveview_set_output_mode(config->output_mode) != 0) {
 		apply_result = -1;
 	}
+	liveview_set_mirror(config->liveview_mirror);
+	if (pseudo_set_mode(config->pseudo_color_mode) != 0) apply_result = -1;
 	liveview_set_startup_skip_frames(config->startup_skip_frames);
 	liveview_set_runtime_skip_frames(config->runtime_skip_frames);
 
@@ -383,6 +460,7 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	} else {
 		agc_mode_set(AGC_MODE_OFF);
 	}
+	if (clahe_set_params(&config->clahe) != 0) apply_result = -1;
 	videoproc_isp_set_runtime(config->videoproc_af_enable,
 				  config->videoproc_wdr_enable,
 				  config->videoproc_defog_enable,
@@ -466,12 +544,29 @@ int app_config_get_int(const char *key, int *value)
 	}
 
 	cfg_initialize_from_runtime();
+    {
+        int i = cfg_fieldscale_index(key);
+        if (i >= 0) {
+            *value = (int)*cfg_fieldscale_value(&g_app_config.fieldscale, (unsigned int)i);
+            return 0;
+        }
+    }
 	if (strcmp(key, "cfg_boot_load") == 0) {
 		*value = g_app_config.boot_load;
 	} else if (strcmp(key, "fps") == 0) {
 		*value = (int)g_app_config.fps;
 	} else if (strcmp(key, "output_mode") == 0) {
 		*value = (int)g_app_config.output_mode;
+	} else if (strcmp(key, "liveview_mirror") == 0) {
+		*value = g_app_config.liveview_mirror;
+	} else if (strcmp(key, "clahe_enable") == 0) {
+        *value = g_app_config.clahe.enable;
+    } else if (strcmp(key, "clahe_tile_size") == 0) {
+        *value = g_app_config.clahe.tile_size;
+    } else if (strcmp(key, "clahe_clip_limit") == 0) {
+        *value = g_app_config.clahe.clip_limit;
+	} else if (strcmp(key, "pseudo_color_mode") == 0) {
+		*value = g_app_config.pseudo_color_mode;
 	} else if (strcmp(key, "startup_skip_frames") == 0) {
 		*value = (int)g_app_config.startup_skip_frames;
 	} else if (strcmp(key, "runtime_skip_frames") == 0) {
@@ -518,6 +613,18 @@ int app_config_get_int(const char *key, int *value)
 	return 0;
 }
 
+static void app_config_request_agc(void)
+{
+    AGC_MODE mode = AGC_MODE_OFF;
+    if (g_app_config.agc_histogram_p1_p99_enable) mode = AGC_MODE_HISTOGRAM_P1_P99_CPU;
+    else if (g_app_config.agc_min_max_tone_curve_enable) mode = AGC_MODE_MIN_MAX_TONE_CURVE_ISP;
+    else if (g_app_config.agc_fieldscale_enable) mode = AGC_MODE_FIELDSCALE_CPU;
+    if (agc_mode_request(mode) == 0)
+        printf("AGC saved; on/off applies on next RAW frame\n");
+    else
+        printf("AGC saved; selecting a different algorithm requires Liveview Restart\n");
+}
+
 int app_config_update_int(const char *key, int value)
 {
 	char value_text[32];
@@ -542,7 +649,26 @@ int app_config_update_int(const char *key, int value)
 		return -1;
 	}
 
-	app_config_print_restart_required();
+    if (strcmp(key, "clahe_enable") == 0 || strcmp(key, "clahe_tile_size") == 0 ||
+        strcmp(key, "clahe_clip_limit") == 0) {
+        ret = clahe_set_params(&g_app_config.clahe);
+        if (ret != 0) return ret;
+        printf("CLAHE saved; applies on next display frame (no restart)\n");
+    } else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0 ||
+        strcmp(key, "agc_min_max_tone_curve_enable") == 0 ||
+        strcmp(key, "agc_fieldscale_enable") == 0) {
+        app_config_request_agc();
+    } else if (strcmp(key, "pseudo_color_mode") == 0) {
+        ret = pseudo_request_mode(g_app_config.pseudo_color_mode);
+        if (ret != 0) return ret;
+        printf("Pseudo color saved; applies on next display frame (no restart)\n");
+    } else if (cfg_fieldscale_index(key) >= 0) {
+        ret = agc_fieldscale_set_params(&g_app_config.fieldscale);
+        if (ret != 0) return ret;
+        printf("Fieldscale parameters saved and applied; next Fieldscale frame uses new values (no restart)\n");
+    } else {
+        app_config_print_restart_required();
+    }
 	return 0;
 }
 
@@ -624,6 +750,12 @@ static int app_config_show_file(void)
 	printf("  4. %-31s = %u frames\n", "runtime_skip_frames",
 	       g_app_config.runtime_skip_frames);
 
+	printf("  5. %-31s = %d (%s)\n", "liveview_mirror",
+	       g_app_config.liveview_mirror,
+	       g_app_config.liveview_mirror ? "on" : "off");
+
+	printf("  6. %-31s = %d (%s)\n", "pseudo_color_mode",
+	       g_app_config.pseudo_color_mode, pseudo_mode_name(g_app_config.pseudo_color_mode));
 	printf("\n[BPR]\n");
 	printf("  1. %-31s = %d (%s)\n", "bpr_correction",
 	       g_app_config.bpr_correction,
@@ -665,21 +797,42 @@ static int app_config_show_file(void)
 	printf("  2. %-31s = %u sec\n", "tdc_interval_sec",
 	       g_app_config.tdc_interval_sec);
 
-	printf("\n[AGC - mutually exclusive]\n");
+	printf("\n[AGC]\n");
 	printf("  1. %-31s = %d (%s)\n",
 	       "agc_histogram_p1_p99_enable",
 	       g_app_config.agc_histogram_p1_p99_enable,
 	       g_app_config.agc_histogram_p1_p99_enable ? "on" : "off");
+
 	printf("  2. %-31s = %d (%s)\n",
 	       "agc_min_max_tone_curve_enable",
 	       g_app_config.agc_min_max_tone_curve_enable,
 	       g_app_config.agc_min_max_tone_curve_enable ? "on" : "off");
+
 	printf("  3. %-31s = %d (%s)\n",
 	       "agc_fieldscale_enable",
 	       g_app_config.agc_fieldscale_enable,
 	       g_app_config.agc_fieldscale_enable ? "on" : "off");
-	printf("     selected runtime AGC: %s\n",
+
+	for (point = 0; point < FIELDSCALE_CFG_COUNT; point++) {
+		printf("       * %-27s = %u\n",
+		       fieldscale_items[point].key,
+		       *cfg_fieldscale_value(&g_app_config.fieldscale, point));
+	}
+
+	printf("  4. %-31s = %s\n",
+	       "selected_runtime_agc",
 	       agc_mode_name(agc_mode_get()));
+
+	printf("\n[CLAHE]\n");
+	printf("  1. %-31s = %d (%s)\n", "clahe_enable",
+		g_app_config.clahe.enable,
+		g_app_config.clahe.enable ? "on" : "off");
+
+	printf("  2. %-31s = %u\n", "clahe_tile_size",
+		g_app_config.clahe.tile_size);
+
+	printf("  3. %-31s = %u\n", "clahe_clip_limit",
+		g_app_config.clahe.clip_limit);
 
 	printf("\n[VideoProc / ISP]\n");
 	printf("  1. %-31s = %d (%s)\n", "videoproc_af_enable",
@@ -783,6 +936,8 @@ static int app_config_liveview_menu_run(void)
 		printf(" 2. Startup skip frames\n");
 		printf(" 3. Runtime skip frames\n");
 		printf(" 4. Output mode (UVC / RTSP)\n");
+		printf(" 5. Horizontal mirror on/off\n");
+		printf(" 6. Pseudo color mode\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: output=%s, fps=%u, startup skip=%u, runtime skip=%u\n",
@@ -793,6 +948,12 @@ static int app_config_liveview_menu_run(void)
 		       app_config_output_mode_name(g_app_config.output_mode),
 		       g_app_config.fps, g_app_config.startup_skip_frames,
 		       g_app_config.runtime_skip_frames);
+		printf("Horizontal mirror: runtime=%s, pending CFG=%s\n",
+		       liveview_get_mirror() ? "on" : "off",
+		       g_app_config.liveview_mirror ? "on" : "off");
+		printf("Pseudo color: runtime=%s, pending CFG=%s\n",
+		       pseudo_mode_name(pseudo_get_mode()),
+		       pseudo_mode_name(g_app_config.pseudo_color_mode));
 
 		option = app_config_read_option();
 		switch (option) {
@@ -814,6 +975,15 @@ static int app_config_liveview_menu_run(void)
 			break;
 		case 4:
 			ret = app_config_prompt_output_mode();
+			break;
+		case 5:
+			ret = app_config_prompt_bool("Horizontal mirror",
+				"liveview_mirror", g_app_config.liveview_mirror);
+			break;
+		case 6:
+			printf("0: Black/White, 1: White/Black, 2: Color (Jet), 3: Iron\n");
+			ret = app_config_prompt_int("Pseudo color mode", "pseudo_color_mode",
+				g_app_config.pseudo_color_mode, 0, 3, "");
 			break;
 		case 0:
 		case -1:
@@ -1047,18 +1217,61 @@ static int app_config_tdc_menu_run(void)
 	return ret;
 }
 
+static int app_config_fieldscale_menu_run(void)
+{
+    int option;
+    int ret = 0;
+    unsigned int i;
+    while (1) {
+        AGC_FIELDSCALE_PARAMS runtime;
+        agc_fieldscale_get_params(&runtime);
+        printf("----------------------------------------\nFieldscale Local Adaptive AGC (CPU) setting\n");
+        printf(" 1. Fieldscale on/off: CFG=%s, runtime=%s\n",
+               g_app_config.agc_fieldscale_enable ? "on" : "off",
+               agc_fieldscale_is_enabled() ? "on" : "off");
+        for (i = 0; i < FIELDSCALE_CFG_COUNT; i++) {
+            printf(" %u. %s: CFG=%u, runtime=%u\n", i + 2,
+                   fieldscale_items[i].label,
+                   *cfg_fieldscale_value(&g_app_config.fieldscale, i),
+                   *cfg_fieldscale_value(&runtime, i));
+        }
+        printf(" 0. Back\nParameter changes apply on the next Fieldscale frame; no restart.\n");
+        printf("Current AGC on/off applies on next RAW frame; changing algorithm requires Restart.\n");
+        printf("Distances are clipped at grid boundaries. Parameter changes reset temporal history.\n");
+        printf("Fieldscale runtime: %s\n", agc_fieldscale_is_enabled() ? "on" : "off");
+        option = app_config_read_option();
+        if (option == 0 || option == -1) return ret;
+        if (option == MENU_OPTION_REFRESH) continue;
+        if (option == 1) {
+            ret = app_config_prompt_bool("Fieldscale Local Adaptive AGC (CPU)",
+                "agc_fieldscale_enable", g_app_config.agc_fieldscale_enable);
+            continue;
+        }
+        if (option < 2 || option > (int)FIELDSCALE_CFG_COUNT + 1) {
+            printf("Invalid option\n");
+            continue;
+        }
+        i = (unsigned int)option - 2U;
+        ret = app_config_prompt_int(fieldscale_items[i].label,
+            fieldscale_items[i].key,
+            (int)*cfg_fieldscale_value(&g_app_config.fieldscale, i),
+            fieldscale_items[i].minimum, fieldscale_items[i].maximum, "");
+    }
+}
+
 static int app_config_agc_menu_run(void)
 {
 	int option;
 	int running = 1;
 	int ret = 0;
+	APP_CONFIG_VALUES old_config;
 
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("AGC setting (mutually exclusive)\n");
 		printf(" 1. Histogram P1/P99 AGC (CPU) on/off\n");
 		printf(" 2. Min/Max Tone Curve AGC (ISP) on/off\n");
-		printf(" 3. Fieldscale Local Adaptive AGC (CPU) on/off\n");
+		printf(" 3. Fieldscale Local Adaptive AGC (CPU) setting\n");
 		printf(" 4. Disable all AGC\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
@@ -1070,6 +1283,7 @@ static int app_config_agc_menu_run(void)
 		       g_app_config.agc_min_max_tone_curve_enable ? "on" : "off",
 		       g_app_config.agc_fieldscale_enable ? "on" : "off");
 		printf("enabling one AGC automatically disables the other AGCs\n");
+		printf("Current AGC on/off: next RAW frame. Different algorithm: Restart.\n");
 		printf("pipeline: after RAW snapshot, before VideoProc\n");
 
 		option = app_config_read_option();
@@ -1087,19 +1301,18 @@ static int app_config_agc_menu_run(void)
 				g_app_config.agc_min_max_tone_curve_enable);
 			break;
 		case 3:
-			ret = app_config_prompt_bool(
-				"Fieldscale Local Adaptive AGC (CPU)",
-				"agc_fieldscale_enable",
-				g_app_config.agc_fieldscale_enable);
+			ret = app_config_fieldscale_menu_run();
 			break;
 		case 4:
+			old_config = g_app_config;
 			g_app_config.agc_histogram_p1_p99_enable = 0;
 			g_app_config.agc_min_max_tone_curve_enable = 0;
 			g_app_config.agc_fieldscale_enable = 0;
 			ret = app_config_save();
 			if (ret == 0) {
-				printf("All pending CFG AGC modes disabled\n");
-				app_config_print_restart_required();
+				app_config_request_agc();
+			} else {
+				g_app_config = old_config;
 			}
 			break;
 		case 0:
@@ -1117,6 +1330,38 @@ static int app_config_agc_menu_run(void)
 	return ret;
 }
 
+static int app_config_clahe_menu_run(void)
+{
+    int option, value, ret = 0;
+    for (;;) {
+        printf("----------------------------------------\nCLAHE setting (CPU, Y8)\n");
+        printf(" 1. On/off: %s\n 2. Tile Size: %dx%d pixels\n 3. Clip Limit: %d\n 0. Back\n",
+            g_app_config.clahe.enable ? "on" : "off", g_app_config.clahe.tile_size,
+            g_app_config.clahe.tile_size, g_app_config.clahe.clip_limit);
+        printf("Changes apply on next display frame; no restart.\n");
+        option = app_config_read_option();
+        switch (option) {
+        case 1:
+            ret = app_config_prompt_bool("CLAHE", "clahe_enable", g_app_config.clahe.enable);
+            break;
+        case 2:
+            printf("Tile Size: 1. 8x8  2. 16x16  3. 32x32  0. Back\n");
+            value = app_config_read_option();
+            if (value >= 1 && value <= 3)
+                ret = app_config_update_int("clahe_tile_size", 1 << (value + 2));
+            else if (value > 3) printf("Invalid option\n");
+            break;
+        case 3:
+            ret = app_config_prompt_int("Clip Limit (count per histogram bin)",
+                "clahe_clip_limit", g_app_config.clahe.clip_limit, 4, 128, "");
+            break;
+        case 0: case -1: return ret;
+        case MENU_OPTION_REFRESH: break;
+        default: printf("Invalid option\n"); break;
+        }
+    }
+}
+
 int app_config_menu_run(void)
 {
 	int option;
@@ -1129,14 +1374,15 @@ int app_config_menu_run(void)
 		printf("CFG Setting\n");
 		printf(" 1. Liveview setting\n");
 		printf(" 2. BPR setting\n");
-		printf(" 3. FFC setting / Shutter\n");
-		printf(" 4. NUC setting\n");
+		printf(" 3. NUC setting\n");
+		printf(" 4. FFC setting\n");
 		printf(" 5. TDC setting\n");
-		printf(" 6. AGC setting (mutually exclusive)\n");
-		printf(" 7. VideoProc / ISP setting\n");
-		printf(" 8. Show current tiffany_thermal.cfg\n");
-		printf(" 9. Generate tiffany_thermal.cfg\n");
-		printf("10. Use CFG on next boot/restart on/off\n");
+		printf(" 6. AGC setting\n");
+		printf(" 7. ISP setting\n");
+		printf(" 8. CLAHE setting\n");
+		printf(" 9. Show current tiffany_thermal.cfg\n");
+		printf("10. Generate tiffany_thermal.cfg\n");
+		printf("11. Use CFG on next boot/restart on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("pending CFG: boot load %s\n",
@@ -1151,10 +1397,10 @@ int app_config_menu_run(void)
 			ret = app_config_bpr_menu_run();
 			break;
 		case 3:
-			ret = app_config_shutter_ffc_menu_run();
+			ret = app_config_nuc_menu_run();
 			break;
 		case 4:
-			ret = app_config_nuc_menu_run();
+			ret = app_config_shutter_ffc_menu_run();
 			break;
 		case 5:
 			ret = app_config_tdc_menu_run();
@@ -1166,12 +1412,15 @@ int app_config_menu_run(void)
 			ret = videoproc_isp_menu_run();
 			break;
 		case 8:
-			ret = app_config_show_file();
+			ret = app_config_clahe_menu_run();
 			break;
 		case 9:
-			ret = app_config_save();
+			ret = app_config_show_file();
 			break;
 		case 10:
+			ret = app_config_save();
+			break;
+		case 11:
 			ret = app_config_prompt_bool(
 				"Use CFG on next boot/restart",
 				"cfg_boot_load",
@@ -1223,6 +1472,10 @@ int app_config_save(void)
 	fprintf(fp, "cfg_boot_load=%d\n", g_app_config.boot_load);
 	fprintf(fp, "fps=%u\n", g_app_config.fps);
 	fprintf(fp, "output_mode=%u\n", g_app_config.output_mode);
+	fprintf(fp, "liveview_mirror=%d\n", g_app_config.liveview_mirror);
+	fprintf(fp, "pseudo_color_mode=%d\n", g_app_config.pseudo_color_mode);
+	fprintf(fp, "clahe_enable=%d\nclahe_tile_size=%d\nclahe_clip_limit=%d\n",
+	    g_app_config.clahe.enable, g_app_config.clahe.tile_size, g_app_config.clahe.clip_limit);
 	fprintf(fp, "startup_skip_frames=%u\n",
 		g_app_config.startup_skip_frames);
 	fprintf(fp, "runtime_skip_frames=%u\n",
@@ -1255,6 +1508,10 @@ int app_config_save(void)
 		g_app_config.agc_min_max_tone_curve_enable);
 	fprintf(fp, "agc_fieldscale_enable=%d\n",
 		g_app_config.agc_fieldscale_enable);
+    for (point = 0; point < FIELDSCALE_CFG_COUNT; point++) {
+        fprintf(fp, "%s=%u\n", fieldscale_items[point].key,
+                *cfg_fieldscale_value(&g_app_config.fieldscale, point));
+    }
 	fprintf(fp, "videoproc_af_enable=%d\n",
 		g_app_config.videoproc_af_enable);
 	fprintf(fp, "videoproc_wdr_enable=%d\n",

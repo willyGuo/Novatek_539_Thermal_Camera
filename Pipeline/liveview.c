@@ -13,6 +13,9 @@
 */
 
 #include "liveview.h"
+#include "../Enhancement/CLAHE/clahe_frame.h"
+#include "../ISP/Pseudo/pseudo.h"
+#include "../ISP/VPE/vpe_mirror.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -25,6 +28,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #endif
 #include "hdal.h"
 #include "vendor_videocapture.h"
@@ -42,7 +46,7 @@
 #include "../Enhancement/AGC/agc_min_max_tone_curve.h"
 #include "../Enhancement/AGC/agc_mode.h"
 #include "../Enhancement/Gamma/gamma.h"
-#include "../Enhancement/ISP/videoproc_isp.h"
+#include "../ISP/videoproc/videoproc_isp.h"
 #include "../Diagnostics/ISP/isp_raw_to_y_step_diagnostic.h"
 #include "../Driver/GPIO/gpio_control.h"
 #include "Output/video_output.h"
@@ -157,6 +161,7 @@
 
 static UINT32 g_fps = 30;
 static VIDEO_OUTPUT_MODE g_output_mode = VIDEO_OUTPUT_MODE_UVC;
+static int g_liveview_mirror = 1;
 
 static UINT32 g_startup_skip_frames = DEFAULT_STARTUP_SKIP_FRAMES;
 /* VCAP frames dropped after each frame successfully submitted to VideoProc. */
@@ -422,7 +427,7 @@ static HD_RESULT mem_init(void)
 	id++;
 	mem_cfg.pool_info[id].type = HD_COMMON_MEM_COMMON_POOL;
 	mem_cfg.pool_info[id].blk_size = DBGINFO_BUFSIZE()+VDO_YUV_BUFSIZE(VIDEO_OUTPUT_WIDTH, VIDEO_OUTPUT_HEIGHT, HD_VIDEO_PXLFMT_YUV420);
-	mem_cfg.pool_info[id].blk_cnt = 4;
+	mem_cfg.pool_info[id].blk_cnt = 7; /* Includes VPE output/encoder-held buffers. */
 	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
 
 	// TDC common pool (main)
@@ -432,6 +437,17 @@ static HD_RESULT mem_init(void)
 	mem_cfg.pool_info[id].blk_cnt = 4; // 需要分配給 DCC_K, LC_K, ADD_output, all_1:  4 個 Block
 	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
 
+	/* IVE pseudo color: 256-byte Y LUT and tightly packed Y output. */
+	id++;
+	mem_cfg.pool_info[id].type = HD_COMMON_MEM_COMMON_POOL;
+	mem_cfg.pool_info[id].blk_size = 256;
+	mem_cfg.pool_info[id].blk_cnt = 1;
+	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
+	id++;
+	mem_cfg.pool_info[id].type = HD_COMMON_MEM_COMMON_POOL;
+	mem_cfg.pool_info[id].blk_size = RAW_ACTIVE_W * RAW_ACTIVE_H;
+	mem_cfg.pool_info[id].blk_cnt = 1;
+	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
 	ret = hd_common_mem_init(&mem_cfg);
 	return ret;
 }
@@ -631,6 +647,34 @@ static HD_RESULT set_proc_param(HD_PATH_ID video_proc_path, HD_DIM* p_dim,
 	return ret;
 }
 
+/* Shared VideoProc input: applies to all outputs, after RAW capture/correction. */
+static HD_RESULT liveview_set_proc_input_direction(HD_PATH_ID path)
+{
+	HD_VIDEOPROC_IN input = {0};
+	HD_RESULT ret;
+
+	/* Preserve the configured/automatic input format, dimensions and frame rate. */
+	ret = hd_videoproc_get(path, HD_VIDEOPROC_PARAM_IN, &input);
+	if (ret != HD_OK) {
+		printf("VideoProc input direction get failed: path=0x%x, error=%d\n",
+		       (unsigned int)path, ret);
+		return ret;
+	}
+	input.dir = HD_VIDEO_DIR_NONE; /* Mirror is applied by the separate YUV VPE. */
+	ret = hd_videoproc_set(path, HD_VIDEOPROC_PARAM_IN, &input);
+	if (ret != HD_OK) {
+		printf("VideoProc input direction set failed: path=0x%x, dir=0x%x, error=%d\n",
+		       (unsigned int)path, (unsigned int)input.dir, ret);
+		return ret;
+	}
+	printf("RAWALL input direction=0x%x; display VPE mirror=%s\n",
+	       (unsigned int)input.dir, g_liveview_mirror ? "on" : "off");
+	return HD_OK;
+}
+
+static IQT_TONE_PARAM g_agc_baseline_tone;
+static int g_agc_baseline_valid;
+
 static HD_RESULT liveview_bypass_isp_tone_for_cpu_agc(void)
 {
 	IQT_TONE_PARAM tone = {0};
@@ -709,6 +753,8 @@ typedef struct _VIDEO_LIVEVIEW {
 	HD_PATH_ID proc_path;
 	HD_PATH_ID proc_path_3dnr;
 	HD_PATH_ID proc_path_diag;
+	HD_VIDEO_FRAME vpe_held_input;
+	int vpe_input_held;
 
 	// (3) Selected UVC MJPEG or RTSP H.265 output
 	VIDEO_OUTPUT video_output;
@@ -776,6 +822,7 @@ typedef struct {
 	int module_open_attempted;
 	int cap_thread_created;
 	int proc_thread_created;
+	int pseudo_started;
 	int snapshot_writer_started;
 	int proc_bound;
 	int cap_started;
@@ -799,6 +846,16 @@ typedef struct {
 	int pending;
 	int busy;
 } SNAPSHOT_WRITER;
+
+/* Protected by g_snapshot_writer.lock; job owns input_buffer until written. */
+static struct {
+	int active, job, type;
+	UINT64 started_ms;
+	unsigned long long target_frames;
+	unsigned long long saved, skipped, sequence;
+	char directory[192], path[320];
+	const char *reason;
+} g_raw_recording;
 
 static LIVEVIEW_CONTEXT g_liveview;
 static UINT32 g_snapshot_count = 0;
@@ -1280,8 +1337,8 @@ static int copy_active_raw_frame(const HD_VIDEO_FRAME *p_video_frame,
 	return 0;
 }
 
-static int save_raw_buffer(const unsigned char *raw_buffer,
-	size_t raw_size, const char *file_path)
+static int save_raw_buffer_internal(const unsigned char *raw_buffer,
+	size_t raw_size, const char *file_path, int quiet)
 {
 	FILE *fp = NULL;
 	size_t write_size;
@@ -1325,7 +1382,7 @@ static int save_raw_buffer(const unsigned char *raw_buffer,
 	}
 	/* Avoid closing the stream again in the common cleanup path. */
 	fp = NULL;
-	printf("snapshot saved: %s (%ux%u, 16-bit container)\n",
+	if (!quiet) printf("snapshot saved: %s (%ux%u, 16-bit container)\n",
 	       file_path, RAW_ACTIVE_W, RAW_ACTIVE_H);
 	ret = 0;
 
@@ -1871,6 +1928,12 @@ static int display_diag_get_next_id(UINT32 *p_diag_id)
 	return 0;
 }
 
+static int save_raw_buffer(const unsigned char *raw_buffer,
+	size_t raw_size, const char *file_path)
+{
+	return save_raw_buffer_internal(raw_buffer, raw_size, file_path, 0);
+}
+
 static int snapshot_write_job(UINT32 snapshot_id, int final_is_input,
 			      int has_agc_output)
 {
@@ -1916,20 +1979,94 @@ static int snapshot_write_job(UINT32 snapshot_id, int final_is_input,
 	return ret;
 }
 
+static void raw_recording_stop_locked(const char *reason)
+{
+	if (g_raw_recording.active) {
+		g_raw_recording.active = 0;
+		g_raw_recording.reason = reason;
+		printf("RAW recording stopped: %s; saved=%llu, skipped=%llu%s\n",
+			reason, g_raw_recording.saved, g_raw_recording.skipped,
+			g_raw_recording.job ? "; finishing current file" : "");
+	}
+}
+
+static void raw_recording_check_limit_locked(void)
+{
+	if (g_raw_recording.active && g_raw_recording.saved >= g_raw_recording.target_frames)
+		raw_recording_stop_locked("requested image count reached");
+}
+
+static int raw_recording_has_space(const char *path)
+{
+#if defined(__LINUX)
+	struct statvfs info;
+	if (statvfs(path, &info) != 0) return 0;
+	return (unsigned long long)info.f_bavail * info.f_frsize >=
+		256ULL * 1024 * 1024 + SNAPSHOT_FRAME_BYTES;
+#else
+	(void)path;
+	return 0;
+#endif
+}
+
+/* VCAP owner only, before releasing any source buffer. No disk I/O here. */
+static void raw_recording_queue(HD_VIDEO_FRAME *input,
+	HD_VIDEO_FRAME *corrected, HD_VIDEO_FRAME *agc)
+{
+	HD_VIDEO_FRAME *selected;
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	raw_recording_check_limit_locked();
+	if (!g_raw_recording.active) goto done;
+	if (g_snapshot_writer.busy) {
+		g_raw_recording.skipped++;
+		goto done;
+	}
+	selected = g_raw_recording.type == 0 ? input :
+		(g_raw_recording.type == 1 ? corrected : agc);
+	if (selected == NULL) {
+		raw_recording_stop_locked("selected RAW output unavailable");
+		goto done;
+	}
+	g_snapshot_writer.busy = 1;
+	if (copy_active_raw_frame(selected, g_snapshot_writer.input_buffer,
+				SNAPSHOT_FRAME_BYTES) != 0) {
+		g_snapshot_writer.busy = 0;
+		raw_recording_stop_locked("RAW copy failed");
+		goto done;
+	}
+	raw_recording_check_limit_locked();
+	if (!g_raw_recording.active) {
+		g_snapshot_writer.busy = 0;
+		goto done;
+	}
+	snprintf(g_raw_recording.path, sizeof(g_raw_recording.path),
+		"%s/frame_%06llu_t%llums_%s_raw16_%ux%u.raw",
+		g_raw_recording.directory, g_raw_recording.sequence++,
+		(unsigned long long)(liveview_get_time_ms() - g_raw_recording.started_ms),
+		g_raw_recording.type == 0 ? "original" :
+			(g_raw_recording.type == 1 ? "corrected" : "agc_output"),
+		RAW_ACTIVE_W, RAW_ACTIVE_H);
+	g_raw_recording.job = 1;
+	g_snapshot_writer.pending = 1;
+	pthread_cond_signal(&g_snapshot_writer.cond);
+done:
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+}
+
 static void *snapshot_writer_thread(void *arg)
 {
 	UINT32 snapshot_id;
 	int final_is_input;
 	int has_agc_output;
 	int write_ret;
+	int recording_job;
 
 	(void)arg;
 	for (;;) {
 		pthread_mutex_lock(&g_snapshot_writer.lock);
 		while (!g_snapshot_writer.pending &&
 		       !g_snapshot_writer.exit_requested) {
-			pthread_cond_wait(&g_snapshot_writer.cond,
-					  &g_snapshot_writer.lock);
+			pthread_cond_wait(&g_snapshot_writer.cond, &g_snapshot_writer.lock);
 		}
 		if (!g_snapshot_writer.pending &&
 		    g_snapshot_writer.exit_requested) {
@@ -1937,18 +2074,35 @@ static void *snapshot_writer_thread(void *arg)
 			break;
 		}
 
+		recording_job = g_raw_recording.job;
 		snapshot_id = g_snapshot_writer.snapshot_id;
 		final_is_input = g_snapshot_writer.final_is_input;
 		has_agc_output = g_snapshot_writer.has_agc_output;
 		g_snapshot_writer.pending = 0;
 		pthread_mutex_unlock(&g_snapshot_writer.lock);
 
-		write_ret = snapshot_write_job(snapshot_id, final_is_input,
-					       has_agc_output);
-		printf("Snapshot %04u background save %s\n",
-		       snapshot_id, write_ret == 0 ? "done" : "failed");
+		if (recording_job) {
+			write_ret = raw_recording_has_space(g_raw_recording.directory) ?
+				save_raw_buffer_internal(g_snapshot_writer.input_buffer, SNAPSHOT_FRAME_BYTES,
+					g_raw_recording.path, 1) : -1;
+			if (write_ret != 0) remove(g_raw_recording.path);
+		} else {
+			write_ret = snapshot_write_job(snapshot_id, final_is_input,
+						       has_agc_output);
+			printf("Snapshot %04u background save %s\n",
+			       snapshot_id, write_ret == 0 ? "done" : "failed");
+		}
 
 		pthread_mutex_lock(&g_snapshot_writer.lock);
+		if (recording_job) {
+			g_raw_recording.job = 0;
+			if (write_ret == 0) g_raw_recording.saved++;
+			else raw_recording_stop_locked("write failed or insufficient SD space");
+			raw_recording_check_limit_locked();
+			if (!g_raw_recording.active)
+				printf("RAW recording complete: saved=%llu, skipped=%llu\n",
+					g_raw_recording.saved, g_raw_recording.skipped);
+		}
 		g_snapshot_writer.busy = 0;
 		pthread_cond_broadcast(&g_snapshot_writer.cond);
 		pthread_mutex_unlock(&g_snapshot_writer.lock);
@@ -3353,6 +3507,29 @@ static int liveview_apply_agc_min_max_tone_curve(
 	return agc_status;
 }
 
+/* Only the RAW worker changes active AGC and ISP tone state. */
+static void liveview_apply_agc_request(VIDEO_LIVEVIEW *stream)
+{
+    int requested = agc_mode_take_request();
+    AGC_MODE old_mode = agc_mode_get();
+    IQT_TONE_PARAM target;
+    if (requested < 0 || requested == (int)old_mode) return;
+    if (!g_agc_baseline_valid) {
+        printf("AGC switch unavailable: baseline ISP tone was not captured\n");
+        return;
+    }
+    target = g_agc_baseline_tone;
+    if (requested == AGC_MODE_HISTOGRAM_P1_P99_CPU ||
+        requested == AGC_MODE_FIELDSCALE_CPU) target.tone.enable = 0;
+    if (vendor_isp_set_iq(IQT_ITEM_TONE_PARAM, &target) != HD_OK) {
+        printf("AGC switch failed: ISP tone update failed; runtime unchanged\n");
+        return;
+    }
+    agc_fieldscale_state_reset(&stream->agc_fieldscale_state);
+    agc_mode_set((AGC_MODE)requested);
+    printf("AGC applied: %s\n", agc_mode_name((AGC_MODE)requested));
+}
+
 static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 {
 	HD_VIDEO_FRAME vcap_video_frame = {0};
@@ -3392,6 +3569,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		}
 		return;
 	}
+	liveview_apply_agc_request(p_stream0);
 	print_requested_raw_frame_stats(&vcap_video_frame);
 
 	if (g_raw_copy_pending) {
@@ -3515,6 +3693,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	correction_lock_held = 0;
 
 after_corrections:
+	snapshot_final_frame = current_frame;
 	if (!isp_step_test_requested && p_stream0->cap_snap) {
 		p_stream0->cap_snap = 0;
 		snapshot_requested = 1;
@@ -3555,7 +3734,7 @@ after_corrections:
 
 			current_frame = &agc_histogram_p1_p99_video_frame;
 			current_frame_is_vcap = 0;
-			if (snapshot_requested) {
+			if (!isp_step_test_requested) {
 				snapshot_agc_output_frame = current_frame;
 				snapshot_has_agc_output = 1;
 			}
@@ -3593,7 +3772,7 @@ after_corrections:
 			}
 			current_frame = &agc_histogram_p1_p99_video_frame;
 			current_frame_is_vcap = 0;
-			if (snapshot_requested) {
+			if (!isp_step_test_requested) {
 				snapshot_agc_output_frame = current_frame;
 				snapshot_has_agc_output = 1;
 			}
@@ -3652,6 +3831,10 @@ after_corrections:
 				    snapshot_has_agc_output) != 0) {
 		printf("Snapshot frame queue failed\n");
 	}
+
+	if (!isp_step_test_requested)
+		raw_recording_queue(&vcap_video_frame, snapshot_final_frame,
+			snapshot_agc_output_frame);
 
 	/* A processed frame no longer depends on the held VCAP buffer. */
 	if (!current_frame_is_vcap) {
@@ -3795,6 +3978,9 @@ static void *raw_pipeline_thread(void *arg)
 		usleep(100);
 	}
 
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	raw_recording_stop_locked("RAW pipeline stopped");
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
 	liveview_set_ffc_test_worker_active(0);
 	return 0;
 }
@@ -3802,6 +3988,7 @@ static void *raw_pipeline_thread(void *arg)
 static void *yuv_statistics_thread(void *arg)
 {
 	VIDEO_LIVEVIEW *p_stream0 = (VIDEO_LIVEVIEW *)arg;
+	HD_VIDEO_FRAME proc_frame = {0};
 	HD_VIDEO_FRAME video_frame = {0};
 	HD_RESULT ret;
 
@@ -3809,6 +3996,50 @@ static void *yuv_statistics_thread(void *arg)
 		usleep(100);
 	}
 	while (p_stream0->proc_exit == 0) {
+		ret = hd_videoproc_pull_out_buf(
+			p_stream0->proc_path, &proc_frame, 100);
+		if (ret == HD_OK) {
+			HD_VIDEO_FRAME mirrored = {0};
+			HD_VIDEO_FRAME *display = &proc_frame;
+			int have_mirror = 0;
+			int display_ok = 1;
+			if (g_liveview_mirror) {
+				ret = vpe_mirror_process(&proc_frame, &mirrored);
+				if (ret != HD_OK) {
+					printf("VPE mirror process failed=%d; stopping display worker\n", ret);
+					if (vpe_mirror_input_pending()) {
+						p_stream0->vpe_held_input = proc_frame;
+						p_stream0->vpe_input_held = 1;
+					} else {
+						hd_videoproc_release_out_buf(p_stream0->proc_path, &proc_frame);
+					}
+					break;
+				}
+				display = &mirrored;
+				have_mirror = 1;
+			}
+			if (clahe_process_frame(display) != 0) {
+				printf("CLAHE processing failed; frame dropped\n");
+				display_ok = 0;
+			}
+			if (display_ok && PseudoColor_YUV420(display) != 0) {
+				printf("PseudoColor YUV processing failed; frame dropped\n");
+				display_ok = 0;
+			}
+			if (display_ok) {
+				ret = video_output_push_frame(&p_stream0->video_output, display);
+				if (ret != HD_OK) printf("videoenc push error=%d\n", ret);
+			}
+			if (have_mirror) {
+				ret = vpe_mirror_release(&mirrored);
+				if (ret != HD_OK) printf("VPE output release failed=%d\n", ret);
+			}
+			ret = hd_videoproc_release_out_buf(p_stream0->proc_path, &proc_frame);
+			if (ret != HD_OK) printf("proc_release error=%d\n", ret);
+		} else if (ret != HD_ERR_UNDERRUN && ret != HD_ERR_TIMEDOUT) {
+			printf("proc_pull error=%d !!\r\n\r\n", ret);
+		}
+
 		ret = hd_videoproc_pull_out_buf(
 			p_stream0->proc_path_diag, &video_frame, 100);
 		if (ret != HD_OK) {
@@ -4009,7 +4240,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	main_dim.w = RAW_ACTIVE_W;
 	main_dim.h = RAW_ACTIVE_H;
 	ret = set_proc_param(stream[0].proc_path, &main_dim,
-		HD_VIDEO_PXLFMT_YUV420, 0);
+		HD_VIDEO_PXLFMT_YUV420, 1);
 	if (ret != HD_OK) {
 		printf("set proc fail=%d\n", ret);
 		goto exit;
@@ -4018,9 +4249,14 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	/*
 	 * A CPU AGC already stretches RAW14 before VideoProc. Bypass Tone Curve so
 	 * the stretched frame is not remapped again.
-	 * A later Liveview restart reloads the ISP cfg before applying AGC mode,
-	 * which restores the configured Tone Curve for OFF/ISP Tone Curve modes.
+	 * Save the configured tone before AGC overrides it so runtime OFF can
+	 * restore it without restarting Liveview.
 	 */
+	memset(&g_agc_baseline_tone, 0, sizeof(g_agc_baseline_tone));
+	g_agc_baseline_tone.id = g_thermal_pipeline_id;
+	g_agc_baseline_valid = vendor_isp_get_iq(
+		IQT_ITEM_TONE_PARAM, &g_agc_baseline_tone) == HD_OK;
+	agc_mode_begin_session();
 	ret = liveview_bypass_isp_tone_for_cpu_agc();
 	if (ret != HD_OK) {
 		printf("%s: Tone Curve bypass unavailable; "
@@ -4043,6 +4279,11 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		HD_VIDEO_PXLFMT_YUV420, 1);
 	if (ret != HD_OK) {
 		printf("set diagnostic proc fail=%d\n", ret);
+		goto exit;
+	}
+
+	ret = liveview_set_proc_input_direction(stream[0].proc_path);
+	if (ret != HD_OK) {
 		goto exit;
 	}
 
@@ -4073,14 +4314,20 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	}
 	ctx->proc_thread_created = 1;
 
-	ret = hd_videoproc_bind(HD_VIDEOPROC_0_OUT_0,
-		HD_VIDEOENC_0_IN_0);
+	if (g_liveview_mirror) {
+		ret = vpe_mirror_start(RAW_ACTIVE_W, RAW_ACTIVE_H,
+			DBGINFO_BUFSIZE() + VDO_YUV_BUFSIZE(RAW_ACTIVE_W,
+				RAW_ACTIVE_H, HD_VIDEO_PXLFMT_YUV420));
+		if (ret != HD_OK) goto exit;
+	}
+	ret = Pseudo_Init(RAW_ACTIVE_W * RAW_ACTIVE_H);
 	if (ret != HD_OK) {
-		printf("bind videoproc to %s encoder failed=%d\n",
-			video_output_mode_name(g_output_mode), ret);
+		printf("Pseudo init failed=%d\n", ret);
 		goto exit;
 	}
-	ctx->proc_bound = 1;
+	ctx->pseudo_started = 1;
+	printf("Pseudo color mode=%d (%s)\n", pseudo_get_mode(),
+	       pseudo_mode_name(pseudo_get_mode()));
 
 	// start video_liveview modules (main)
 	ret = hd_videocap_start(stream[0].cap_path);
@@ -4141,6 +4388,9 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 	VIDEO_LIVEVIEW *stream = ctx->stream;
 	HD_RESULT ret;
 
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	raw_recording_stop_locked("Liveview stopped");
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
 	g_diagnostic_video_output = NULL;
 	/* Wake threads that may still be waiting for the pipeline to start. */
 	stream[0].cap_exit = 1;
@@ -4157,6 +4407,26 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		pthread_join(stream[0].proc_thread_id, NULL);
 		ctx->proc_thread_created = 0;
 		stream[0].proc_thread_id = 0;
+	}
+	clahe_frame_release();
+	ret = vpe_mirror_stop();
+	if (ret != HD_OK) {
+		printf("VPE cleanup failed=%d; retain buffers, retry Liveview Stop\n", ret);
+		return;
+	}
+	if (stream[0].vpe_input_held) {
+		ret = hd_videoproc_release_out_buf(stream[0].proc_path,
+			&stream[0].vpe_held_input);
+		if (ret != HD_OK) {
+			printf("VPE retained source release failed=%d\n", ret);
+			return;
+		}
+		stream[0].vpe_input_held = 0;
+	}
+	if (ctx->pseudo_started) {
+		ret = Pseudo_Uninit();
+		if (ret != HD_OK) printf("Pseudo uninit failed=%d\n", ret);
+		ctx->pseudo_started = 0;
 	}
 	if (ctx->snapshot_writer_started) {
 		snapshot_writer_stop();
@@ -4298,6 +4568,11 @@ int liveview_start(void)
 		goto exit;
 	}
 
+	if (g_liveview.mem_inited) {
+		printf("Previous pipeline cleanup incomplete; retry Stop first\n");
+		ret = -1;
+		goto exit;
+	}
 	ret = liveview_start_pipeline(&g_liveview);
 
 exit:
@@ -4329,6 +4604,11 @@ int liveview_restart(void)
 	}
 
 	liveview_stop_pipeline(&g_liveview);
+	if (g_liveview.mem_inited) {
+		printf("Previous pipeline cleanup incomplete; retry Stop first\n");
+		ret = -1;
+		goto exit;
+	}
 	ret = liveview_start_pipeline(&g_liveview);
 
 exit:
@@ -4373,6 +4653,17 @@ static int liveview_request_snapshot(void)
 
 	g_liveview.stream[0].cap_snap = 1;
 	return 0;
+}
+
+/* Applied from CFG before pipeline start; menu changes only pending CFG. */
+void liveview_set_mirror(int enabled)
+{
+	g_liveview_mirror = enabled ? 1 : 0;
+}
+
+int liveview_get_mirror(void)
+{
+	return g_liveview_mirror;
 }
 
 int liveview_set_fps(unsigned int fps)
@@ -4573,6 +4864,178 @@ static int liveview_shutter_control_menu_run(void)
 	return ret;
 }
 
+static int raw_recording_is_busy(void)
+{
+	int busy;
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	raw_recording_check_limit_locked();
+	busy = g_raw_recording.active || g_raw_recording.job;
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	return busy;
+}
+
+static void raw_recording_print_status(void)
+{
+	UINT64 elapsed;
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	raw_recording_check_limit_locked();
+	elapsed = g_raw_recording.started_ms ? liveview_get_time_ms() - g_raw_recording.started_ms : 0;
+	printf("RAW Recording: %s, saved=%llu/%llu, skipped=%llu",
+		g_raw_recording.active ? "Recording" : (g_raw_recording.job ? "Stopping" : "Stopped"),
+		g_raw_recording.saved, g_raw_recording.target_frames, g_raw_recording.skipped);
+	if (g_raw_recording.active) printf(", elapsed=%llu s", (unsigned long long)(elapsed / 1000));
+	printf("\n");
+	if (!g_raw_recording.active && g_raw_recording.reason)
+		printf("Last stop: %s\n", g_raw_recording.reason);
+	if (g_raw_recording.directory[0]) printf("Output: %s\n", g_raw_recording.directory);
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+}
+
+static void raw_recording_toggle(int type, int frame_count)
+{
+#if defined(__LINUX)
+	unsigned int attempt;
+	char directory[192];
+	int created = 0;
+#endif
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	raw_recording_check_limit_locked();
+	if (g_raw_recording.active) {
+		raw_recording_stop_locked("user requested stop");
+		goto done;
+	}
+	if (g_raw_recording.job) {
+		printf("RAW recording is finishing the last file; please wait\n");
+		goto done;
+	}
+	if (!g_liveview.running || !g_snapshot_writer.thread_created ||
+	    g_snapshot_writer.exit_requested || liveview_stop_is_requested()) {
+		printf("Start Liveview before recording\n");
+		goto done;
+	}
+	if (type < 0 || type > 2 || frame_count <= 0) goto done;
+	if (type == 2 && !agc_histogram_p1_p99_is_enabled() && !agc_fieldscale_is_enabled()) {
+		printf("AGC output RAW requires Histogram P1/P99 or Fieldscale AGC\n");
+		goto done;
+	}
+#if defined(__LINUX)
+	if (!raw_recording_has_space(RAW_SNAPSHOT_DIR)) {
+		printf("Cannot record: SD unavailable or less than 256 MiB plus one RAW frame free\n");
+		goto done;
+	}
+	for (attempt = 0; attempt < 10000; attempt++) {
+		snprintf(directory, sizeof(directory), RAW_SNAPSHOT_DIR "/recording_%lld_%04u",
+			(long long)time(NULL), attempt);
+		if (mkdir(directory, 0775) == 0) { created = 1; break; }
+		if (errno != EEXIST) break;
+	}
+	if (!created) {
+		printf("Cannot create recording directory: %s\n", strerror(errno));
+		goto done;
+	}
+	snprintf(g_raw_recording.directory, sizeof(g_raw_recording.directory), "%s", directory);
+	g_raw_recording.type = type;
+	g_raw_recording.started_ms = liveview_get_time_ms();
+	g_raw_recording.target_frames = (unsigned long long)frame_count;
+	g_raw_recording.saved = g_raw_recording.skipped = g_raw_recording.sequence = 0;
+	g_raw_recording.reason = NULL;
+	g_raw_recording.active = 1;
+	pthread_cond_signal(&g_snapshot_writer.cond);
+	printf("RAW recording started: target=%d images, output=%s\n", frame_count, directory);
+#else
+	printf("RAW recording requires Linux SD storage\n");
+#endif
+done:
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+}
+
+static int liveview_raw_type_menu_run(int selected_raw_type)
+{
+	int option;
+
+	for (;;) {
+		printf("----------------------------------------\n");
+		printf("Select RAW type\n");
+		printf(" 1. Original RAW\n");
+		printf(" 2. Corrected RAW\n");
+		printf(" 3. AGC output RAW\n");
+		printf(" 0. Back\n");
+		printf("----------------------------------------\n");
+		option = liveview_read_option();
+		if (option >= 1 && option <= 3) {
+			return option - 1;
+		}
+		if (option == 0 || option == -1) {
+			return selected_raw_type;
+		}
+		if (option != MENU_OPTION_REFRESH) {
+			printf("Invalid option\n");
+		}
+	}
+}
+
+static int liveview_raw_recording_menu_run(void)
+{
+	static int selected_raw_type = 0;
+	static int recording_frame_count = 30;
+	static const char * const raw_type_names[] = {
+		"Original RAW", "Corrected RAW", "AGC output RAW"
+	};
+	int option;
+
+	for (;;) {
+		printf("----------------------------------------\n");
+		printf("Recording RAW\n");
+		printf(" 1. Select RAW type\n");
+		printf(" 2. Set recording image count\n");
+		printf(" 3. Start / Stop recording\n");
+		printf(" 0. Back\n");
+		printf("----------------------------------------\n");
+		printf("Selected: %s\n", raw_type_names[selected_raw_type]);
+		printf("Target: %d images\n", recording_frame_count);
+		raw_recording_print_status();
+		printf("Save selected RAW only; frames may be skipped. Stops after the requested number of images are saved.\n");
+		printf("AGC output RAW is available only in supported AGC modes.\n");
+
+		option = liveview_read_option();
+		switch (option) {
+		case 1:
+			if (raw_recording_is_busy()) {
+				printf("Stop recording before changing RAW type\n");
+				break;
+			}
+			selected_raw_type = liveview_raw_type_menu_run(selected_raw_type);
+			break;
+		case 2:
+			if (raw_recording_is_busy()) {
+				printf("Stop recording before changing image count\n");
+				break;
+			}
+			printf("Enter recording image count (positive integer, q to cancel)\n");
+			option = liveview_read_option();
+			if (option > 0) {
+				recording_frame_count = option;
+			} else if (option != -1) {
+				printf("Image count unchanged: enter a positive integer\n");
+			}
+			break;
+		case 3:
+			raw_recording_toggle(selected_raw_type, recording_frame_count);
+			break;
+		case 0:
+		case -1:
+			return 0;
+		case MENU_OPTION_REFRESH:
+			break;
+		default:
+			printf("Invalid option\n");
+			break;
+		}
+	}
+}
+
 int liveview_menu_run(void)
 {
 	int option;
@@ -4586,11 +5049,13 @@ int liveview_menu_run(void)
 		printf(" 2. Liveview control\n");
 		printf(" 3. Shutter control\n");
 		printf(" 4. Snapshot RAW\n");
-		printf(" 5. Show current RAW statistics\n");
-		printf(" 6. Show current YUV statistics\n");
+		printf(" 5. Recording RAW\n");
+		printf(" 6. Show current RAW statistics\n");
+		printf(" 7. Show current YUV statistics\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("Settings: CFG Setting -> Liveview setting\n");
+		raw_recording_print_status();
 
 		option = liveview_read_option();
 		switch (option) {
@@ -4617,10 +5082,14 @@ int liveview_menu_run(void)
 			break;
 
 		case 5:
-			ret = liveview_request_raw_statistics();
+			ret = liveview_raw_recording_menu_run();
 			break;
 
 		case 6:
+			ret = liveview_request_raw_statistics();
+			break;
+
+		case 7:
 			ret = liveview_request_yuv_statistics();
 			break;
 
