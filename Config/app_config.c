@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include "../Enhancement/CLAHE/clahe.h"
+#include "../DDE/dde.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -60,6 +61,7 @@ typedef struct {
 	int agc_fieldscale_enable;
 	AGC_FIELDSCALE_PARAMS fieldscale;
 	CLAHE_PARAMS clahe;
+    DDE_PARAMS dde;
 	int videoproc_af_enable;
 	int videoproc_wdr_enable;
 	int videoproc_defog_enable;
@@ -174,6 +176,7 @@ static void cfg_initialize_from_runtime(void)
 	memset(&g_app_config, 0, sizeof(g_app_config));
 	g_app_config.boot_load = 1;
 	clahe_get_params(&g_app_config.clahe);
+    dde_get_params(&g_app_config.dde);
 	g_app_config.fps = liveview_get_fps();
 	g_app_config.output_mode = liveview_get_output_mode();
 	g_app_config.liveview_mirror = liveview_get_mirror();
@@ -274,6 +277,31 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
         return 0;
     }
 
+    if (strcmp(key, "dde_enable") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || int_value < 0 || int_value > 1) return -1;
+        config->dde.enable = (int)int_value;
+        return 0;
+    }
+    if (strcmp(key, "dde_sigma_s") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || int_value < 1 || int_value > 256) return -1;
+        config->dde.sigma_s = (int)int_value;
+        return 0;
+    }
+    if (strcmp(key, "dde_sigma_r") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || int_value < 1 || int_value > 255) return -1;
+        config->dde.sigma_r = (int)int_value;
+        return 0;
+    }
+    if (strcmp(key, "dde_gain_percent") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || int_value < 0 || int_value > 1000) return -1;
+        config->dde.gain_percent = (int)int_value;
+        return 0;
+    }
+    if (strcmp(key, "dde_num_iters") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || int_value < 1 || int_value > 8) return -1;
+        config->dde.num_iters = (int)int_value;
+        return 0;
+    }
 	if (strcmp(key, "cfg_boot_load") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->boot_load = int_value ? 1 : 0;
@@ -461,6 +489,7 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 		agc_mode_set(AGC_MODE_OFF);
 	}
 	if (clahe_set_params(&config->clahe) != 0) apply_result = -1;
+    if (dde_set_params(&config->dde) != 0) apply_result = -1;
 	videoproc_isp_set_runtime(config->videoproc_af_enable,
 				  config->videoproc_wdr_enable,
 				  config->videoproc_defog_enable,
@@ -551,6 +580,11 @@ int app_config_get_int(const char *key, int *value)
             return 0;
         }
     }
+    if (strcmp(key, "dde_enable") == 0) { *value = g_app_config.dde.enable; return 0; }
+    if (strcmp(key, "dde_sigma_s") == 0) { *value = g_app_config.dde.sigma_s; return 0; }
+    if (strcmp(key, "dde_sigma_r") == 0) { *value = g_app_config.dde.sigma_r; return 0; }
+    if (strcmp(key, "dde_gain_percent") == 0) { *value = g_app_config.dde.gain_percent; return 0; }
+    if (strcmp(key, "dde_num_iters") == 0) { *value = g_app_config.dde.num_iters; return 0; }
 	if (strcmp(key, "cfg_boot_load") == 0) {
 		*value = g_app_config.boot_load;
 	} else if (strcmp(key, "fps") == 0) {
@@ -649,7 +683,11 @@ int app_config_update_int(const char *key, int value)
 		return -1;
 	}
 
-    if (strcmp(key, "clahe_enable") == 0 || strcmp(key, "clahe_tile_size") == 0 ||
+    if (strncmp(key, "dde_", 4) == 0) {
+        ret = dde_set_params(&g_app_config.dde);
+        if (ret != 0) return ret;
+        printf("DDE saved; applies on next display frame (no restart)\n");
+    } else if (strcmp(key, "clahe_enable") == 0 || strcmp(key, "clahe_tile_size") == 0 ||
         strcmp(key, "clahe_clip_limit") == 0) {
         ret = clahe_set_params(&g_app_config.clahe);
         if (ret != 0) return ret;
@@ -823,6 +861,12 @@ static int app_config_show_file(void)
 	       "selected_runtime_agc",
 	       agc_mode_name(agc_mode_get()));
 
+	printf("\n[DDE]\n");
+    printf("  dde_enable=%d\n", g_app_config.dde.enable);
+    printf("  dde_sigma_s=%d\n", g_app_config.dde.sigma_s);
+    printf("  dde_sigma_r=%d\n", g_app_config.dde.sigma_r);
+    printf("  dde_gain_percent=%d\n", g_app_config.dde.gain_percent);
+    printf("  dde_num_iters=%d\n", g_app_config.dde.num_iters);
 	printf("\n[CLAHE]\n");
 	printf("  1. %-31s = %d (%s)\n", "clahe_enable",
 		g_app_config.clahe.enable,
@@ -1355,6 +1399,48 @@ static int app_config_agc_menu_run(void)
 	return ret;
 }
 
+static int app_config_dde_menu_run(void)
+{
+    int option, ret = 0;
+    for (;;) {
+        DDE_PARAMS runtime;
+        dde_get_params(&runtime);
+        printf("----------------------------------------\nDDE setting (CPU, Y8)\n");
+        printf(" 1. On/off: CFG=%s, runtime=%s\n",
+            g_app_config.dde.enable ? "on" : "off", runtime.enable ? "on" : "off");
+        printf(" 2. Standard preset: Iterations=3\n");
+        printf(" 3. Fast preset: Iterations=1\n");
+        printf(" 4. Sigma S (pixels): CFG=%d, runtime=%d\n", g_app_config.dde.sigma_s, runtime.sigma_s);
+        printf(" 5. Sigma R (Y8 DN): CFG=%d, runtime=%d\n", g_app_config.dde.sigma_r, runtime.sigma_r);
+        printf(" 6. Detail gain (%%): CFG=%d, runtime=%d\n", g_app_config.dde.gain_percent, runtime.gain_percent);
+        printf(" 7. Iterations: CFG=%d, runtime=%d\n", g_app_config.dde.num_iters, runtime.num_iters);
+        printf(" 0. Back\nPresets change iterations only. Parameters apply on next display frame.\n");
+        option = app_config_read_option();
+        switch (option) {
+        case 1:
+            ret = app_config_prompt_bool("DDE", "dde_enable", g_app_config.dde.enable);
+            break;
+        case 2: ret = app_config_update_int("dde_num_iters", 3); break;
+        case 3: ret = app_config_update_int("dde_num_iters", 1); break;
+        case 4:
+            ret = app_config_prompt_int("Sigma S (pixels)", "dde_sigma_s", g_app_config.dde.sigma_s, 1, 256, "");
+            break;
+        case 5:
+            ret = app_config_prompt_int("Sigma R (Y8 DN)", "dde_sigma_r", g_app_config.dde.sigma_r, 1, 255, "");
+            break;
+        case 6:
+            ret = app_config_prompt_int("Detail gain (%)", "dde_gain_percent", g_app_config.dde.gain_percent, 0, 1000, "");
+            break;
+        case 7:
+            ret = app_config_prompt_int("Iterations", "dde_num_iters", g_app_config.dde.num_iters, 1, 8, "");
+            break;
+        case 0: case -1: return ret;
+        case MENU_OPTION_REFRESH: break;
+        default: printf("Invalid option\n"); break;
+        }
+    }
+}
+
 static int app_config_clahe_menu_run(void)
 {
 	APP_CONFIG_VALUES old_config;
@@ -1422,6 +1508,93 @@ static int app_config_clahe_menu_run(void)
     }
 }
 
+static int app_config_apply_simple_display_mode(int mode)
+{
+	APP_CONFIG_VALUES old_config;
+	const char *name;
+	int ret;
+
+	cfg_initialize_from_runtime();
+	old_config = g_app_config;
+	g_app_config.agc_histogram_p1_p99_enable = 0;
+	g_app_config.agc_min_max_tone_curve_enable = 0;
+	g_app_config.agc_fieldscale_enable = 1;
+
+	if (mode == 1 || mode == 2) {
+		g_app_config.fieldscale.grid_size = 8U;
+		g_app_config.fieldscale.les_distance = 2U;
+		g_app_config.fieldscale.les_threshold = mode == 1 ? 400U : 800U;
+		g_app_config.fieldscale.message_distance = 1U;
+		g_app_config.fieldscale.message_iterations = mode == 1 ? 7U : 1U;
+		g_app_config.fieldscale.temporal_previous_percent = 90U;
+		g_app_config.clahe.enable = 1;
+		g_app_config.clahe.tile_size = mode == 1 ? 16 : 32;
+		g_app_config.clahe.clip_limit = mode == 1 ? 8 : 16;
+		g_app_config.dde.enable = 1;
+		g_app_config.dde.num_iters = mode == 1 ? 3 : 1;
+		name = mode == 1 ? "Standard" : "Fast";
+	} else if (mode == 3) {
+		g_app_config.clahe.enable = 0;
+		g_app_config.dde.enable = 0;
+		name = "AGC only";
+	} else {
+		return -1;
+	}
+
+	if (agc_fieldscale_validate_params(&g_app_config.fieldscale) != 0 ||
+	    dde_validate_params(&g_app_config.dde) != 0) {
+		g_app_config = old_config;
+		return -1;
+	}
+	ret = app_config_save();
+	if (ret != 0) {
+		g_app_config = old_config;
+		return ret;
+	}
+	if (agc_fieldscale_set_params(&g_app_config.fieldscale) != 0 ||
+	    clahe_set_params(&g_app_config.clahe) != 0 ||
+	    dde_set_params(&g_app_config.dde) != 0) {
+		printf("%s display mode saved, but runtime apply failed\n", name);
+		return -1;
+	}
+	app_config_request_agc();
+	printf("%s display mode saved; CLAHE/DDE apply on next display frame\n",
+	       name);
+	return 0;
+}
+
+static int app_config_simple_display_menu_run(void)
+{
+	int option;
+	int ret = 0;
+
+	for (;;) {
+		printf("----------------------------------------\n");
+		printf("Simple display setting\n");
+		printf(" 1. Standard mode: Fieldscale AGC, CLAHE and DDE on; standard presets\n");
+		printf(" 2. Fast mode: Fieldscale AGC, CLAHE and DDE on; fast presets\n");
+		printf(" 3. AGC only: Fieldscale AGC on; CLAHE and DDE off\n");
+		printf(" 0. Back\n");
+		printf("----------------------------------------\n");
+		option = app_config_read_option();
+		switch (option) {
+		case 1:
+		case 2:
+		case 3:
+			ret = app_config_apply_simple_display_mode(option);
+			break;
+		case 0:
+		case -1:
+			return ret;
+		case MENU_OPTION_REFRESH:
+			break;
+		default:
+			printf("Invalid option\n");
+			break;
+		}
+	}
+}
+
 int app_config_menu_run(void)
 {
 	int option;
@@ -1433,16 +1606,18 @@ int app_config_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("CFG Setting\n");
 		printf(" 1. Liveview setting\n");
-		printf(" 2. BPR setting\n");
-		printf(" 3. NUC setting\n");
-		printf(" 4. FFC setting\n");
-		printf(" 5. TDC setting\n");
-		printf(" 6. AGC setting\n");
-		printf(" 7. ISP setting\n");
-		printf(" 8. CLAHE setting\n");
-		printf(" 9. Show current tiffany_thermal.cfg\n");
-		printf("10. Generate tiffany_thermal.cfg\n");
-		printf("11. Use CFG on next boot/restart on/off\n");
+		printf(" 2. Simple display setting\n");
+		printf(" 3. BPR setting\n");
+		printf(" 4. NUC setting\n");
+		printf(" 5. FFC setting\n");
+		printf(" 6. TDC setting\n");
+		printf(" 7. AGC setting\n");
+		printf(" 8. ISP setting\n");
+		printf(" 9. CLAHE setting\n");
+		printf("10. DDE setting\n");
+		printf("11. Show current tiffany_thermal.cfg\n");
+		printf("12. Generate tiffany_thermal.cfg\n");
+		printf("13. Use CFG on next boot/restart on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("pending CFG: boot load %s\n",
@@ -1454,33 +1629,39 @@ int app_config_menu_run(void)
 			ret = app_config_liveview_menu_run();
 			break;
 		case 2:
-			ret = app_config_bpr_menu_run();
+			ret = app_config_simple_display_menu_run();
 			break;
 		case 3:
-			ret = app_config_nuc_menu_run();
+			ret = app_config_bpr_menu_run();
 			break;
 		case 4:
-			ret = app_config_shutter_ffc_menu_run();
+			ret = app_config_nuc_menu_run();
 			break;
 		case 5:
-			ret = app_config_tdc_menu_run();
+			ret = app_config_shutter_ffc_menu_run();
 			break;
 		case 6:
-			ret = app_config_agc_menu_run();
+			ret = app_config_tdc_menu_run();
 			break;
 		case 7:
-			ret = videoproc_isp_menu_run();
+			ret = app_config_agc_menu_run();
 			break;
 		case 8:
-			ret = app_config_clahe_menu_run();
+			ret = videoproc_isp_menu_run();
 			break;
 		case 9:
-			ret = app_config_show_file();
+			ret = app_config_clahe_menu_run();
 			break;
 		case 10:
-			ret = app_config_save();
+			ret = app_config_dde_menu_run();
 			break;
 		case 11:
+			ret = app_config_show_file();
+			break;
+		case 12:
+			ret = app_config_save();
+			break;
+		case 13:
 			ret = app_config_prompt_bool(
 				"Use CFG on next boot/restart",
 				"cfg_boot_load",
@@ -1534,6 +1715,11 @@ int app_config_save(void)
 	fprintf(fp, "output_mode=%u\n", g_app_config.output_mode);
 	fprintf(fp, "liveview_mirror=%d\n", g_app_config.liveview_mirror);
 	fprintf(fp, "pseudo_color_mode=%d\n", g_app_config.pseudo_color_mode);
+    fprintf(fp, "dde_enable=%d\n", g_app_config.dde.enable);
+    fprintf(fp, "dde_sigma_s=%d\n", g_app_config.dde.sigma_s);
+    fprintf(fp, "dde_sigma_r=%d\n", g_app_config.dde.sigma_r);
+    fprintf(fp, "dde_gain_percent=%d\n", g_app_config.dde.gain_percent);
+    fprintf(fp, "dde_num_iters=%d\n", g_app_config.dde.num_iters);
 	fprintf(fp, "clahe_enable=%d\nclahe_tile_size=%d\nclahe_clip_limit=%d\n",
 	    g_app_config.clahe.enable, g_app_config.clahe.tile_size, g_app_config.clahe.clip_limit);
 	fprintf(fp, "startup_skip_frames=%u\n",

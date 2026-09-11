@@ -14,6 +14,7 @@
 
 #include "liveview.h"
 #include "../Enhancement/CLAHE/clahe_frame.h"
+#include "../DDE/dde_frame.h"
 #include "../ISP/Pseudo/pseudo.h"
 #include "../ISP/VPE/vpe_mirror.h"
 
@@ -4022,6 +4023,10 @@ static void *yuv_statistics_thread(void *arg)
 				printf("CLAHE processing failed; frame dropped\n");
 				display_ok = 0;
 			}
+			if (display_ok && dde_process_frame(display) != 0) {
+				printf("DDE processing failed; frame dropped\n");
+				display_ok = 0;
+			}
 			if (display_ok && PseudoColor_YUV420(display) != 0) {
 				printf("PseudoColor YUV processing failed; frame dropped\n");
 				display_ok = 0;
@@ -4409,6 +4414,7 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		stream[0].proc_thread_id = 0;
 	}
 	clahe_frame_release();
+	dde_frame_release();
 	ret = vpe_mirror_stop();
 	if (ret != HD_OK) {
 		printf("VPE cleanup failed=%d; retain buffers, retry Liveview Stop\n", ret);
