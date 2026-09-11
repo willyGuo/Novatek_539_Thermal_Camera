@@ -936,8 +936,6 @@ static int app_config_liveview_menu_run(void)
 		printf(" 2. Startup skip frames\n");
 		printf(" 3. Runtime skip frames\n");
 		printf(" 4. Output mode (UVC / RTSP)\n");
-		printf(" 5. Horizontal mirror on/off\n");
-		printf(" 6. Pseudo color mode\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: output=%s, fps=%u, startup skip=%u, runtime skip=%u\n",
@@ -948,13 +946,6 @@ static int app_config_liveview_menu_run(void)
 		       app_config_output_mode_name(g_app_config.output_mode),
 		       g_app_config.fps, g_app_config.startup_skip_frames,
 		       g_app_config.runtime_skip_frames);
-		printf("Horizontal mirror: runtime=%s, pending CFG=%s\n",
-		       liveview_get_mirror() ? "on" : "off",
-		       g_app_config.liveview_mirror ? "on" : "off");
-		printf("Pseudo color: runtime=%s, pending CFG=%s\n",
-		       pseudo_mode_name(pseudo_get_mode()),
-		       pseudo_mode_name(g_app_config.pseudo_color_mode));
-
 		option = app_config_read_option();
 		switch (option) {
 		case 1:
@@ -975,15 +966,6 @@ static int app_config_liveview_menu_run(void)
 			break;
 		case 4:
 			ret = app_config_prompt_output_mode();
-			break;
-		case 5:
-			ret = app_config_prompt_bool("Horizontal mirror",
-				"liveview_mirror", g_app_config.liveview_mirror);
-			break;
-		case 6:
-			printf("0: Black/White, 1: White/Black, 2: Color (Jet), 3: Iron\n");
-			ret = app_config_prompt_int("Pseudo color mode", "pseudo_color_mode",
-				g_app_config.pseudo_color_mode, 0, 3, "");
 			break;
 		case 0:
 		case -1:
@@ -1217,6 +1199,39 @@ static int app_config_tdc_menu_run(void)
 	return ret;
 }
 
+static int app_config_apply_fieldscale_preset(const char *name,
+		unsigned int les_threshold, unsigned int message_iterations)
+{
+	APP_CONFIG_VALUES old_config;
+	AGC_FIELDSCALE_PARAMS *params;
+
+	cfg_initialize_from_runtime();
+	old_config = g_app_config;
+	params = &g_app_config.fieldscale;
+	params->grid_size = 8U;
+	params->les_distance = 2U;
+	params->les_threshold = les_threshold;
+	params->message_distance = 1U;
+	params->message_iterations = message_iterations;
+	params->temporal_previous_percent = 90U;
+	if (agc_fieldscale_validate_params(params) != 0) {
+		printf("Invalid %s Fieldscale preset\n", name);
+		g_app_config = old_config;
+		return -1;
+	}
+	if (app_config_save() != 0) {
+		g_app_config = old_config;
+		return -1;
+	}
+	if (agc_fieldscale_set_params(params) != 0) {
+		return -1;
+	}
+
+	printf("%s Fieldscale preset saved and applied; next Fieldscale frame uses it (no restart)\n",
+	       name);
+	return 0;
+}
+
 static int app_config_fieldscale_menu_run(void)
 {
     int option;
@@ -1229,8 +1244,10 @@ static int app_config_fieldscale_menu_run(void)
         printf(" 1. Fieldscale on/off: CFG=%s, runtime=%s\n",
                g_app_config.agc_fieldscale_enable ? "on" : "off",
                agc_fieldscale_is_enabled() ? "on" : "off");
+		printf(" 2. Standard: grid=8, LES=2, TLES=400, MP distance=1, N=7, current/previous=10/90%%\n");
+		printf(" 3. Fast: grid=8, LES=2, TLES=800, MP distance=1, N=1, current/previous=10/90%%\n");
         for (i = 0; i < FIELDSCALE_CFG_COUNT; i++) {
-            printf(" %u. %s: CFG=%u, runtime=%u\n", i + 2,
+            printf(" %u. %s: CFG=%u, runtime=%u\n", i + 4,
                    fieldscale_items[i].label,
                    *cfg_fieldscale_value(&g_app_config.fieldscale, i),
                    *cfg_fieldscale_value(&runtime, i));
@@ -1247,11 +1264,19 @@ static int app_config_fieldscale_menu_run(void)
                 "agc_fieldscale_enable", g_app_config.agc_fieldscale_enable);
             continue;
         }
-        if (option < 2 || option > (int)FIELDSCALE_CFG_COUNT + 1) {
+		if (option == 2) {
+			ret = app_config_apply_fieldscale_preset("Standard", 400U, 7U);
+			continue;
+		}
+		if (option == 3) {
+			ret = app_config_apply_fieldscale_preset("Fast", 800U, 1U);
+			continue;
+		}
+        if (option < 4 || option > (int)FIELDSCALE_CFG_COUNT + 3) {
             printf("Invalid option\n");
             continue;
         }
-        i = (unsigned int)option - 2U;
+        i = (unsigned int)option - 4U;
         ret = app_config_prompt_int(fieldscale_items[i].label,
             fieldscale_items[i].key,
             (int)*cfg_fieldscale_value(&g_app_config.fieldscale, i),
@@ -1332,12 +1357,17 @@ static int app_config_agc_menu_run(void)
 
 static int app_config_clahe_menu_run(void)
 {
+	APP_CONFIG_VALUES old_config;
     int option, value, ret = 0;
     for (;;) {
         printf("----------------------------------------\nCLAHE setting (CPU, Y8)\n");
-        printf(" 1. On/off: %s\n 2. Tile Size: %dx%d pixels\n 3. Clip Limit: %d\n 0. Back\n",
-            g_app_config.clahe.enable ? "on" : "off", g_app_config.clahe.tile_size,
-            g_app_config.clahe.tile_size, g_app_config.clahe.clip_limit);
+        printf(" 1. On/off: %s\n", g_app_config.clahe.enable ? "on" : "off");
+        printf(" 2. Standard preset: Tile: 16x16 pixels, Clip: 8\n");
+        printf(" 3. Fast preset: Tile: 32x32 pixels, Clip: 16\n");
+        printf(" 4. Tile Size: %dx%d pixels\n",
+            g_app_config.clahe.tile_size, g_app_config.clahe.tile_size);
+        printf(" 5. Clip Limit: %d\n", g_app_config.clahe.clip_limit);
+        printf(" 0. Back\n");
         printf("Changes apply on next display frame; no restart.\n");
         option = app_config_read_option();
         switch (option) {
@@ -1345,13 +1375,43 @@ static int app_config_clahe_menu_run(void)
             ret = app_config_prompt_bool("CLAHE", "clahe_enable", g_app_config.clahe.enable);
             break;
         case 2:
+			cfg_initialize_from_runtime();
+			old_config = g_app_config;
+			g_app_config.clahe.tile_size = 16;
+			g_app_config.clahe.clip_limit = 8;
+			ret = app_config_save();
+			if (ret == 0) {
+				ret = clahe_set_params(&g_app_config.clahe);
+				if (ret == 0) {
+					printf("Standard CLAHE preset saved; applies on next display frame (no restart)\n");
+				}
+			} else {
+				g_app_config = old_config;
+			}
+			break;
+        case 3:
+			cfg_initialize_from_runtime();
+			old_config = g_app_config;
+			g_app_config.clahe.tile_size = 32;
+			g_app_config.clahe.clip_limit = 16;
+			ret = app_config_save();
+			if (ret == 0) {
+				ret = clahe_set_params(&g_app_config.clahe);
+				if (ret == 0) {
+					printf("Fast CLAHE preset saved; applies on next display frame (no restart)\n");
+				}
+			} else {
+				g_app_config = old_config;
+			}
+			break;
+        case 4:
             printf("Tile Size: 1. 8x8  2. 16x16  3. 32x32  0. Back\n");
             value = app_config_read_option();
             if (value >= 1 && value <= 3)
                 ret = app_config_update_int("clahe_tile_size", 1 << (value + 2));
             else if (value > 3) printf("Invalid option\n");
             break;
-        case 3:
+        case 5:
             ret = app_config_prompt_int("Clip Limit (count per histogram bin)",
                 "clahe_clip_limit", g_app_config.clahe.clip_limit, 4, 128, "");
             break;

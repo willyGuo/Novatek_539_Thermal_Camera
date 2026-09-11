@@ -6,6 +6,8 @@
 
 #include "../../Config/app_config.h"
 #include "../../Enhancement/Gamma/gamma.h"
+#include "../../Pipeline/liveview.h"
+#include "../Pseudo/pseudo.h"
 
 #define MENU_OPTION_REFRESH (-2)
 
@@ -14,6 +16,8 @@ typedef struct {
 	int wdr_enable;
 	int defog_enable;
 	int three_dnr_enable;
+	int liveview_mirror;
+	int pseudo_color_mode;
 } VIDEOPROC_ISP_SETTINGS;
 
 static VIDEOPROC_ISP_SETTINGS g_videoproc_isp_runtime = {
@@ -92,7 +96,11 @@ static int videoproc_isp_load_pending(VIDEOPROC_ISP_SETTINGS *pending)
 	    app_config_get_int("videoproc_defog_enable",
 			       &pending->defog_enable) != 0 ||
 	    app_config_get_int("videoproc_3dnr_enable",
-			       &pending->three_dnr_enable) != 0) {
+			       &pending->three_dnr_enable) != 0 ||
+	    app_config_get_int("liveview_mirror",
+			       &pending->liveview_mirror) != 0 ||
+	    app_config_get_int("pseudo_color_mode",
+			       &pending->pseudo_color_mode) != 0) {
 		printf("read pending VideoProc / ISP CFG fail\n");
 		return -1;
 	}
@@ -120,6 +128,26 @@ static int videoproc_isp_prompt_bool(const char *label, const char *key,
 	return app_config_update_int(key, value);
 }
 
+static int videoproc_isp_prompt_pseudo_color(int current)
+{
+	int value;
+
+	printf("0: Black/White, 1: White/Black, 2: Color (Jet), 3: Iron\n");
+	printf("Pseudo color mode (pending CFG: %s)\n",
+	       pseudo_mode_name(current));
+	value = videoproc_isp_read_option();
+	if (value == -1 || value == MENU_OPTION_REFRESH) {
+		return 0;
+	}
+	if (value < 0 || value > 3) {
+		printf("Invalid Pseudo color mode, enter 0 to 3; keep pending CFG %s\n",
+		       pseudo_mode_name(current));
+		return -1;
+	}
+
+	return app_config_update_int("pseudo_color_mode", value);
+}
+
 int videoproc_isp_menu_run(void)
 {
 	VIDEOPROC_ISP_SETTINGS pending;
@@ -140,6 +168,8 @@ int videoproc_isp_menu_run(void)
 		printf(" 5. All on\n");
 		printf(" 6. All off\n");
 		printf(" 7. Gamma on/off\n");
+		printf(" 8. Horizontal mirror on/off\n");
+		printf(" 9. Pseudo color mode\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: AF=%s, WDR=%s, DEFOG=%s, 3DNR=%s\n",
@@ -152,7 +182,13 @@ int videoproc_isp_menu_run(void)
 		       pending.wdr_enable ? "on" : "off",
 		       pending.defog_enable ? "on" : "off",
 		       pending.three_dnr_enable ? "on" : "off");
-		printf("Changes take effect after Liveview Restart\n");
+		printf("Horizontal mirror: runtime=%s, pending CFG=%s\n",
+		       liveview_get_mirror() ? "on" : "off",
+		       pending.liveview_mirror ? "on" : "off");
+		printf("Pseudo color: runtime=%s, pending CFG=%s\n",
+		       pseudo_mode_name(pseudo_get_mode()),
+		       pseudo_mode_name(pending.pseudo_color_mode));
+		printf("AF/WDR/DEFOG/3DNR/mirror take effect after Liveview Restart\n");
 
 		option = videoproc_isp_read_option();
 		switch (option) {
@@ -188,6 +224,17 @@ int videoproc_isp_menu_run(void)
 
 		case 7:
 			ret = gamma_menu_run();
+			break;
+
+		case 8:
+			ret = videoproc_isp_prompt_bool(
+				"Horizontal mirror", "liveview_mirror",
+				pending.liveview_mirror);
+			break;
+
+		case 9:
+			ret = videoproc_isp_prompt_pseudo_color(
+				pending.pseudo_color_mode);
 			break;
 
 		case 0:
