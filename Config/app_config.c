@@ -703,7 +703,22 @@ int app_config_update_int(const char *key, int value)
 		return -1;
 	}
 
-    if (strncmp(key, "dde_", 4) == 0) {
+    if (strcmp(key, "bpr_correction") == 0 || strcmp(key, "nuc_correction") == 0) {
+        int is_bpr = strcmp(key, "bpr_correction") == 0;
+        const char *name = is_bpr ? "BPR" : "NUC";
+        ret = is_bpr ? liveview_set_bpr_enabled(g_app_config.bpr_correction) :
+                       liveview_set_nuc_enabled(g_app_config.nuc_correction);
+        if (ret < 0) {
+            printf("%s CFG saved, but runtime apply failed; check runtime status\n", name);
+            return ret;
+        }
+        if (ret == 1) {
+            printf("%s CFG saved; Liveview is stopped\n", name);
+            app_config_print_restart_required();
+        } else {
+            printf("%s on/off saved and applied (no restart)\n", name);
+        }
+    } else if (strncmp(key, "dde_", 4) == 0) {
         ret = dde_set_params(&g_app_config.dde);
         if (ret != 0) return ret;
         printf("DDE saved; applies on next display frame (no restart)\n");
@@ -1064,6 +1079,7 @@ static int app_config_bpr_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("BPR setting\n");
+		printf("BPR on/off applies immediately; other settings require restart.\n");
 		printf(" 1. BPR on/off\n");
 		printf(" 2. Bright/Dark BPR threshold (RAW8 DN)\n");
 		printf(" 3. Runtime BPR on/off\n");
@@ -1186,6 +1202,7 @@ static int app_config_nuc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("NUC setting\n");
+		printf("NUC on/off applies immediately; table interval requires restart.\n");
 		printf(" 1. NUC on/off\n");
 		printf(" 2. Sensor Temperature table interval\n");
 		printf(" 0. Back\n");
@@ -1474,6 +1491,32 @@ static int app_config_agc_menu_run(void)
 	return ret;
 }
 
+static void app_config_set_dde_preset(DDE_PARAMS *params, int fast)
+{
+    params->sigma_s = 21;
+    params->sigma_r = 51;
+    params->gain_percent = 200;
+    params->num_iters = fast ? 1 : 3;
+}
+
+static int app_config_apply_dde_preset(int fast)
+{
+    APP_CONFIG_VALUES old_config;
+    cfg_initialize_from_runtime();
+    old_config = g_app_config;
+    app_config_set_dde_preset(&g_app_config.dde, fast);
+    if (dde_validate_params(&g_app_config.dde) != 0 || app_config_save() != 0) {
+        g_app_config = old_config;
+        return -1;
+    }
+    if (dde_set_params(&g_app_config.dde) != 0) {
+        printf("DDE preset saved, but runtime apply failed\n");
+        return -1;
+    }
+    printf("DDE preset saved; applies on next display frame\n");
+    return 0;
+}
+
 static int app_config_dde_menu_run(void)
 {
     int option, ret = 0;
@@ -1483,20 +1526,20 @@ static int app_config_dde_menu_run(void)
         printf("----------------------------------------\nDDE setting (CPU, Y8)\n");
         printf(" 1. On/off: CFG=%s, runtime=%s\n",
             g_app_config.dde.enable ? "on" : "off", runtime.enable ? "on" : "off");
-        printf(" 2. Standard preset: Iterations=3\n");
-        printf(" 3. Fast preset: Iterations=1\n");
+        printf(" 2. Standard preset: Sigma S=21, Sigma R=51, Detail gain=200%%, Iterations=3\n");
+        printf(" 3. Fast preset: Sigma S=21, Sigma R=51, Detail gain=200%%, Iterations=1\n");
         printf(" 4. Sigma S (pixels): CFG=%d, runtime=%d\n", g_app_config.dde.sigma_s, runtime.sigma_s);
         printf(" 5. Sigma R (Y8 DN): CFG=%d, runtime=%d\n", g_app_config.dde.sigma_r, runtime.sigma_r);
         printf(" 6. Detail gain (%%): CFG=%d, runtime=%d\n", g_app_config.dde.gain_percent, runtime.gain_percent);
         printf(" 7. Iterations: CFG=%d, runtime=%d\n", g_app_config.dde.num_iters, runtime.num_iters);
-        printf(" 0. Back\nPresets change iterations only. Parameters apply on next display frame.\n");
+        printf(" 0. Back\nPresets change Sigma S, Sigma R, Detail gain and Iterations. Parameters apply on next display frame.\n");
         option = app_config_read_option();
         switch (option) {
         case 1:
             ret = app_config_prompt_bool("DDE", "dde_enable", g_app_config.dde.enable);
             break;
-        case 2: ret = app_config_update_int("dde_num_iters", 3); break;
-        case 3: ret = app_config_update_int("dde_num_iters", 1); break;
+        case 2: ret = app_config_apply_dde_preset(0); break;
+        case 3: ret = app_config_apply_dde_preset(1); break;
         case 4:
             ret = app_config_prompt_int("Sigma S (pixels)", "dde_sigma_s", g_app_config.dde.sigma_s, 1, 256, "");
             break;
@@ -1606,7 +1649,7 @@ static int app_config_apply_simple_display_mode(int mode)
 		g_app_config.clahe.tile_size = mode == 1 ? 16 : 32;
 		g_app_config.clahe.clip_limit = mode == 1 ? 8 : 16;
 		g_app_config.dde.enable = 1;
-		g_app_config.dde.num_iters = mode == 1 ? 3 : 1;
+		app_config_set_dde_preset(&g_app_config.dde, mode == 2);
 		name = mode == 1 ? "Standard" : "Fast";
 	} else if (mode == 3) {
 		g_app_config.clahe.enable = 0;

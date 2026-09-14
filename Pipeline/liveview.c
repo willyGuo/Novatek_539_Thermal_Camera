@@ -97,7 +97,6 @@
 #define DEFAULT_RUNTIME_SKIP_FRAMES   0
 #define DEFAULT_SHUTTER_CLOSE_WAIT_MS 200
 #define SHUTTER_CALIBRATION_PAUSED    1
-#define RAW_STATS_WAIT_TIMEOUT_MS     1000U
 #define YUV_STATS_WAIT_TIMEOUT_MS     1000U
 #define ISP_STEP_TEST_WAIT_TIMEOUT_SEC 30U
 
@@ -174,7 +173,6 @@ static volatile int g_raw_copy_done = 0;
 static volatile int g_raw_copy_result = 0;
 static UINTPTR g_raw_copy_dst_va = 0;
 static UINT32 g_raw_copy_size = 0;
-static volatile int g_raw_stats_pending = 1;
 static volatile int g_yuv_stats_pending = 0;
 static UINT32 g_yuv_diag_id = 0;
 static UINT32 g_display_diag_count = 0;
@@ -272,33 +270,6 @@ static int liveview_request_raw_copy(UINTPTR dst_va, UINT32 size)
 static int liveview_copy_next_raw(UINTPTR dst_va, UINT32 size)
 {
 	return liveview_request_raw_copy(dst_va, size);
-}
-
-static int liveview_request_raw_statistics(void)
-{
-	UINT32 wait_count = 0;
-
-	if (!liveview_is_running()) {
-		printf("RAW statistics unavailable: Liveview is stopped\n");
-		return -1;
-	}
-
-	if (g_raw_stats_pending) {
-		printf("RAW statistics request is already pending\n");
-	} else {
-		printf("RAW statistics requested for the next VCAP input frame\n");
-		g_raw_stats_pending = 1;
-	}
-
-	while (g_raw_stats_pending && wait_count < RAW_STATS_WAIT_TIMEOUT_MS) {
-		usleep(1000);
-		wait_count++;
-	}
-	if (g_raw_stats_pending) {
-		printf("RAW statistics are still pending; waiting for a VCAP frame\n");
-	}
-
-	return 0;
 }
 
 static int liveview_request_yuv_statistics(void)
@@ -753,7 +724,6 @@ typedef struct _VIDEO_LIVEVIEW {
 	HD_PATH_ID proc_ctrl;
 	HD_PATH_ID proc_path;
 	HD_PATH_ID proc_path_3dnr;
-	HD_PATH_ID proc_path_diag;
 	HD_VIDEO_FRAME vpe_held_input;
 	int vpe_input_held;
 
@@ -831,7 +801,6 @@ typedef struct {
 	int cap_started;
 	int proc_started;
 	int proc_3dnr_started;
-	int proc_diag_started;
 } LIVEVIEW_CONTEXT;
 
 typedef struct {
@@ -1445,126 +1414,6 @@ exit:
 		fclose(fp);
 	}
 	return ret;
-}
-
-static void print_requested_raw_frame_stats(const HD_VIDEO_FRAME *p_video_frame)
-{
-	UINTPTR blk_pa;
-	UINTPTR map_pa;
-	UINTPTR map_va;
-	UINTPTR raw_va;
-	UINT32 data_offset;
-	UINT32 stride;
-	UINT32 plane_height;
-	UINT32 map_size;
-	UINT32 width;
-	UINT32 height;
-	UINT32 x;
-	UINT32 y;
-	UINT16 min_value = 0x3FFF;
-	UINT16 max_value = 0;
-	UINT16 container_min = 0xFFFF;
-	UINT16 container_max = 0;
-	UINT64 sum = 0;
-	UINT64 container_sum = 0;
-	UINT64 low2_count[4] = {0};
-	UINT64 pixel_count;
-
-	if (!g_raw_stats_pending) {
-		return;
-	}
-	if (p_video_frame == NULL) {
-		printf("RAW diagnostic: frame pointer is NULL\n");
-		g_raw_stats_pending = 0;
-		return;
-	}
-
-	printf("RAW diagnostic frame: blk=0x%llX, pa=0x%llX, "
-	       "fmt=0x%08X, dim=%ux%u, loff=%u, ph=%u\n",
-	       (unsigned long long)p_video_frame->blk,
-	       (unsigned long long)p_video_frame->phy_addr[0],
-	       p_video_frame->pxlfmt,
-	       p_video_frame->dim.w, p_video_frame->dim.h,
-	       p_video_frame->loff[0], p_video_frame->ph[0]);
-	if (p_video_frame->phy_addr[0] == 0) {
-		printf("RAW diagnostic: physical address is zero\n");
-		g_raw_stats_pending = 0;
-		return;
-	}
-
-	width = p_video_frame->dim.w;
-	height = p_video_frame->dim.h;
-	stride = p_video_frame->loff[0];
-	if (stride < width * sizeof(UINT16)) {
-		stride *= sizeof(UINT16);
-	}
-	plane_height = p_video_frame->ph[0] != 0 ?
-		p_video_frame->ph[0] : height;
-	if (width == 0 || height == 0 || plane_height < height ||
-	    stride < width * sizeof(UINT16)) {
-		printf("RAW stats invalid frame: %ux%u, stride=%u, ph=%u\n",
-		       width, height, stride, plane_height);
-		g_raw_stats_pending = 0;
-		return;
-	}
-
-	blk_pa = p_video_frame->blk != 0 ?
-		hd_common_mem_blk2pa(p_video_frame->blk) : 0;
-	if (blk_pa != 0 && p_video_frame->phy_addr[0] >= blk_pa) {
-		map_pa = blk_pa;
-		data_offset = (UINT32)(p_video_frame->phy_addr[0] - blk_pa);
-	} else {
-		/* Some VCAP frames do not expose a common-pool block handle. */
-		map_pa = p_video_frame->phy_addr[0];
-		data_offset = 0;
-	}
-
-	map_size = data_offset + stride * plane_height;
-	map_va = (UINTPTR)hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE_CACHE,
-		map_pa, map_size);
-	if (map_va == 0) {
-		printf("RAW stats mmap error\n");
-		g_raw_stats_pending = 0;
-		return;
-	}
-
-	hd_common_mem_flush_cache((void *)map_va, map_size);
-	raw_va = map_va + data_offset;
-	for (y = 0; y < height; y++) {
-		const UINT16 *row = (const UINT16 *)(raw_va + y * stride);
-
-		for (x = 0; x < width; x++) {
-			UINT16 container_value = row[x];
-			UINT16 value = container_value & 0x3FFF;
-
-			if (value < min_value) min_value = value;
-			if (value > max_value) max_value = value;
-			sum += value;
-			if (container_value < container_min) container_min = container_value;
-			if (container_value > container_max) container_max = container_value;
-			container_sum += container_value;
-			low2_count[container_value & 0x3U]++;
-		}
-	}
-	pixel_count = (UINT64)width * height;
-
-	printf("RAW frame: fmt=0x%08X, dim=%ux%u, stride=%u, ph=%u\n",
-	       p_video_frame->pxlfmt, width, height, stride, plane_height);
-	printf("RAW14 stats: min=%u, max=%u, mean=%llu, pixels=%llu\n",
-	       min_value, max_value,
-	       (unsigned long long)(sum / pixel_count),
-	       (unsigned long long)pixel_count);
-	printf("RAW16 container: min=%u, max=%u, mean=%llu\n",
-	       container_min, container_max,
-	       (unsigned long long)(container_sum / pixel_count));
-	printf("RAW low2 histogram: 0=%llu, 1=%llu, 2=%llu, 3=%llu\n",
-	       (unsigned long long)low2_count[0],
-	       (unsigned long long)low2_count[1],
-	       (unsigned long long)low2_count[2],
-	       (unsigned long long)low2_count[3]);
-
-	hd_common_mem_munmap((void *)map_va, map_size);
-	g_raw_stats_pending = 0;
 }
 
 static UINT8 yuv_histogram_percentile(const UINT64 histogram[256],
@@ -2850,8 +2699,6 @@ static HD_RESULT open_module(VIDEO_LIVEVIEW *p_stream, HD_DIM* p_proc_max_dim)
 			return ret;
 		}
 	}
-	if ((ret = hd_videoproc_open(HD_VIDEOPROC_0_IN_0, HD_VIDEOPROC_0_OUT_1, &p_stream->proc_path_diag)) != HD_OK)
-		return ret;
 	ret = video_output_open(&p_stream->video_output, g_output_mode,
 		VIDEO_OUTPUT_WIDTH, VIDEO_OUTPUT_HEIGHT, g_fps,
 		RTSP_OUTPUT_BITRATE_BPS, g_thermal_pipeline_id);
@@ -2885,7 +2732,6 @@ static HD_RESULT close_module(VIDEO_LIVEVIEW *p_stream)
 	CLOSE_PATH(p_stream->cap_path, hd_videocap_close, "videocap");
 	CLOSE_PATH(p_stream->proc_path, hd_videoproc_close, "videoproc");
 	CLOSE_PATH(p_stream->proc_path_3dnr, hd_videoproc_close, "videoproc 3DNR");
-	CLOSE_PATH(p_stream->proc_path_diag, hd_videoproc_close, "videoproc diagnostic");
 #undef CLOSE_PATH
 
 	return ret;
@@ -3595,7 +3441,6 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		return;
 	}
 	liveview_apply_agc_request(p_stream0);
-	print_requested_raw_frame_stats(&vcap_video_frame);
 
 	if (g_raw_copy_pending) {
 		g_raw_copy_result =
@@ -4014,7 +3859,6 @@ static void *yuv_statistics_thread(void *arg)
 {
 	VIDEO_LIVEVIEW *p_stream0 = (VIDEO_LIVEVIEW *)arg;
 	HD_VIDEO_FRAME proc_frame = {0};
-	HD_VIDEO_FRAME video_frame = {0};
 	HD_RESULT ret;
 
 	while (p_stream0->proc_enter == 0 && p_stream0->proc_exit == 0) {
@@ -4028,6 +3872,10 @@ static void *yuv_statistics_thread(void *arg)
 			HD_VIDEO_FRAME *display = &proc_frame;
 			int have_mirror = 0;
 			int display_ok = 1;
+
+			/* Inspect OUT_0 before display processing; no extra output path. */
+			process_requested_isp_step_test_output(p_stream0, &proc_frame);
+			print_requested_yuv_frame_stats(&proc_frame);
 			if (g_liveview_mirror) {
 				ret = vpe_mirror_process(&proc_frame, &mirrored);
 				if (ret != HD_OK) {
@@ -4067,23 +3915,6 @@ static void *yuv_statistics_thread(void *arg)
 			if (ret != HD_OK) printf("proc_release error=%d\n", ret);
 		} else if (ret != HD_ERR_UNDERRUN && ret != HD_ERR_TIMEDOUT) {
 			printf("proc_pull error=%d !!\r\n\r\n", ret);
-		}
-
-		ret = hd_videoproc_pull_out_buf(
-			p_stream0->proc_path_diag, &video_frame, 100);
-		if (ret != HD_OK) {
-			if (ret != HD_ERR_UNDERRUN && ret != HD_ERR_TIMEDOUT) {
-				printf("diagnostic proc_pull error=%d !!\r\n\r\n", ret);
-			}
-			continue;
-		}
-
-		process_requested_isp_step_test_output(p_stream0, &video_frame);
-		print_requested_yuv_frame_stats(&video_frame);
-		ret = hd_videoproc_release_out_buf(
-			p_stream0->proc_path_diag, &video_frame);
-		if (ret != HD_OK) {
-			printf("diagnostic proc_release error=%d !!\r\n\r\n", ret);
 		}
 	}
 
@@ -4303,14 +4134,6 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 			goto exit;
 		}
 	}
-	/* OUT_1 is independent from video output OUT_0 and 3DNR reference OUT_4. */
-	ret = set_proc_param(stream[0].proc_path_diag, &main_dim,
-		HD_VIDEO_PXLFMT_YUV420, 1);
-	if (ret != HD_OK) {
-		printf("set diagnostic proc fail=%d\n", ret);
-		goto exit;
-	}
-
 	ret = liveview_set_proc_input_direction(stream[0].proc_path);
 	if (ret != HD_OK) {
 		goto exit;
@@ -4381,12 +4204,6 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 		}
 		ctx->proc_3dnr_started = 1;
 	}
-	ret = hd_videoproc_start(stream[0].proc_path_diag);
-	if (ret != HD_OK) {
-		printf("diagnostic videoproc start failed=%d\n", ret);
-		goto exit;
-	}
-	ctx->proc_diag_started = 1;
 	// wait thermal stable
 	sleep(2);
 	ret = video_output_start(&stream[0].video_output);
@@ -4397,7 +4214,6 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	}
 
 	// start raw_pipeline_thread
-	printf("RAW diagnostic build: metadata+stats v2 enabled\n");
 	stream[0].cap_enter = 1;
 	stream[0].proc_enter = 1;
 
@@ -4481,11 +4297,6 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		ret = hd_videoproc_stop(stream[0].proc_path_3dnr);
 		if (ret != HD_OK) printf("videoproc 3DNR stop failed=%d\n", ret);
 		ctx->proc_3dnr_started = 0;
-	}
-	if (ctx->proc_diag_started) {
-		ret = hd_videoproc_stop(stream[0].proc_path_diag);
-		if (ret != HD_OK) printf("diagnostic videoproc stop failed=%d\n", ret);
-		ctx->proc_diag_started = 0;
 	}
 	if (ctx->proc_bound) {
 		ret = hd_videoproc_unbind(HD_VIDEOPROC_0_OUT_0);
@@ -4649,6 +4460,36 @@ exit:
 int liveview_is_running(void)
 {
 	return g_liveview.running;
+}
+
+static int liveview_set_correction_enabled(int is_bpr, int enabled)
+{
+	int ret = 1;
+
+	/* Serialize with Start/Stop and with the RAW correction/calibration work. */
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	if (g_liveview.running) {
+		pthread_mutex_lock(&g_manual_calibration_lock);
+		if (is_bpr) {
+			ret = bpr_set_enabled(enabled);
+		} else {
+			nuc_set_enabled(enabled);
+			ret = nuc_is_enabled() == !!enabled ? 0 : -1;
+		}
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+	}
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+	return ret;
+}
+
+int liveview_set_bpr_enabled(int enabled)
+{
+	return liveview_set_correction_enabled(1, enabled);
+}
+
+int liveview_set_nuc_enabled(int enabled)
+{
+	return liveview_set_correction_enabled(0, enabled);
 }
 
 int liveview_get_result(void)
@@ -5080,8 +4921,7 @@ int liveview_menu_run(void)
 		printf(" 3. Shutter control\n");
 		printf(" 4. Snapshot RAW\n");
 		printf(" 5. Recording RAW\n");
-		printf(" 6. Show current RAW statistics\n");
-		printf(" 7. Show current YUV statistics\n");
+		printf(" 6. Show current YUV statistics\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("Settings: CFG Setting -> Liveview setting\n");
@@ -5116,10 +4956,6 @@ int liveview_menu_run(void)
 			break;
 
 		case 6:
-			ret = liveview_request_raw_statistics();
-			break;
-
-		case 7:
 			ret = liveview_request_yuv_statistics();
 			break;
 

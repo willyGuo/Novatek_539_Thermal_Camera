@@ -135,7 +135,7 @@ Liveview menu
  2. Liveview control
  3. Shutter control
  4. Snapshot RAW
- 5. Show current RAW statistics
+ 5. Recording RAW
  6. Show current YUV statistics
  0. Back
 ```
@@ -167,9 +167,9 @@ FPS、startup skip 與 runtime skip 都移到 `CFG Setting -> Liveview setting`�
 
 每個檔案大小為 `640 * 512 * 2 = 655360 bytes`。RAW pipeline thread 先複製同一張 frame 的各階段資料，再由背景 writer 寫入 SD 卡；快照當下仍會增加一次或多次 frame copy 的負擔。
 
-`Show current RAW statistics` 會要求 RAW pipeline 對下一張 VCAP 輸入 frame 計算並顯示格式、尺寸、stride、最低值、最高值、平均值與 pixel 數量。統計對象是套用 TDC／NUC／FFC 前的 Sensor RAW14；選單執行緒不會自行 pull 或 release VCAP buffer。
+RAW Statistics（包含開機第一張 RAW 的統計）已移除。VideoProc 不再開啟診斷 OUT_1；YUV Statistics 與 ISP Step Test 共用主路 OUT_0，在 VPE 鏡像、CLAHE、DDE 與偽色彩處理前讀取影像。手動執行診斷時，統計與存檔仍可能暫時增加顯示延遲。
 
-`Show current YUV statistics` 會對下一張 VideoProc diagnostic OUT1 的 Y plane 顯示 min／max／mean、P1／P50／P99、unique value 數量、Y=0／Y=255 的 pixel 數量與比例，以及可能被 limited-range 顯示截斷的 Y<=16／Y>=235 比例，並在 `/mnt/sd/` 保存：
+`Show current YUV statistics` 會對下一張 VideoProc OUT_0 的 Y plane 顯示 min／max／mean、P1／P50／P99、unique value 數量、Y=0／Y=255 的 pixel 數量與比例，以及可能被 limited-range 顯示截斷的 Y<=16／Y>=235 比例，並在 `/mnt/sd/` 保存：
 
 - `display_diag_NNNN_videoproc_y8_640x512.raw`：VideoProc 後、JPEG 前的 8-bit Y plane，固定為 `640 * 512 = 327680 bytes`
 - `display_diag_NNNN_uvc_mjpeg_640x512.jpg`：UVC encoder 產生、送往 USB 前的單張 MJPEG bitstream；檔案大小依影像內容而變動
@@ -368,6 +368,8 @@ NUC enable 與 Sensor Temperature table interval 已集中到 `CFG Setting -> NU
 `Toggle per-pixel Blackbody Dynamic NUC` 開啟時會一次載入五組 K/B，並由五張 reference RAW 預先計算每個 Pixel 的四個相鄰中點。每張即時 RAW 送進 NUC 前，CPU 對 `640x512` 每個 Pixel 比較四個中點，選出 point1 到 point5，將該點同座標的 K/B 複製到目前的 DDR K/B table，再交給 `VENDOR_GRPH_CMD_Non_uni_correction`。等於中點時選較高 point。若某 Pixel 的五個 reference RAW 不是嚴格遞增，該 Pixel 改用五張 reference RAW 的全畫面平均中點，並在開啟時列出 fallback Pixel 數量。為了暫時進行板端效能測試，目前即使五個全畫面平均不是由低到高也只會印出警告並繼續啟用；此時只可使用 CPU／GFX／FPS 數據，校正畫質與 point distribution 不具判定意義。
 
 Dynamic NUC 逐幀不讀 SD 卡。常駐 CPU heap 為五組 K/B `6,553,600` bytes，加四組 UINT16 threshold `2,621,440` bytes，共 `9,175,040` bytes；現有 GFX DDR 動態 K/B buffer 另為 `1,310,720` bytes。每 60 張會列出 mmap/cache、CPU 選表、K/B cache flush、三者合計的 `CPU added`、GFX 與 NUC 總耗時平均值、最大值、pipeline FPS，以及 P1 到 P5 的 Pixel 分布。`CPU added` 是相對原本固定 table NUC 新增的主要 CPU 成本；30 FPS 的單幀時間預算約為 `33.3 ms`。關閉 Dynamic NUC 時會釋放來源 table/threshold，並重新載入 Sensor Temperature table；Dynamic NUC 開啟期間不執行週期性的 Sensor Temperature table 更新。
+
+手動 Bright/Dark BPR 校正前會自動關閉 BPR 與 NUC；校正成功後載入新表並開啟 BPR，NUC 保持關閉。接著執行 Sensor Temperature NUC 校正時，會先關閉 NUC、載入最新的 `dpc_table.bin` 並開啟 BPR；只有 NUC 校正、儲存與重新載入全部成功後，才自動開啟 NUC。開關同步存入 CFG，必要的開關切換或 BPR table 載入失敗時會中止校正。此流程不變更 Runtime BPR 與 Blackbody 校正的使用方式。
 
 NUC 校正開始前會先等待正在執行的自動 shutter cycle 完成；接著暫停 interval 觸發的 FFC／Runtime BPR 關快門，讓 Low／High RAW 擷取期間保持快門開啟。校正成功或失敗離開時都會恢復自動 shutter cycle，並從完整的 `shutter_interval_sec` 重新計時。
 

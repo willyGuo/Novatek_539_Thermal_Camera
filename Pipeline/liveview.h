@@ -8,6 +8,9 @@ int liveview_restart(void);
 int liveview_is_running(void);
 int liveview_get_result(void);
 int liveview_get_shutter_fault(void);
+/* Returns 0 when applied, 1 when stopped (CFG only), -1 on failure. */
+int liveview_set_bpr_enabled(int enabled);
+int liveview_set_nuc_enabled(int enabled);
 void liveview_set_mirror(int enabled);
 int liveview_get_mirror(void);
 int liveview_set_fps(unsigned int fps);

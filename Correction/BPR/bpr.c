@@ -19,6 +19,8 @@
 #include "hd_videocapture.h"
 #include "bpr.h"
 #include "../../Config/hardware_config.h"
+#include "../../Config/app_config.h"
+#include "../NUC/nuc.h"
 
 #define VENDOR_DPC_DIR "/mnt/sd/thermal_op"
 #define VENDOR_DPC_BIN_PATH VENDOR_DPC_DIR "/dpc_table.bin"
@@ -134,23 +136,23 @@ unsigned int bpr_get_threshold(void)
 int bpr_set_enabled(int enable)
 {
 	int ret;
+	IQT_DPC_PARAM switch_param = {0};
 
-	g_bpr_enabled = enable ? 1 : 0;
-
-	dpc_param.id = g_thermal_pipeline_id;
-	ret = vendor_isp_get_iq(IQT_ITEM_DPC_PARAM, &dpc_param);
+	switch_param.id = g_thermal_pipeline_id;
+	ret = vendor_isp_get_iq(IQT_ITEM_DPC_PARAM, &switch_param);
 	if (ret < 0) {
 		printf("GET IQT_ITEM_DPC_PARAM fail!\n");
 		return ret;
 	}
 
-	dpc_param.dpc.enable = g_bpr_enabled;
-	ret = vendor_isp_set_iq(IQT_ITEM_DPC_PARAM, &dpc_param);
+	switch_param.dpc.enable = enable ? 1 : 0;
+	ret = vendor_isp_set_iq(IQT_ITEM_DPC_PARAM, &switch_param);
 	if (ret < 0) {
 		printf("SET IQT_ITEM_DPC_PARAM fail!\n");
 		return ret;
 	}
 
+	g_bpr_enabled = switch_param.dpc.enable;
 	printf("BPR %s\n", g_bpr_enabled ? "on" : "off");
 	return 0;
 }
@@ -737,6 +739,15 @@ static int dpc_run_bright_dark(unsigned int sensor_id, unsigned int dpc_th, UINT
 		calibration_state("BPR", 1);
 	}
 
+	/* Manual BPR must inspect the sensor without old BPR/NUC correction. */
+	if (app_config_update_int("nuc_correction", 0) != 0 ||
+	    app_config_update_int("bpr_correction", 0) != 0 ||
+	    nuc_is_enabled() || bpr_is_enabled()) {
+		printf("BPR calibration aborted: BPR and NUC must both be off\n");
+		goto exit;
+	}
+	printf("BPR calibration: BPR off, NUC off (CFG saved)\n");
+
 	printf("BPR cfg threshold = %u RAW8 DN\r\n\r\n", dpc_th);
 
 	printf("\n Bright Pixel: blackbody calibration.\r\n\n");
@@ -770,6 +781,14 @@ static int dpc_run_bright_dark(unsigned int sensor_id, unsigned int dpc_th, UINT
 	}
 
 	usleep(1000000);
+	if (bpr_load_table() != 0 ||
+	    app_config_update_int("bpr_correction", 1) != 0 ||
+	    !bpr_is_enabled()) {
+		printf("BPR table saved but loading or enabling BPR failed; NUC remains off\n");
+		ret = -1;
+		goto exit;
+	}
+	printf("BPR calibration complete: new table loaded, BPR on (CFG saved), NUC off. Run Sensor Temperature NUC calibration to rebuild NUC.\n");
 
 exit:
 	dpc_free_buf(&raw_buf, &tmp_buf, &dp_buf);

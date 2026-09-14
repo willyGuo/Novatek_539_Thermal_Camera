@@ -15,6 +15,7 @@
 #endif
 
 #include "../../Config/app_config.h"
+#include "../BPR/bpr.h"
 #include "../../Device/SensorTemp/sensor_temp.h"
 #include "vendor_gfx.h"
 
@@ -1847,6 +1848,20 @@ int nuc_five_point_sensor_temp_calibration(void)
 		calibration_state("NUC", 1);
 	}
 
+	/* Pair the new NUC tables with the latest saved BPR table. */
+	if (app_config_update_int("nuc_correction", 0) != 0 ||
+	    nuc_is_enabled()) {
+		printf("NUC calibration aborted: cannot turn NUC off\n");
+		goto exit;
+	}
+	if (bpr_load_table() != 0 ||
+	    app_config_update_int("bpr_correction", 1) != 0 ||
+	    !bpr_is_enabled()) {
+		printf("NUC calibration aborted: latest BPR table must be loaded and enabled\n");
+		goto exit;
+	}
+	printf("NUC calibration: latest BPR table loaded, BPR on, NUC off (CFG saved)\n");
+
 	active_pixel_count = g_nuc.active_width * g_nuc.active_height;
 	low_raw = (UINT16 *)malloc(g_nuc.table_size);
 	high_raw = (UINT16 *)malloc(g_nuc.table_size);
@@ -1906,7 +1921,20 @@ exit:
 	free(frame_raw);
 	free(raw_sum);
 
-	nuc_reload_table();
+	if (nuc_reload_table() != 0) {
+		ret = -1;
+	}
+	if (ret == 0) {
+		if (app_config_update_int("nuc_correction", 1) != 0 ||
+		    !nuc_is_enabled()) {
+			printf("NUC tables saved but enabling NUC failed\n");
+			ret = -1;
+		} else {
+			printf("NUC calibration complete: BPR on, NUC on (CFG saved)\n");
+		}
+	} else {
+		printf("NUC calibration failed; NUC was not automatically enabled\n");
+	}
 	if (calibration_state != 0) {
 		calibration_state("NUC", 0);
 	}
