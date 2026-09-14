@@ -14,7 +14,7 @@
 
 #include "liveview.h"
 #include "../Enhancement/CLAHE/clahe_frame.h"
-#include "../DDE/dde_frame.h"
+#include "../Enhancement/DDE/dde_frame.h"
 #include "../ISP/Pseudo/pseudo.h"
 #include "../ISP/VPE/vpe_mirror.h"
 
@@ -796,6 +796,8 @@ typedef struct _VIDEO_LIVEVIEW {
 	UINTPTR thermal_agc_histogram_p1_p99_out_pa;
 	UINTPTR thermal_agc_histogram_p1_p99_out_va;
 	uint32_t *agc_histogram_p1_p99_workspace;
+	AGC_HISTOGRAM_P1_P99_STATE agc_histogram_p1_p99_state;
+	uint32_t *agc_fieldscale_horizontal_workspace;
 	AGC_FIELDSCALE_STATE agc_fieldscale_state;
 	UINT32 agc_histogram_p1_p99_frame_count;
 	UINT32 agc_histogram_p1_p99_error_count;
@@ -2423,6 +2425,7 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	UINT32 i;
 	UINT32 blk_size = VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
 	size_t histogram_bins;
+	size_t fieldscale_workspace_values;
 
 	// init TDC output frame
 	p_stream->thermal_tdc_out_blk = hd_common_mem_get_block(
@@ -2644,6 +2647,17 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		       histogram_bins);
 		return HD_ERR_NG;
 	}
+	agc_histogram_p1_p99_state_reset(
+		&p_stream->agc_histogram_p1_p99_state);
+	fieldscale_workspace_values =
+		agc_fieldscale_horizontal_workspace_values(RAW_SIZE_W);
+	p_stream->agc_fieldscale_horizontal_workspace = (uint32_t *)calloc(
+		fieldscale_workspace_values, sizeof(uint32_t));
+	if (p_stream->agc_fieldscale_horizontal_workspace == NULL) {
+		printf("allocate Fieldscale horizontal workspace fail, values=%zu\n",
+		       fieldscale_workspace_values);
+		return HD_ERR_NG;
+	}
 	agc_fieldscale_state_reset(&p_stream->agc_fieldscale_state);
 
 	// init ISP RAW14-to-Y8 step-test input frame
@@ -2750,8 +2764,12 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	p_stream->thermal_isp_step_test_pa = 0;
 	free(p_stream->agc_histogram_p1_p99_workspace);
 	p_stream->agc_histogram_p1_p99_workspace = NULL;
+	free(p_stream->agc_fieldscale_horizontal_workspace);
+	p_stream->agc_fieldscale_horizontal_workspace = NULL;
 	p_stream->agc_histogram_p1_p99_frame_count = 0;
 	p_stream->agc_histogram_p1_p99_error_count = 0;
+	agc_histogram_p1_p99_state_reset(
+		&p_stream->agc_histogram_p1_p99_state);
 	agc_fieldscale_state_reset(&p_stream->agc_fieldscale_state);
 	p_stream->agc_fieldscale_frame_count = 0;
 	p_stream->agc_fieldscale_error_count = 0;
@@ -3232,6 +3250,7 @@ static int liveview_apply_agc_histogram_p1_p99(
 		RAW_SIZE_H,
 		p_stream->agc_histogram_p1_p99_workspace,
 		histogram_bins,
+		&p_stream->agc_histogram_p1_p99_state,
 		p1_result,
 		p99_result);
 
@@ -3295,6 +3314,7 @@ static int liveview_apply_agc_fieldscale(
 	    p_stream->thermal_agc_histogram_p1_p99_out_pa == 0 ||
 	    p_stream->thermal_agc_histogram_p1_p99_out_va == 0 ||
 	    p_stream->thermal_agc_histogram_p1_p99_out_blk == 0 ||
+	    p_stream->agc_fieldscale_horizontal_workspace == NULL ||
 	    input_frame->dim.w != RAW_SIZE_W ||
 	    input_frame->dim.h != RAW_SIZE_H) {
 		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
@@ -3353,7 +3373,9 @@ static int liveview_apply_agc_fieldscale(
 		output_stride,
 		RAW_SIZE_W,
 		RAW_SIZE_H,
-		&p_stream->agc_fieldscale_state);
+		&p_stream->agc_fieldscale_state,
+		p_stream->agc_fieldscale_horizontal_workspace,
+		agc_fieldscale_horizontal_workspace_values(RAW_SIZE_W));
 	if (measure_latency) {
 		core_done_us = liveview_get_time_us();
 		latency.core_us = core_done_us - map_cache_done_us;
@@ -3526,6 +3548,8 @@ static void liveview_apply_agc_request(VIDEO_LIVEVIEW *stream)
         printf("AGC switch failed: ISP tone update failed; runtime unchanged\n");
         return;
     }
+    agc_histogram_p1_p99_state_reset(
+        &stream->agc_histogram_p1_p99_state);
     agc_fieldscale_state_reset(&stream->agc_fieldscale_state);
     agc_mode_set((AGC_MODE)requested);
     printf("AGC applied: %s\n", agc_mode_name((AGC_MODE)requested));

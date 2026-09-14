@@ -1,6 +1,6 @@
 #include "app_config.h"
 #include "../Enhancement/CLAHE/clahe.h"
-#include "../DDE/dde.h"
+#include "../Enhancement/DDE/dde.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -57,6 +57,7 @@ typedef struct {
 	int tdc_correction;
 	unsigned int tdc_interval_sec;
 	int agc_histogram_p1_p99_enable;
+	AGC_HISTOGRAM_P1_P99_PARAMS histogram_p1_p99;
 	int agc_min_max_tone_curve_enable;
 	int agc_fieldscale_enable;
 	AGC_FIELDSCALE_PARAMS fieldscale;
@@ -206,6 +207,7 @@ static void cfg_initialize_from_runtime(void)
 	g_app_config.tdc_interval_sec = tdc_get_interval_sec();
 	g_app_config.agc_histogram_p1_p99_enable =
 		agc_histogram_p1_p99_is_enabled();
+	agc_histogram_p1_p99_get_params(&g_app_config.histogram_p1_p99);
 	g_app_config.agc_min_max_tone_curve_enable =
 		agc_min_max_tone_curve_is_enabled();
 	g_app_config.agc_fieldscale_enable = agc_fieldscale_is_enabled();
@@ -395,6 +397,18 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 			}
 			config->agc_min_max_tone_curve_enable = 0;
 		}
+	} else if (strcmp(key,
+			   "agc_histogram_p1_p99_temporal_previous_percent") == 0) {
+		AGC_HISTOGRAM_P1_P99_PARAMS params = config->histogram_p1_p99;
+		if (cfg_parse_long(value, &int_value) != 0 ||
+		    int_value < 0 || int_value > 99) {
+			return -1;
+		}
+		params.temporal_previous_percent = (uint32_t)int_value;
+		if (agc_histogram_p1_p99_validate_params(&params) != 0) {
+			return -1;
+		}
+		config->histogram_p1_p99 = params;
 	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->agc_min_max_tone_curve_enable = int_value ? 1 : 0;
@@ -440,7 +454,10 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	unsigned int point;
 	int apply_result = 0;
 
-	if (agc_fieldscale_set_params(&config->fieldscale) != 0) return -1;
+	if (agc_histogram_p1_p99_set_params(&config->histogram_p1_p99) != 0 ||
+	    agc_fieldscale_set_params(&config->fieldscale) != 0) {
+		return -1;
+	}
 
 	if (liveview_set_fps(config->fps) != 0) {
 		apply_result = -1;
@@ -629,6 +646,9 @@ int app_config_get_int(const char *key, int *value)
 		*value = (int)g_app_config.tdc_interval_sec;
 	} else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0) {
 		*value = g_app_config.agc_histogram_p1_p99_enable;
+	} else if (strcmp(key,
+			  "agc_histogram_p1_p99_temporal_previous_percent") == 0) {
+		*value = (int)g_app_config.histogram_p1_p99.temporal_previous_percent;
 	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
 		*value = g_app_config.agc_min_max_tone_curve_enable;
 	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
@@ -692,7 +712,13 @@ int app_config_update_int(const char *key, int value)
         ret = clahe_set_params(&g_app_config.clahe);
         if (ret != 0) return ret;
         printf("CLAHE saved; applies on next display frame (no restart)\n");
-    } else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0 ||
+	} else if (strcmp(key,
+			  "agc_histogram_p1_p99_temporal_previous_percent") == 0) {
+		ret = agc_histogram_p1_p99_set_params(
+			&g_app_config.histogram_p1_p99);
+		if (ret != 0) return ret;
+		printf("Histogram P1/P99 temporal smoothing saved and applied; next Histogram frame uses the new value (no restart)\n");
+	} else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0 ||
         strcmp(key, "agc_min_max_tone_curve_enable") == 0 ||
         strcmp(key, "agc_fieldscale_enable") == 0) {
         app_config_request_agc();
@@ -840,6 +866,9 @@ static int app_config_show_file(void)
 	       "agc_histogram_p1_p99_enable",
 	       g_app_config.agc_histogram_p1_p99_enable,
 	       g_app_config.agc_histogram_p1_p99_enable ? "on" : "off");
+	printf("       * %-27s = %u\n",
+	       "agc_histogram_p1_p99_temporal_previous_percent",
+	       g_app_config.histogram_p1_p99.temporal_previous_percent);
 
 	printf("  2. %-31s = %d (%s)\n",
 	       "agc_min_max_tone_curve_enable",
@@ -1276,6 +1305,55 @@ static int app_config_apply_fieldscale_preset(const char *name,
 	return 0;
 }
 
+static int app_config_histogram_p1_p99_menu_run(void)
+{
+	int option;
+	int ret = 0;
+
+	while (1) {
+		AGC_HISTOGRAM_P1_P99_PARAMS runtime;
+
+		agc_histogram_p1_p99_get_params(&runtime);
+		printf("----------------------------------------\n");
+		printf("Histogram P1/P99 AGC (CPU) setting\n");
+		printf(" 1. Histogram P1/P99 on/off: CFG=%s, runtime=%s\n",
+		       g_app_config.agc_histogram_p1_p99_enable ? "on" : "off",
+		       agc_histogram_p1_p99_is_enabled() ? "on" : "off");
+		printf(" 2. Temporal Smoothing (previous %%, 0: off): CFG=%u, runtime=%u\n",
+		       g_app_config.histogram_p1_p99.temporal_previous_percent,
+		       runtime.temporal_previous_percent);
+		printf(" 0. Back\n");
+		printf("Smoothing is applied to P1/P99 thresholds, not output pixels.\n");
+		printf("Parameter changes apply on the next Histogram frame and reset temporal history; no restart.\n");
+		printf("Current AGC on/off applies on next RAW frame; changing algorithm requires Restart.\n");
+
+		option = app_config_read_option();
+		switch (option) {
+		case 1:
+			ret = app_config_prompt_bool(
+				"Histogram P1/P99 AGC (CPU)",
+				"agc_histogram_p1_p99_enable",
+				g_app_config.agc_histogram_p1_p99_enable);
+			break;
+		case 2:
+			ret = app_config_prompt_int(
+				"Temporal Smoothing (previous %, 0: off)",
+				"agc_histogram_p1_p99_temporal_previous_percent",
+				(int)g_app_config.histogram_p1_p99.temporal_previous_percent,
+				0, 99, " %");
+			break;
+		case 0:
+		case -1:
+			return ret;
+		case MENU_OPTION_REFRESH:
+			break;
+		default:
+			printf("Invalid option\n");
+			break;
+		}
+	}
+}
+
 static int app_config_fieldscale_menu_run(void)
 {
     int option;
@@ -1338,7 +1416,7 @@ static int app_config_agc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("AGC setting (mutually exclusive)\n");
-		printf(" 1. Histogram P1/P99 AGC (CPU) on/off\n");
+		printf(" 1. Histogram P1/P99 AGC (CPU) setting\n");
 		printf(" 2. Min/Max Tone Curve AGC (ISP) on/off\n");
 		printf(" 3. Fieldscale Local Adaptive AGC (CPU) setting\n");
 		printf(" 4. Disable all AGC\n");
@@ -1358,10 +1436,7 @@ static int app_config_agc_menu_run(void)
 		option = app_config_read_option();
 		switch (option) {
 		case 1:
-			ret = app_config_prompt_bool(
-				"Histogram P1/P99 AGC (CPU)",
-				"agc_histogram_p1_p99_enable",
-				g_app_config.agc_histogram_p1_p99_enable);
+			ret = app_config_histogram_p1_p99_menu_run();
 			break;
 		case 2:
 			ret = app_config_prompt_bool(
@@ -1750,6 +1825,8 @@ int app_config_save(void)
 		g_app_config.tdc_interval_sec);
 	fprintf(fp, "agc_histogram_p1_p99_enable=%d\n",
 		g_app_config.agc_histogram_p1_p99_enable);
+	fprintf(fp, "agc_histogram_p1_p99_temporal_previous_percent=%u\n",
+		g_app_config.histogram_p1_p99.temporal_previous_percent);
 	fprintf(fp, "agc_min_max_tone_curve_enable=%d\n",
 		g_app_config.agc_min_max_tone_curve_enable);
 	fprintf(fp, "agc_fieldscale_enable=%d\n",

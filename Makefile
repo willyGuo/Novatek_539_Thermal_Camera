@@ -42,9 +42,9 @@ EXTRA_LDFLAGS = \
 	-l:libFileSys.a -l:libFsLinux.a \
 	-Wl,--end-group -lrt -lstdc++
 SRC += \
-	DDE/dde_dt_opt.c \
-	DDE/dde.c \
-	DDE/dde_frame.c \
+	Enhancement/DDE/dde_dt_opt.c \
+	Enhancement/DDE/dde.c \
+	Enhancement/DDE/dde_frame.c \
 	main.c \
 	app.c \
 	Pipeline/menu.c \

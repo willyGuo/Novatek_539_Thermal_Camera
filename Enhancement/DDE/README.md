@@ -30,7 +30,5 @@ The display worker lazily allocates and reuses its workspace; shutdown releases
 it after the worker has joined. No intermediate uint16_t image is allocated.
 SDK build and board cache/FPS testing are still required.
 
-Host core test (GCC):
-
-    gcc -std=c99 -O2 -Wall -Wextra -Werror DDE/tests/test_dde.c DDE/dde_dt_opt.c DDE/dde.c -o test_dde -lm -lpthread
-    ./test_dde
+Module location: Enhancement/DDE. The Makefile builds dde_dt_opt.c, dde.c,
+and dde_frame.c; the active display integration is Pipeline/liveview.c.

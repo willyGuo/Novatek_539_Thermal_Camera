@@ -6,6 +6,12 @@
 #include <string.h>
 
 #include "agc_mode.h"
+#if defined(__LINUX)
+#include <pthread.h>
+#else
+#include <FreeRTOS_POSIX.h>
+#include <FreeRTOS_POSIX/pthread.h>
+#endif
 
 /*
  * Histogram P1/P99 AGC core for 14-bit thermal RAW stored in UINT16.
@@ -26,6 +32,60 @@
 #define AGC_PERCENTILE_LOW           1U
 #define AGC_PERCENTILE_HIGH          99U
 #define MENU_OPTION_REFRESH          (-2)
+
+#define AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS {90U}
+static const AGC_HISTOGRAM_P1_P99_PARAMS g_histogram_defaults =
+	AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS;
+static AGC_HISTOGRAM_P1_P99_PARAMS g_histogram_params =
+	AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS;
+static pthread_mutex_t g_histogram_params_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void agc_histogram_p1_p99_get_default_params(
+	AGC_HISTOGRAM_P1_P99_PARAMS *params)
+{
+	if (params != NULL) {
+		*params = g_histogram_defaults;
+	}
+}
+
+int agc_histogram_p1_p99_validate_params(
+	const AGC_HISTOGRAM_P1_P99_PARAMS *params)
+{
+	if (params == NULL || params->temporal_previous_percent > 99U) {
+		return -1;
+	}
+	return 0;
+}
+
+int agc_histogram_p1_p99_set_params(
+	const AGC_HISTOGRAM_P1_P99_PARAMS *params)
+{
+	if (agc_histogram_p1_p99_validate_params(params) != 0) {
+		return -1;
+	}
+	pthread_mutex_lock(&g_histogram_params_lock);
+	g_histogram_params = *params;
+	pthread_mutex_unlock(&g_histogram_params_lock);
+	return 0;
+}
+
+void agc_histogram_p1_p99_get_params(
+	AGC_HISTOGRAM_P1_P99_PARAMS *params)
+{
+	if (params == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_histogram_params_lock);
+	*params = g_histogram_params;
+	pthread_mutex_unlock(&g_histogram_params_lock);
+}
+
+void agc_histogram_p1_p99_state_reset(AGC_HISTOGRAM_P1_P99_STATE *state)
+{
+	if (state != NULL) {
+		memset(state, 0, sizeof(*state));
+	}
+}
 
 static int agc_histogram_p1_p99_read_option(void)
 {
@@ -79,9 +139,11 @@ int agc_histogram_p1_p99_apply_u14(const uint16_t *input,
 				   uint32_t height,
 				   uint32_t *histogram_workspace,
 				   size_t histogram_bins,
+				   AGC_HISTOGRAM_P1_P99_STATE *state,
 				   uint16_t *p1_result,
 				   uint16_t *p99_result)
 {
+	AGC_HISTOGRAM_P1_P99_PARAMS params;
 	uint64_t pixel_count;
 	uint64_t low_target;
 	uint64_t high_target;
@@ -93,7 +155,9 @@ int agc_histogram_p1_p99_apply_u14(const uint16_t *input,
 	uint32_t bin;
 	uint32_t range;
 
+	agc_histogram_p1_p99_get_params(&params);
 	if (input == NULL || output == NULL || histogram_workspace == NULL ||
+	    state == NULL ||
 	    width == 0U || height == 0U ||
 	    histogram_bins < AGC_HISTOGRAM_BIN_COUNT ||
 	    input_stride_bytes < width * sizeof(uint16_t) ||
@@ -153,6 +217,30 @@ int agc_histogram_p1_p99_apply_u14(const uint16_t *input,
 			break;
 		}
 	}
+
+	if (memcmp(&state->previous_params, &params, sizeof(params)) != 0) {
+		state->temporal_valid = 0;
+		state->previous_params = params;
+	}
+	if (state->temporal_valid) {
+		p1_value = (uint16_t)(
+			((uint32_t)p1_value *
+			 (AGC_PERCENT_SCALE - params.temporal_previous_percent) +
+			 (uint32_t)state->previous_p1 *
+			 params.temporal_previous_percent +
+			 AGC_PERCENT_SCALE / 2U) /
+			 AGC_PERCENT_SCALE);
+		p99_value = (uint16_t)(
+			((uint32_t)p99_value *
+			 (AGC_PERCENT_SCALE - params.temporal_previous_percent) +
+			 (uint32_t)state->previous_p99 *
+			 params.temporal_previous_percent +
+			 AGC_PERCENT_SCALE / 2U) /
+			 AGC_PERCENT_SCALE);
+	}
+	state->previous_p1 = p1_value;
+	state->previous_p99 = p99_value;
+	state->temporal_valid = 1;
 
 	if (p1_result != NULL) {
 		*p1_result = p1_value;

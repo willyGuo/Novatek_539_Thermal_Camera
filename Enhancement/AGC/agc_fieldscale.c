@@ -305,11 +305,52 @@ static void fieldscale_interpolation_from_q16(int64_t source_q16,
 	}
 }
 
+static void fieldscale_expand_grid_row_q8(const uint32_t *min_grid,
+					  const uint32_t *max_grid,
+					  uint32_t grid_y,
+					  uint32_t width,
+					  int64_t source_x_start_q16,
+					  int64_t source_x_step_q16,
+					  const AGC_FIELDSCALE_PARAMS *params,
+					  uint32_t *min_horizontal,
+					  uint32_t *max_horizontal)
+{
+	int64_t source_x_q16 = source_x_start_q16;
+	uint32_t x;
+
+	for (x = 0; x < width; x++) {
+		uint32_t x0;
+		uint32_t x1;
+		uint32_t fx;
+
+		fieldscale_interpolation_from_q16(source_x_q16,
+			params->grid_size, &x0, &x1, &fx);
+		min_horizontal[x] = fieldscale_lerp_q16(
+			min_grid[fieldscale_grid_index(x0, grid_y)],
+			min_grid[fieldscale_grid_index(x1, grid_y)], fx);
+		max_horizontal[x] = fieldscale_lerp_q16(
+			max_grid[fieldscale_grid_index(x0, grid_y)],
+			max_grid[fieldscale_grid_index(x1, grid_y)], fx);
+		source_x_q16 += source_x_step_q16;
+	}
+}
+
 void agc_fieldscale_state_reset(AGC_FIELDSCALE_STATE *state)
 {
 	if (state != NULL) {
 		memset(state, 0, sizeof(*state));
 	}
+}
+
+size_t agc_fieldscale_horizontal_workspace_values(uint32_t width)
+{
+	size_t count = (size_t)width * 4U;
+
+	if (width == 0U || count / 4U != width ||
+	    count > SIZE_MAX / sizeof(uint32_t)) {
+		return 0U;
+	}
+	return count;
 }
 
 int agc_fieldscale_apply_u14(const uint16_t *input,
@@ -318,23 +359,32 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 			     uint32_t output_stride_bytes,
 			     uint32_t width,
 			     uint32_t height,
-			     AGC_FIELDSCALE_STATE *state)
+			     AGC_FIELDSCALE_STATE *state,
+			     uint32_t *horizontal_workspace,
+			     size_t horizontal_workspace_values)
 {
 	AGC_FIELDSCALE_PARAMS frame_params;
 	const AGC_FIELDSCALE_PARAMS *params = &frame_params;
 	uint32_t min_grid[AGC_FIELDSCALE_GRID_COUNT] = {0};
 	uint32_t max_grid[AGC_FIELDSCALE_GRID_COUNT] = {0};
 	uint32_t scratch[AGC_FIELDSCALE_GRID_COUNT] = {0};
+	uint32_t *min_horizontal[2];
+	uint32_t *max_horizontal[2];
+	uint32_t cached_grid_y[2] = {UINT32_MAX, UINT32_MAX};
 	uint32_t x;
 	uint32_t y;
 	uint32_t iteration;
+	size_t horizontal_count;
 	int64_t source_y_q16;
 	int64_t source_x_start_q16;
 	int64_t source_x_step_q16;
 	int64_t source_y_step_q16;
 
 	agc_fieldscale_get_params(&frame_params);
+	horizontal_count = agc_fieldscale_horizontal_workspace_values(width);
 	if (input == NULL || output == NULL || state == NULL ||
+	    horizontal_workspace == NULL || horizontal_count == 0U ||
+	    horizontal_workspace_values < horizontal_count ||
 	    width < params->grid_size ||
 	    height < params->grid_size ||
 	    input_stride_bytes < width * sizeof(uint16_t) ||
@@ -343,6 +393,10 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 	    (output_stride_bytes & 1U) != 0U) {
 		return AGC_FIELDSCALE_STATUS_INVALID_ARGUMENT;
 	}
+	min_horizontal[0] = horizontal_workspace;
+	min_horizontal[1] = horizontal_workspace + width;
+	max_horizontal[0] = horizontal_workspace + (size_t)width * 2U;
+	max_horizontal[1] = horizontal_workspace + (size_t)width * 3U;
 
     if (memcmp(&state->previous_params, params, sizeof(*params)) != 0) {
         state->temporal_valid = 0;
@@ -400,40 +454,50 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 		uint32_t y0;
 		uint32_t y1;
 		uint32_t fy;
-		int64_t source_x_q16 = source_x_start_q16;
+		uint32_t y0_slot;
+		uint32_t y1_slot;
 
 		fieldscale_interpolation_from_q16(source_y_q16,
 			params->grid_size, &y0, &y1, &fy);
+		if (cached_grid_y[0] == y0) {
+			y0_slot = 0U;
+		} else if (cached_grid_y[1] == y0) {
+			y0_slot = 1U;
+		} else {
+			y0_slot = cached_grid_y[0] != y1 ? 0U : 1U;
+			fieldscale_expand_grid_row_q8(min_grid, max_grid, y0,
+				width, source_x_start_q16, source_x_step_q16,
+				params, min_horizontal[y0_slot],
+				max_horizontal[y0_slot]);
+			cached_grid_y[y0_slot] = y0;
+		}
+		if (y1 == y0) {
+			y1_slot = y0_slot;
+		} else if (cached_grid_y[0] == y1) {
+			y1_slot = 0U;
+		} else if (cached_grid_y[1] == y1) {
+			y1_slot = 1U;
+		} else {
+			y1_slot = 1U - y0_slot;
+			fieldscale_expand_grid_row_q8(min_grid, max_grid, y1,
+				width, source_x_start_q16, source_x_step_q16,
+				params, min_horizontal[y1_slot],
+				max_horizontal[y1_slot]);
+			cached_grid_y[y1_slot] = y1;
+		}
 		for (x = 0; x < width; x++) {
-			uint32_t x0;
-			uint32_t x1;
-			uint32_t fx;
-			uint32_t min_top;
-			uint32_t min_bottom;
-			uint32_t max_top;
-			uint32_t max_bottom;
 			uint32_t min_field;
 			uint32_t max_field;
 			uint32_t low;
 			uint32_t high;
 			uint32_t value_q8;
 
-			fieldscale_interpolation_from_q16(source_x_q16,
-				params->grid_size, &x0, &x1, &fx);
-			min_top = fieldscale_lerp_q16(
-				min_grid[fieldscale_grid_index(x0, y0)],
-				min_grid[fieldscale_grid_index(x1, y0)], fx);
-			min_bottom = fieldscale_lerp_q16(
-				min_grid[fieldscale_grid_index(x0, y1)],
-				min_grid[fieldscale_grid_index(x1, y1)], fx);
-			max_top = fieldscale_lerp_q16(
-				max_grid[fieldscale_grid_index(x0, y0)],
-				max_grid[fieldscale_grid_index(x1, y0)], fx);
-			max_bottom = fieldscale_lerp_q16(
-				max_grid[fieldscale_grid_index(x0, y1)],
-				max_grid[fieldscale_grid_index(x1, y1)], fx);
-			min_field = fieldscale_lerp_q16(min_top, min_bottom, fy);
-			max_field = fieldscale_lerp_q16(max_top, max_bottom, fy);
+			min_field = fieldscale_lerp_q16(
+				min_horizontal[y0_slot][x],
+				min_horizontal[y1_slot][x], fy);
+			max_field = fieldscale_lerp_q16(
+				max_horizontal[y0_slot][x],
+				max_horizontal[y1_slot][x], fy);
 			low = min_field < max_field ? min_field : max_field;
 			high = min_field < max_field ? max_field : min_field;
 			value_q8 = (input_row[x] & FIELDSCALE_RAW14_MAX) *
@@ -448,7 +512,6 @@ int agc_fieldscale_apply_u14(const uint16_t *input,
 					(uint64_t)(value_q8 - low) *
 					FIELDSCALE_RAW14_MAX / (high - low));
 			}
-			source_x_q16 += source_x_step_q16;
 		}
 		source_y_q16 += source_y_step_q16;
 	}
