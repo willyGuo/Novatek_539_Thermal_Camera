@@ -29,11 +29,9 @@
 #define AGC_RAW_MAX                  ((1U << AGC_RAW_BITS) - 1U)
 #define AGC_HISTOGRAM_BIN_COUNT      (1U << AGC_RAW_BITS)
 #define AGC_PERCENT_SCALE            100U
-#define AGC_PERCENTILE_LOW           1U
-#define AGC_PERCENTILE_HIGH          99U
 #define MENU_OPTION_REFRESH          (-2)
 
-#define AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS {90U}
+#define AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS {90U, 1U, 99U}
 static const AGC_HISTOGRAM_P1_P99_PARAMS g_histogram_defaults =
 	AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS;
 static AGC_HISTOGRAM_P1_P99_PARAMS g_histogram_params =
@@ -51,7 +49,9 @@ void agc_histogram_p1_p99_get_default_params(
 int agc_histogram_p1_p99_validate_params(
 	const AGC_HISTOGRAM_P1_P99_PARAMS *params)
 {
-	if (params == NULL || params->temporal_previous_percent > 99U) {
+	if (params == NULL || params->temporal_previous_percent > 99U ||
+	    params->percentile_high > 100U ||
+	    params->percentile_low >= params->percentile_high) {
 		return -1;
 	}
 	return 0;
@@ -186,10 +186,10 @@ int agc_histogram_p1_p99_apply_u14(const uint16_t *input,
 		}
 	}
 
-	/* Match the original integer histogram definition: 1% from each tail. */
-	low_target = pixel_count * AGC_PERCENTILE_LOW / AGC_PERCENT_SCALE;
+	/* Preserve the original integer tail ranks; P0/P100 select min/max. */
+	low_target = pixel_count * params.percentile_low / AGC_PERCENT_SCALE;
 	high_target = pixel_count *
-		(AGC_PERCENT_SCALE - AGC_PERCENTILE_HIGH) /
+		(AGC_PERCENT_SCALE - params.percentile_high) /
 		AGC_PERCENT_SCALE;
 	if (low_target == 0U) {
 		low_target = 1U;
@@ -311,13 +311,16 @@ int agc_histogram_p1_p99_menu_run(void)
 	int running = 1;
 
 	while (running) {
+		AGC_HISTOGRAM_P1_P99_PARAMS params;
+		agc_histogram_p1_p99_get_params(&params);
 		printf("----------------------------------------\n");
 		printf("Histogram P1/P99 AGC (CPU) status\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("selected runtime AGC: %s\n",
 		       agc_mode_name(agc_mode_get()));
-		printf("mapping: P1..P99 -> RAW14 0..16383, CPU Linear Stretch\n");
+		printf("mapping: P%u..P%u -> RAW14 0..16383, CPU Linear Stretch\n",
+		       params.percentile_low, params.percentile_high);
 		printf("pipeline: after RAW snapshot, before VideoProc\n");
 		printf("Settings: CFG Setting -> AGC setting (mutually exclusive)\n");
 

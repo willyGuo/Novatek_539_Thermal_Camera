@@ -405,10 +405,15 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 			return -1;
 		}
 		params.temporal_previous_percent = (uint32_t)int_value;
-		if (agc_histogram_p1_p99_validate_params(&params) != 0) {
-			return -1;
-		}
 		config->histogram_p1_p99 = params;
+	} else if (strcmp(key, "agc_histogram_p1_p99_percentile_low") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0 ||
+		    int_value < 0 || int_value > 99) return -1;
+		config->histogram_p1_p99.percentile_low = (uint32_t)int_value;
+	} else if (strcmp(key, "agc_histogram_p1_p99_percentile_high") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0 ||
+		    int_value < 1 || int_value > 100) return -1;
+		config->histogram_p1_p99.percentile_high = (uint32_t)int_value;
 	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->agc_min_max_tone_curve_enable = int_value ? 1 : 0;
@@ -559,6 +564,11 @@ int app_config_load(void)
 	}
 	fclose(fp);
 
+	/* Validate the pair after parsing so CFG key order does not matter. */
+	if (agc_histogram_p1_p99_validate_params(&loaded_config.histogram_p1_p99) != 0) {
+		printf("Invalid Histogram percentiles: require 0 <= low < high <= 100; keep previous Histogram settings\n");
+		loaded_config.histogram_p1_p99 = g_app_config.histogram_p1_p99;
+	}
 	loaded_config.initialized = 1;
 	g_app_config = loaded_config;
 	if (!g_app_config.boot_load) {
@@ -649,6 +659,10 @@ int app_config_get_int(const char *key, int *value)
 	} else if (strcmp(key,
 			  "agc_histogram_p1_p99_temporal_previous_percent") == 0) {
 		*value = (int)g_app_config.histogram_p1_p99.temporal_previous_percent;
+	} else if (strcmp(key, "agc_histogram_p1_p99_percentile_low") == 0) {
+		*value = (int)g_app_config.histogram_p1_p99.percentile_low;
+	} else if (strcmp(key, "agc_histogram_p1_p99_percentile_high") == 0) {
+		*value = (int)g_app_config.histogram_p1_p99.percentile_high;
 	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
 		*value = g_app_config.agc_min_max_tone_curve_enable;
 	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
@@ -693,7 +707,8 @@ int app_config_update_int(const char *key, int value)
 	old_config = g_app_config;
 	snprintf(value_text, sizeof(value_text), "%d", value);
 	ret = cfg_store_pair(&g_app_config, key, value_text);
-	if (ret != 0) {
+	if (ret != 0 ||
+	    agc_histogram_p1_p99_validate_params(&g_app_config.histogram_p1_p99) != 0) {
 		printf("invalid CFG setting %s=%s\n", key, value_text);
 		g_app_config = old_config;
 		return -1;
@@ -728,11 +743,13 @@ int app_config_update_int(const char *key, int value)
         if (ret != 0) return ret;
         printf("CLAHE saved; applies on next display frame (no restart)\n");
 	} else if (strcmp(key,
-			  "agc_histogram_p1_p99_temporal_previous_percent") == 0) {
+			  "agc_histogram_p1_p99_temporal_previous_percent") == 0 ||
+		   strcmp(key, "agc_histogram_p1_p99_percentile_low") == 0 ||
+		   strcmp(key, "agc_histogram_p1_p99_percentile_high") == 0) {
 		ret = agc_histogram_p1_p99_set_params(
 			&g_app_config.histogram_p1_p99);
 		if (ret != 0) return ret;
-		printf("Histogram P1/P99 temporal smoothing saved and applied; next Histogram frame uses the new value (no restart)\n");
+		printf("Histogram P1/P99 parameters saved and applied; next Histogram frame resets temporal history (no restart)\n");
 	} else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0 ||
         strcmp(key, "agc_min_max_tone_curve_enable") == 0 ||
         strcmp(key, "agc_fieldscale_enable") == 0) {
@@ -884,6 +901,12 @@ static int app_config_show_file(void)
 	printf("       * %-27s = %u\n",
 	       "agc_histogram_p1_p99_temporal_previous_percent",
 	       g_app_config.histogram_p1_p99.temporal_previous_percent);
+	printf("       * %-27s = %u\n",
+	       "agc_histogram_p1_p99_percentile_low",
+	       g_app_config.histogram_p1_p99.percentile_low);
+	printf("       * %-27s = %u\n",
+	       "agc_histogram_p1_p99_percentile_high",
+	       g_app_config.histogram_p1_p99.percentile_high);
 
 	printf("  2. %-31s = %d (%s)\n",
 	       "agc_min_max_tone_curve_enable",
@@ -1339,6 +1362,11 @@ static int app_config_histogram_p1_p99_menu_run(void)
 		printf(" 2. Temporal Smoothing (previous %%, 0: off): CFG=%u, runtime=%u\n",
 		       g_app_config.histogram_p1_p99.temporal_previous_percent,
 		       runtime.temporal_previous_percent);
+		printf(" 3. Low percentile P (0..99): CFG=%u, runtime=%u\n",
+		       g_app_config.histogram_p1_p99.percentile_low, runtime.percentile_low);
+		printf(" 4. High percentile P (1..100): CFG=%u, runtime=%u\n",
+		       g_app_config.histogram_p1_p99.percentile_high, runtime.percentile_high);
+		printf("Low P must be below High P; P0/P100 uses min/max.\n");
 		printf(" 0. Back\n");
 		printf("Smoothing is applied to P1/P99 thresholds, not output pixels.\n");
 		printf("Parameter changes apply on the next Histogram frame and reset temporal history; no restart.\n");
@@ -1358,6 +1386,18 @@ static int app_config_histogram_p1_p99_menu_run(void)
 				"agc_histogram_p1_p99_temporal_previous_percent",
 				(int)g_app_config.histogram_p1_p99.temporal_previous_percent,
 				0, 99, " %");
+			break;
+		case 3:
+			ret = app_config_prompt_int("Low percentile P",
+				"agc_histogram_p1_p99_percentile_low",
+				(int)g_app_config.histogram_p1_p99.percentile_low,
+				0, (int)g_app_config.histogram_p1_p99.percentile_high - 1, " %");
+			break;
+		case 4:
+			ret = app_config_prompt_int("High percentile P",
+				"agc_histogram_p1_p99_percentile_high",
+				(int)g_app_config.histogram_p1_p99.percentile_high,
+				(int)g_app_config.histogram_p1_p99.percentile_low + 1, 100, " %");
 			break;
 		case 0:
 		case -1:
@@ -1870,6 +1910,10 @@ int app_config_save(void)
 		g_app_config.agc_histogram_p1_p99_enable);
 	fprintf(fp, "agc_histogram_p1_p99_temporal_previous_percent=%u\n",
 		g_app_config.histogram_p1_p99.temporal_previous_percent);
+	fprintf(fp, "agc_histogram_p1_p99_percentile_low=%u\n",
+		g_app_config.histogram_p1_p99.percentile_low);
+	fprintf(fp, "agc_histogram_p1_p99_percentile_high=%u\n",
+		g_app_config.histogram_p1_p99.percentile_high);
 	fprintf(fp, "agc_min_max_tone_curve_enable=%d\n",
 		g_app_config.agc_min_max_tone_curve_enable);
 	fprintf(fp, "agc_fieldscale_enable=%d\n",
