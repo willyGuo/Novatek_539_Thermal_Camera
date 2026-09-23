@@ -788,7 +788,7 @@ static int dpc_run_bright_dark(unsigned int sensor_id, unsigned int dpc_th, UINT
 		ret = -1;
 		goto exit;
 	}
-	printf("BPR calibration complete: new table loaded, BPR on (CFG saved), NUC off. Run Sensor Temperature NUC calibration to rebuild NUC.\n");
+	printf("BPR calibration complete: new table loaded, BPR on (CFG saved), NUC off. Run NUC menu 2 (5 point Blackbody Temperature calibration) to rebuild NUC.\n");
 
 exit:
 	dpc_free_buf(&raw_buf, &tmp_buf, &dp_buf);

@@ -26,13 +26,8 @@ void nuc_bind_calibration_state_callback(
 	NUC_CALIBRATION_STATE_CB calibration_state);
 int nuc_init_table(void);
 int nuc_reload_table(void);
-int nuc_update_sensor_temp_table(void);
-int nuc_update_sensor_temp_table_periodic(void);
 int nuc_five_point_sensor_temp_calibration(void);
 int nuc_five_point_blackbody_temp_calibration(void);
-int nuc_set_blackbody_dynamic_enabled(int enable);
-int nuc_is_blackbody_dynamic_enabled(void);
-int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame);
 void nuc_set_sensor_temp_point(UINT32 point, float temp_c);
 float nuc_get_sensor_temp_point(UINT32 point);
 void nuc_set_enabled(int enable);

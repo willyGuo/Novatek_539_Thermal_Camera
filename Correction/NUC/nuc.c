@@ -26,11 +26,13 @@
 #define NUC_CALIBRATION_FRAME_COUNT 4U
 #define NUC_SENSOR_TEMP_DEFAULT_INTERVAL_SEC 60U
 #define NUC_SENSOR_TABLE_FILE_COUNT (NUC_FIVE_POINT_COUNT * 2U)
-#define NUC_BLACKBODY_TABLE_FILE_COUNT (NUC_FIVE_POINT_COUNT * 3U)
-#define NUC_DYNAMIC_BOUNDARY_COUNT (NUC_FIVE_POINT_COUNT - 1U)
+#define NUC_BLACKBODY_SEGMENT_COUNT (NUC_FIVE_POINT_COUNT - 1U)
+#define NUC_BLACKBODY_TABLE_FILE_COUNT (NUC_FIVE_POINT_COUNT + NUC_BLACKBODY_SEGMENT_COUNT * 2U)
+#define NUC_DYNAMIC_BOUNDARY_COUNT (NUC_BLACKBODY_SEGMENT_COUNT - 1U)
 #define NUC_DYNAMIC_REPORT_FRAME_COUNT 60U
-/* Temporary: allow invalid reference ordering so board performance can be measured. */
-#define NUC_DYNAMIC_PERF_ALLOW_NON_MONOTONIC 1
+#ifndef NUC_DYNAMIC_PERF_LOG_ENABLE
+#define NUC_DYNAMIC_PERF_LOG_ENABLE 0
+#endif
 #define NUC_TABLE_STAGE_SUFFIX ".new"
 #define NUC_TABLE_BACKUP_SUFFIX ".bak"
 #define MENU_OPTION_REFRESH (-2)
@@ -47,12 +49,10 @@ typedef struct {
 	UINT32 active_height;
 	int enabled;
 	int table_loaded;
-	int sensor_temp_table_point;
 	float sensor_temp_points[NUC_FIVE_POINT_COUNT];
-	int blackbody_dynamic_enabled;
 	UINT16 *blackbody_source_tables;
-	UINT16 *blackbody_k[NUC_FIVE_POINT_COUNT];
-	UINT16 *blackbody_b[NUC_FIVE_POINT_COUNT];
+	UINT16 *blackbody_k[NUC_BLACKBODY_SEGMENT_COUNT];
+	UINT16 *blackbody_b[NUC_BLACKBODY_SEGMENT_COUNT];
 	UINT16 *blackbody_thresholds;
 	UINT32 blackbody_reference_mean[NUC_FIVE_POINT_COUNT];
 	UINT32 blackbody_invalid_pixel_count;
@@ -62,7 +62,7 @@ typedef struct {
 	UINT64 dynamic_flush_us;
 	UINT64 dynamic_gfx_us;
 	UINT64 dynamic_max_total_us;
-	UINT64 dynamic_point_pixels[NUC_FIVE_POINT_COUNT];
+	UINT64 dynamic_point_pixels[NUC_BLACKBODY_SEGMENT_COUNT];
 	UINT64 dynamic_last_frame_start_us;
 	UINT64 dynamic_interval_us;
 	UINT64 dynamic_interval_count;
@@ -251,8 +251,11 @@ static void nuc_format_table_path(char *path, size_t path_size,
 				  const char *dir, UINT32 point,
 				  const char *type, const char *suffix)
 {
-	snprintf(path, path_size, "%s/point%u_%s.bin%s",
-		 dir, point + 1, type, suffix);
+	/* Distinct segment names prevent loading legacy one-point K/B tables. */
+	const char *prefix = strcmp(dir, NUC_BLACKBODY_TEMP_DIR) == 0 &&
+		strcmp(type, "RAW") != 0 ? "segment" : "point";
+	snprintf(path, path_size, "%s/%s%u_%s.bin%s",
+		 dir, prefix, point + 1, type, suffix);
 }
 
 static UINT32 nuc_prepare_table_transaction(
@@ -262,6 +265,7 @@ static UINT32 nuc_prepare_table_transaction(
 	static const char *blackbody_types[] = {"K", "B", "RAW"};
 	const char **types = include_raw ? blackbody_types : sensor_types;
 	UINT32 type_count = include_raw ? 3U : 2U;
+	UINT32 index = 0;
 	UINT32 point;
 	UINT32 type;
 
@@ -270,7 +274,10 @@ static UINT32 nuc_prepare_table_transaction(
 	       sizeof(NUC_TABLE_TRANSACTION_FILE));
 	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
 		for (type = 0; type < type_count; type++) {
-			UINT32 index = point * type_count + type;
+			if (include_raw && point >= NUC_BLACKBODY_SEGMENT_COUNT &&
+			    strcmp(types[type], "RAW") != 0) {
+				continue;
+			}
 
 			nuc_format_table_path(
 				files[index].final_path,
@@ -284,11 +291,11 @@ static UINT32 nuc_prepare_table_transaction(
 				files[index].backup_path,
 				sizeof(files[index].backup_path), dir, point,
 				types[type], NUC_TABLE_BACKUP_SUFFIX);
+			index++;
 		}
 	}
 
-	return include_raw ? NUC_BLACKBODY_TABLE_FILE_COUNT :
-		NUC_SENSOR_TABLE_FILE_COUNT;
+	return index;
 }
 
 static int nuc_cleanup_staged_tables(const char *dir, int include_raw)
@@ -478,36 +485,6 @@ static int nuc_recover_blackbody_temp_tables(void)
 				  "NUC blackbody temperature", 1);
 }
 
-static int nuc_validate_all_sensor_temp_tables(void)
-{
-	char k_path[128];
-	char b_path[128];
-	UINT32 point;
-
-	if (g_nuc.table_size == 0) {
-		printf("NUC table size is not ready\n");
-		return -1;
-	}
-
-	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
-		snprintf(k_path, sizeof(k_path), "%s/point%u_K.bin",
-			 NUC_SENSOR_TEMP_DIR, point + 1);
-		snprintf(b_path, sizeof(b_path), "%s/point%u_B.bin",
-			 NUC_SENSOR_TEMP_DIR, point + 1);
-
-		if (nuc_validate_table_file(k_path) != 0 ||
-		    nuc_validate_table_file(b_path) != 0) {
-			printf("NUC Sensor Temperature point %u table is incomplete\n",
-			       point + 1);
-			return -1;
-		}
-	}
-
-	printf("All %u NUC Sensor Temperature K/B tables are valid\n",
-	       NUC_FIVE_POINT_COUNT);
-	return 0;
-}
-
 static int nuc_validate_all_blackbody_temp_tables(void)
 {
 	char path[128];
@@ -522,6 +499,10 @@ static int nuc_validate_all_blackbody_temp_tables(void)
 
 	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
 		for (type = 0; type < 3U; type++) {
+			if (point >= NUC_BLACKBODY_SEGMENT_COUNT &&
+			    strcmp(types[type], "RAW") != 0) {
+				continue;
+			}
 			nuc_format_table_path(path, sizeof(path),
 				NUC_BLACKBODY_TEMP_DIR, point, types[type], "");
 			if (nuc_validate_table_file(path) != 0) {
@@ -532,8 +513,8 @@ static int nuc_validate_all_blackbody_temp_tables(void)
 		}
 	}
 
-	printf("All %u blackbody temperature RAW/K/B sets are valid\n",
-	       NUC_FIVE_POINT_COUNT);
+	printf("All %u blackbody RAW points and %u K/B segments are valid\n",
+	       NUC_FIVE_POINT_COUNT, NUC_BLACKBODY_SEGMENT_COUNT);
 	return 0;
 }
 
@@ -765,63 +746,6 @@ static int nuc_build_table(const UINT16 *low_raw,
 	return 0;
 }
 
-static int nuc_build_blackbody_point_table(const UINT16 *average_raw,
-					   UINT16 *k_tbl,
-					   UINT16 *b_tbl)
-{
-	UINT64 sum = 0;
-	UINT32 mean;
-	UINT32 active_pixel_count;
-	UINT32 clipped_count = 0;
-	UINT32 x;
-	UINT32 y;
-
-	/* b_tbl may reuse average_raw; k_tbl must remain a separate buffer. */
-	if (average_raw == NULL || k_tbl == NULL || b_tbl == NULL ||
-	    average_raw == k_tbl || k_tbl == b_tbl ||
-	    nuc_validate_image_layout() != 0) {
-		return -1;
-	}
-
-	active_pixel_count = g_nuc.active_width * g_nuc.active_height;
-	for (y = 0; y < g_nuc.active_height; y++) {
-		UINT32 row = (g_nuc.active_y + y) * g_nuc.raw_width +
-			g_nuc.active_x;
-
-		for (x = 0; x < g_nuc.active_width; x++) {
-			sum += average_raw[row + x];
-		}
-	}
-	mean = (UINT32)(sum / active_pixel_count);
-
-	for (y = 0; y < g_nuc.raw_height; y++) {
-		for (x = 0; x < g_nuc.raw_width; x++) {
-			UINT32 pixel = y * g_nuc.raw_width + x;
-			int active = x >= g_nuc.active_x &&
-				x < g_nuc.active_x + g_nuc.active_width &&
-				y >= g_nuc.active_y &&
-				y < g_nuc.active_y + g_nuc.active_height;
-
-			k_tbl[pixel] = (UINT16)NUC_GAIN_ONE;
-			if (active) {
-				long long offset =
-					(long long)average_raw[pixel] - mean;
-
-				if (offset < -32768 || offset > 32767) {
-					clipped_count++;
-				}
-				b_tbl[pixel] = nuc_store_b_i64(offset);
-			} else {
-				b_tbl[pixel] = 0;
-			}
-		}
-	}
-
-	printf("NUC blackbody one-point active %ux%u mean=%u, clipped B=%u\n",
-	       g_nuc.active_width, g_nuc.active_height, mean, clipped_count);
-	return 0;
-}
-
 static int nuc_stage_sensor_temp_table(UINT32 point)
 {
 	char k_path[128];
@@ -860,7 +784,7 @@ static int nuc_stage_blackbody_temp_table(UINT32 point,
 	char k_path[128];
 	char b_path[128];
 
-	if (point >= NUC_FIVE_POINT_COUNT || k_tbl == NULL || b_tbl == NULL) {
+	if (point >= NUC_BLACKBODY_SEGMENT_COUNT || k_tbl == NULL || b_tbl == NULL) {
 		return -1;
 	}
 	if (nuc_make_blackbody_temp_dir() != 0) {
@@ -880,7 +804,7 @@ static int nuc_stage_blackbody_temp_table(UINT32 point,
 	}
 	nuc_sync_table_dir(NUC_BLACKBODY_TEMP_DIR);
 
-	printf("Blackbody temperature point %u K/B table staged\n", point + 1);
+	printf("Blackbody segment %u K/B table staged\n", point + 1);
 	return 0;
 }
 
@@ -1156,20 +1080,6 @@ static UINT64 nuc_get_time_us(void)
 		(UINT64)ts.tv_nsec / 1000U;
 }
 
-static UINT16 nuc_midpoint_boundary(UINT16 low, UINT16 high)
-{
-	UINT16 swap;
-
-	/* Keep the performance-test fallback free from unsigned underflow. */
-	if (high < low) {
-		swap = low;
-		low = high;
-		high = swap;
-	}
-	/* Integer RAW below the midpoint uses the lower point; equality is higher. */
-	return (UINT16)(low + ((UINT32)high - low + 1U) / 2U);
-}
-
 static int nuc_pixel_is_active(UINT32 pixel)
 {
 	UINT32 x = pixel % g_nuc.raw_width;
@@ -1225,13 +1135,14 @@ static void nuc_release_blackbody_dynamic_sources(void)
 	free(g_nuc.blackbody_thresholds);
 	g_nuc.blackbody_source_tables = NULL;
 	g_nuc.blackbody_thresholds = NULL;
-	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
+	for (point = 0; point < NUC_BLACKBODY_SEGMENT_COUNT; point++) {
 		g_nuc.blackbody_k[point] = NULL;
 		g_nuc.blackbody_b[point] = NULL;
-		g_nuc.blackbody_reference_mean[point] = 0;
 	}
+	memset(g_nuc.blackbody_reference_mean, 0,
+	       sizeof(g_nuc.blackbody_reference_mean));
 	g_nuc.blackbody_invalid_pixel_count = 0;
-	g_nuc.blackbody_dynamic_enabled = 0;
+	g_nuc.table_loaded = 0;
 	nuc_reset_dynamic_performance();
 }
 
@@ -1242,8 +1153,8 @@ static int nuc_load_blackbody_dynamic_sources(void)
 	UINT16 *previous_raw = NULL;
 	UINT16 *current_raw = NULL;
 	unsigned char *invalid_pixel = NULL;
-	UINT16 *k_tables[NUC_FIVE_POINT_COUNT];
-	UINT16 *b_tables[NUC_FIVE_POINT_COUNT];
+	UINT16 *k_tables[NUC_BLACKBODY_SEGMENT_COUNT];
+	UINT16 *b_tables[NUC_BLACKBODY_SEGMENT_COUNT];
 	UINT32 reference_mean[NUC_FIVE_POINT_COUNT];
 	UINT32 pixel_count;
 	UINT32 invalid_count = 0;
@@ -1253,7 +1164,6 @@ static int nuc_load_blackbody_dynamic_sources(void)
 	size_t source_bytes;
 	size_t threshold_bytes;
 	char path[128];
-	int reference_order_valid = 1;
 	int ret = -1;
 
 	if (nuc_validate_image_layout() != 0) {
@@ -1266,7 +1176,7 @@ static int nuc_load_blackbody_dynamic_sources(void)
 
 	pixel_count = g_nuc.table_size / sizeof(UINT16);
 	source_bytes = (size_t)g_nuc.table_size *
-		NUC_FIVE_POINT_COUNT * 2U;
+		NUC_BLACKBODY_SEGMENT_COUNT * 2U;
 	threshold_bytes = (size_t)g_nuc.table_size *
 		NUC_DYNAMIC_BOUNDARY_COUNT;
 	source_tables = (UINT16 *)malloc(source_bytes);
@@ -1282,7 +1192,7 @@ static int nuc_load_blackbody_dynamic_sources(void)
 		goto exit;
 	}
 
-	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
+	for (point = 0; point < NUC_BLACKBODY_SEGMENT_COUNT; point++) {
 		k_tables[point] = source_tables +
 			(size_t)(point * 2U) * pixel_count;
 		b_tables[point] = source_tables +
@@ -1311,8 +1221,9 @@ static int nuc_load_blackbody_dynamic_sources(void)
 
 	for (point = 1; point < NUC_FIVE_POINT_COUNT; point++) {
 		UINT16 *swap_raw;
-		UINT16 *point_threshold = thresholds +
-			(size_t)(point - 1U) * pixel_count;
+		/* R2/R3/R4 select the four adjacent calibration intervals. */
+		UINT16 *point_threshold = point < NUC_BLACKBODY_SEGMENT_COUNT ?
+			thresholds + (size_t)(point - 1U) * pixel_count : NULL;
 
 		nuc_format_table_path(path, sizeof(path),
 				      NUC_BLACKBODY_TEMP_DIR, point, "RAW", "");
@@ -1324,8 +1235,9 @@ static int nuc_load_blackbody_dynamic_sources(void)
 
 		for (pixel = 0; pixel < pixel_count; pixel++) {
 			if (current_raw[pixel] > previous_raw[pixel]) {
-				point_threshold[pixel] = nuc_midpoint_boundary(
-					previous_raw[pixel], current_raw[pixel]);
+				if (point_threshold != NULL) {
+					point_threshold[pixel] = current_raw[pixel];
+				}
 			} else if (nuc_pixel_is_active(pixel)) {
 				invalid_pixel[pixel] = 1;
 			}
@@ -1341,14 +1253,8 @@ static int nuc_load_blackbody_dynamic_sources(void)
 			printf("Blackbody reference RAW means are not low-to-high: point %u=%u, point %u=%u\n",
 			       point, reference_mean[point - 1U],
 			       point + 1U, reference_mean[point]);
-			reference_order_valid = 0;
-#if !NUC_DYNAMIC_PERF_ALLOW_NON_MONOTONIC
 			goto exit;
-#endif
 		}
-	}
-	if (!reference_order_valid) {
-		printf("WARNING: non-monotonic Blackbody RAW bypassed for performance test only; correction quality and point distribution are invalid\n");
 	}
 
 	for (pixel = 0; pixel < pixel_count; pixel++) {
@@ -1361,25 +1267,24 @@ static int nuc_load_blackbody_dynamic_sources(void)
 		for (boundary = 0; boundary < NUC_DYNAMIC_BOUNDARY_COUNT;
 		     boundary++) {
 			thresholds[(size_t)boundary * pixel_count + pixel] =
-				nuc_midpoint_boundary(
-					(UINT16)reference_mean[boundary],
-					(UINT16)reference_mean[boundary + 1U]);
+				(UINT16)reference_mean[boundary + 1U];
 		}
 	}
 
 	nuc_release_blackbody_dynamic_sources();
 	g_nuc.blackbody_source_tables = source_tables;
 	g_nuc.blackbody_thresholds = thresholds;
-	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
+	for (point = 0; point < NUC_BLACKBODY_SEGMENT_COUNT; point++) {
 		g_nuc.blackbody_k[point] = k_tables[point];
 		g_nuc.blackbody_b[point] = b_tables[point];
-		g_nuc.blackbody_reference_mean[point] = reference_mean[point];
 	}
+	memcpy(g_nuc.blackbody_reference_mean, reference_mean,
+	       sizeof(reference_mean));
 	g_nuc.blackbody_invalid_pixel_count = invalid_count;
 	source_tables = NULL;
 	thresholds = NULL;
 
-	printf("Blackbody dynamic NUC loaded: K/B=%zu bytes, thresholds=%zu bytes, invalid pixels=%u\n",
+	printf("Five-point Blackbody NUC loaded: K/B=%zu bytes, thresholds=%zu bytes, invalid pixels=%u\n",
 	       source_bytes, threshold_bytes, invalid_count);
 	printf("Blackbody reference RAW means: %u, %u, %u, %u, %u\n",
 	       reference_mean[0], reference_mean[1], reference_mean[2],
@@ -1395,7 +1300,7 @@ exit:
 	return ret;
 }
 
-int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame)
+static int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame)
 {
 	UINTPTR block_pa;
 	UINTPTR map_va;
@@ -1406,7 +1311,7 @@ int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame)
 	UINT32 pixel_count;
 	UINT32 x;
 	UINT32 y;
-	UINT64 point_pixels[NUC_FIVE_POINT_COUNT] = {0};
+	UINT64 point_pixels[NUC_BLACKBODY_SEGMENT_COUNT] = {0};
 	UINT64 start_us;
 	UINT64 map_ready_us;
 	UINT64 select_done_us;
@@ -1417,14 +1322,11 @@ int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame)
 	UINT16 *dynamic_b;
 	HD_RESULT unmap_ret;
 
-	if (!g_nuc.blackbody_dynamic_enabled) {
-		return 0;
-	}
 	if (in_frame == NULL || in_frame->blk == 0 ||
 	    g_nuc.blackbody_source_tables == NULL ||
 	    g_nuc.blackbody_thresholds == NULL ||
 	    g_nuc.k_va == 0 || g_nuc.b_va == 0) {
-		printf("Blackbody dynamic NUC runtime is not ready\n");
+		printf("Five-point Blackbody NUC runtime is not ready\n");
 		return -1;
 	}
 
@@ -1478,6 +1380,7 @@ int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame)
 			UINT16 raw = raw_row[x];
 			UINT32 point = 0;
 
+			/* Equality selects the upper segment; extremes use first/last. */
 			while (point < NUC_DYNAMIC_BOUNDARY_COUNT &&
 			       raw >= g_nuc.blackbody_thresholds[
 				       (size_t)point * pixel_count + pixel]) {
@@ -1510,7 +1413,7 @@ int nuc_prepare_blackbody_dynamic_table(HD_VIDEO_FRAME *in_frame)
 		(unmap_done_us - select_done_us);
 	g_nuc.dynamic_select_us += select_done_us - map_ready_us;
 	g_nuc.dynamic_flush_us += done_us - unmap_done_us;
-	for (x = 0; x < NUC_FIVE_POINT_COUNT; x++) {
+	for (x = 0; x < NUC_BLACKBODY_SEGMENT_COUNT; x++) {
 		g_nuc.dynamic_point_pixels[x] += point_pixels[x];
 	}
 	g_nuc.dynamic_pending_prepare_us = done_us - start_us;
@@ -1540,7 +1443,7 @@ void nuc_bind_runtime(UINTPTR k_va, UINTPTR b_va, UINT32 table_size,
 		g_nuc.active_width = 0;
 		g_nuc.active_height = 0;
 	}
-	g_nuc.sensor_temp_table_point = -1;
+	g_nuc.enabled = 0;
 }
 
 void nuc_bind_capture_callback(NUC_CAPTURE_RAW_CB capture_raw)
@@ -1552,59 +1455,6 @@ void nuc_bind_calibration_state_callback(
 	NUC_CALIBRATION_STATE_CB calibration_state)
 {
 	g_nuc.calibration_state = calibration_state;
-}
-
-int nuc_set_blackbody_dynamic_enabled(int enable)
-{
-	NUC_CALIBRATION_STATE_CB calibration_state = g_nuc.calibration_state;
-	int requested = enable ? 1 : 0;
-	int ret = 0;
-
-	if (requested == g_nuc.blackbody_dynamic_enabled) {
-		printf("Blackbody dynamic NUC is already %s\n",
-		       requested ? "on" : "off");
-		return 0;
-	}
-
-	if (requested) {
-		if (nuc_load_blackbody_dynamic_sources() != 0) {
-			printf("Enable blackbody dynamic NUC fail\n");
-			return -1;
-		}
-		if (calibration_state != NULL) {
-			calibration_state("NUC dynamic mode", 1);
-		}
-		g_nuc.blackbody_dynamic_enabled = 1;
-		g_nuc.table_loaded = 1;
-		g_nuc.enabled = 1;
-		nuc_reset_dynamic_performance();
-		if (calibration_state != NULL) {
-			calibration_state("NUC dynamic mode", 0);
-		}
-		printf("Blackbody dynamic NUC on; NUC master is on\n");
-		return 0;
-	}
-
-	if (calibration_state != NULL) {
-		calibration_state("NUC dynamic mode", 1);
-	}
-	g_nuc.blackbody_dynamic_enabled = 0;
-	nuc_release_blackbody_dynamic_sources();
-	ret = nuc_reload_table();
-	if (calibration_state != NULL) {
-		calibration_state("NUC dynamic mode", 0);
-	}
-	if (ret == 0) {
-		printf("Blackbody dynamic NUC off; Sensor Temperature table restored\n");
-	} else {
-		printf("Blackbody dynamic NUC off; restore Sensor Temperature table fail\n");
-	}
-	return ret;
-}
-
-int nuc_is_blackbody_dynamic_enabled(void)
-{
-	return g_nuc.blackbody_dynamic_enabled;
 }
 
 void nuc_set_sensor_temp_point(UINT32 point, float temp_c)
@@ -1623,192 +1473,16 @@ float nuc_get_sensor_temp_point(UINT32 point)
 	return g_nuc.sensor_temp_points[point];
 }
 
-static int nuc_load_sensor_temp_table(UINT32 point, int verbose)
-{
-	char k_path[128];
-	char b_path[128];
-	UINT16 *k_table = 0;
-	UINT16 *b_table = 0;
-	int ret = -1;
-
-	if (point >= NUC_FIVE_POINT_COUNT) {
-		if (verbose) {
-			printf("invalid NUC Sensor Temperature table point %u\n",
-			       point + 1);
-		}
-		return -1;
-	}
-	if (g_nuc.table_size == 0) {
-		if (verbose) {
-			printf("NUC table size is not ready\n");
-		}
-		return -1;
-	}
-
-	if (g_nuc.k_va == 0) {
-		if (verbose) {
-			printf("NUC K table buffer is not ready\n");
-		}
-		return -1;
-	}
-
-	if (g_nuc.b_va == 0) {
-		if (verbose) {
-			printf("NUC B table buffer is not ready\n");
-		}
-		return -1;
-	}
-
-	snprintf(k_path, sizeof(k_path), "%s/point%u_K.bin",
-		 NUC_SENSOR_TEMP_DIR, point + 1);
-	snprintf(b_path, sizeof(b_path), "%s/point%u_B.bin",
-		 NUC_SENSOR_TEMP_DIR, point + 1);
-	if (nuc_validate_table_file_internal(k_path, verbose) != 0 ||
-	    nuc_validate_table_file_internal(b_path, verbose) != 0) {
-		return -1;
-	}
-
-	k_table = (UINT16 *)malloc(g_nuc.table_size);
-	b_table = (UINT16 *)malloc(g_nuc.table_size);
-	if (k_table == 0 || b_table == 0) {
-		if (verbose) {
-			printf("allocate NUC Sensor Temperature table fail\n");
-		}
-		goto exit;
-	}
-
-	if (nuc_read_file_to_mem_internal(
-		    k_path, k_table, g_nuc.table_size, verbose) != 0 ||
-	    nuc_read_file_to_mem_internal(
-		    b_path, b_table, g_nuc.table_size, verbose) != 0) {
-		goto exit;
-	}
-
-	memcpy((void *)g_nuc.k_va, k_table, g_nuc.table_size);
-	memcpy((void *)g_nuc.b_va, b_table, g_nuc.table_size);
-	hd_common_mem_flush_cache((void *)g_nuc.k_va, g_nuc.table_size);
-	hd_common_mem_flush_cache((void *)g_nuc.b_va, g_nuc.table_size);
-
-	g_nuc.table_loaded = 1;
-	g_nuc.sensor_temp_table_point = (int)point;
-	if (verbose) {
-		printf("NUC Sensor Temperature point %u K/B table loaded\n",
-		       point + 1);
-	}
-	ret = 0;
-
-exit:
-	free(k_table);
-	free(b_table);
-	return ret;
-}
-
-static int nuc_sensor_temp_points_are_ready(void)
-{
-	UINT32 point;
-
-	for (point = 1; point < NUC_FIVE_POINT_COUNT; point++) {
-		if (g_nuc.sensor_temp_points[point] <=
-		    g_nuc.sensor_temp_points[point - 1]) {
-			return 0;
-		}
-	}
-
-	return 1;
-}
-
 int nuc_reload_table(void)
 {
-	int ret;
-
-	if (g_nuc.blackbody_dynamic_enabled) {
-		printf("Sensor Temperature reload skipped while blackbody dynamic NUC is on\n");
+	if (nuc_load_blackbody_dynamic_sources() != 0) {
+		nuc_release_blackbody_dynamic_sources();
+		g_nuc.enabled = 0;
+		printf("Five-point Blackbody NUC tables unavailable; NUC off. Run NUC menu 2.\n");
 		return -1;
 	}
-
-	if (nuc_validate_all_sensor_temp_tables() != 0) {
-		goto fail;
-	}
-
-	if (!nuc_sensor_temp_points_are_ready()) {
-		printf("NUC Sensor Temperature points are not ready, load point 1\n");
-		ret = nuc_load_sensor_temp_table(0, 1);
-	} else {
-		g_nuc.sensor_temp_table_point = -1;
-		ret = nuc_update_sensor_temp_table();
-	}
-
-	if (ret != 0) {
-		goto fail;
-	}
+	g_nuc.table_loaded = 1;
 	return 0;
-
-fail:
-	g_nuc.table_loaded = 0;
-	nuc_set_enabled(0);
-	return -1;
-}
-
-static int nuc_update_sensor_temp_table_internal(int verbose)
-{
-	float temp_c;
-	UINT32 point;
-
-	if (g_nuc.blackbody_dynamic_enabled) {
-		return 0;
-	}
-
-	if (!nuc_sensor_temp_points_are_ready()) {
-		if (verbose) {
-			printf("NUC Sensor Temperature points are not ready\n");
-		}
-		return -1;
-	}
-
-	if (sensor_temp_read(&temp_c) != 0) {
-		if (verbose) {
-			printf("read runtime sensor temperature fail\n");
-		}
-		return -1;
-	}
-
-	point = 0;
-	while (point + 1 < NUC_FIVE_POINT_COUNT) {
-		float boundary =
-			(g_nuc.sensor_temp_points[point] +
-			 g_nuc.sensor_temp_points[point + 1]) * 0.5f;
-
-		if (temp_c < boundary) {
-			break;
-		}
-		point++;
-	}
-
-	if ((int)point == g_nuc.sensor_temp_table_point) {
-		return 0;
-	}
-
-	if (nuc_load_sensor_temp_table(point, verbose) != 0) {
-		g_nuc.table_loaded = 0;
-		nuc_set_enabled(0);
-		return -1;
-	}
-
-	if (verbose) {
-		printf("NUC Sensor Temperature %.4f C, use point %u (%.4f C)\n",
-		       temp_c, point + 1, g_nuc.sensor_temp_points[point]);
-	}
-	return 0;
-}
-
-int nuc_update_sensor_temp_table(void)
-{
-	return nuc_update_sensor_temp_table_internal(1);
-}
-
-int nuc_update_sensor_temp_table_periodic(void)
-{
-	return nuc_update_sensor_temp_table_internal(0);
 }
 
 int nuc_five_point_sensor_temp_calibration(void)
@@ -1827,10 +1501,6 @@ int nuc_five_point_sensor_temp_calibration(void)
 		printf("NUC runtime buffer is not ready\n");
 		return -1;
 	}
-	if (g_nuc.blackbody_dynamic_enabled) {
-		printf("Disable blackbody dynamic NUC before Sensor Temperature calibration\n");
-		return -1;
-	}
 	if (g_nuc.capture_raw == 0) {
 		printf("NUC capture callback is not ready\n");
 		return -1;
@@ -1838,8 +1508,8 @@ int nuc_five_point_sensor_temp_calibration(void)
 	if (nuc_validate_image_layout() != 0) {
 		return -1;
 	}
-	if (nuc_cleanup_staged_sensor_temp_tables() != 0) {
-		printf("clean old staged NUC tables fail\n");
+	if (nuc_recover_sensor_temp_tables() != 0) {
+		printf("recover Sensor Temperature NUC tables fail\n");
 		return -1;
 	}
 
@@ -1894,9 +1564,7 @@ int nuc_five_point_sensor_temp_calibration(void)
 		goto exit;
 	}
 
-	/* Preserve the five-file-pair format without repeating acquisition.
-	 * Equal sensor temperatures intentionally use the existing point-1 fallback.
-	 */
+	/* Retain legacy calibration export; runtime uses Blackbody segments only. */
 	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
 		temperatures[point] = temperatures[0];
 		if (nuc_stage_sensor_temp_table(point) != 0) {
@@ -1921,20 +1589,7 @@ exit:
 	free(frame_raw);
 	free(raw_sum);
 
-	if (nuc_reload_table() != 0) {
-		ret = -1;
-	}
-	if (ret == 0) {
-		if (app_config_update_int("nuc_correction", 1) != 0 ||
-		    !nuc_is_enabled()) {
-			printf("NUC tables saved but enabling NUC failed\n");
-			ret = -1;
-		} else {
-			printf("NUC calibration complete: BPR on, NUC on (CFG saved)\n");
-		}
-	} else {
-		printf("NUC calibration failed; NUC was not automatically enabled\n");
-	}
+	printf("Sensor Temperature tables are export-only; runtime uses Blackbody menu 2 tables.\n");
 	if (calibration_state != 0) {
 		calibration_state("NUC", 0);
 	}
@@ -1945,6 +1600,9 @@ exit:
 int nuc_five_point_blackbody_temp_calibration(void)
 {
 	UINT16 *average_raw = NULL;
+	UINT16 *previous_raw = NULL;
+	UINT16 *k_table = NULL;
+	UINT16 *b_table = NULL;
 	UINT16 *frame_raw = NULL;
 	UINT32 *raw_sum = NULL;
 	NUC_CALIBRATION_STATE_CB calibration_state = NULL;
@@ -1954,10 +1612,6 @@ int nuc_five_point_blackbody_temp_calibration(void)
 
 	if (g_nuc.table_size == 0 || g_nuc.k_va == 0 || g_nuc.b_va == 0) {
 		printf("NUC runtime buffer is not ready\n");
-		return -1;
-	}
-	if (g_nuc.blackbody_dynamic_enabled) {
-		printf("Disable blackbody dynamic NUC before recalibration\n");
 		return -1;
 	}
 	if (g_nuc.capture_raw == NULL) {
@@ -1977,11 +1631,29 @@ int nuc_five_point_blackbody_temp_calibration(void)
 		calibration_state("NUC blackbody", 1);
 	}
 
+	/* Match the original calibration sequence: latest BPR on, NUC off. */
+	if (app_config_update_int("nuc_correction", 0) != 0 ||
+	    nuc_is_enabled()) {
+		printf("Blackbody NUC calibration aborted: cannot turn NUC off\n");
+		goto exit;
+	}
+	if (bpr_load_table() != 0 ||
+	    app_config_update_int("bpr_correction", 1) != 0 ||
+	    !bpr_is_enabled()) {
+		printf("Blackbody NUC calibration aborted: latest BPR table must be loaded and enabled\n");
+		goto exit;
+	}
+	printf("Blackbody NUC calibration: latest BPR table loaded, BPR on, NUC off (CFG saved)\n");
 	active_pixel_count = g_nuc.active_width * g_nuc.active_height;
 	average_raw = (UINT16 *)malloc(g_nuc.table_size);
+	previous_raw = (UINT16 *)malloc(g_nuc.table_size);
+	k_table = (UINT16 *)malloc(g_nuc.table_size);
+	b_table = (UINT16 *)malloc(g_nuc.table_size);
 	frame_raw = (UINT16 *)malloc(g_nuc.table_size);
 	raw_sum = (UINT32 *)malloc(active_pixel_count * sizeof(*raw_sum));
-	if (average_raw == NULL || frame_raw == NULL || raw_sum == NULL) {
+	if (average_raw == NULL || previous_raw == NULL ||
+	    k_table == NULL || b_table == NULL ||
+	    frame_raw == NULL || raw_sum == NULL) {
 		printf("5 point blackbody temperature NUC calibration malloc fail\n");
 		goto exit;
 	}
@@ -2005,18 +1677,27 @@ int nuc_five_point_blackbody_temp_calibration(void)
 			goto exit;
 		}
 
-		/* Reuse frame_raw as K and average_raw as the in-place B table. */
-		if (nuc_build_blackbody_point_table(average_raw, frame_raw,
-						    average_raw) != 0) {
-			printf("build blackbody temperature point %u table fail\n",
-			       point + 1);
-			goto exit;
+		if (point > 0) {
+			/* The same two-point gain/offset calculation as Sensor NUC. */
+			if (nuc_raw_active_mean(average_raw) <=
+			    nuc_raw_active_mean(previous_raw)) {
+				printf("Blackbody RAW means must increase from point %u to %u\n",
+				       point, point + 1U);
+				goto exit;
+			}
+			if (nuc_build_table(previous_raw, average_raw,
+					    k_table, b_table) != 0 ||
+			    nuc_stage_blackbody_temp_table(point - 1U,
+						   k_table, b_table) != 0) {
+				printf("build/save blackbody segment %u fail\n", point);
+				goto exit;
+			}
 		}
-		if (nuc_stage_blackbody_temp_table(point, frame_raw,
-						   average_raw) != 0) {
-			printf("save blackbody temperature point %u table fail\n",
-			       point + 1);
-			goto exit;
+		/* Retain this point for the next adjacent pair without copying. */
+		{
+			UINT16 *swap_raw = previous_raw;
+			previous_raw = average_raw;
+			average_raw = swap_raw;
 		}
 	}
 
@@ -2025,18 +1706,37 @@ int nuc_five_point_blackbody_temp_calibration(void)
 		goto exit;
 	}
 
-	printf("5 point blackbody temperature NUC RAW/K/B saved to %s\n",
+	printf("5 RAW points / 4 two-point K/B segments saved to %s\n",
 	       NUC_BLACKBODY_TEMP_DIR);
-	ret = 0;
+	ret = nuc_reload_table();
 
 exit:
 	if (ret != 0) {
 		nuc_cleanup_staged_blackbody_temp_tables();
 	}
 	free(average_raw);
+	free(previous_raw);
+	free(k_table);
+	free(b_table);
 	free(frame_raw);
 	free(raw_sum);
 
+	if (ret == 0) {
+		if (app_config_update_int("nuc_correction", 1) != 0 ||
+		    !nuc_is_enabled()) {
+			printf("Blackbody tables saved and loaded, but enabling NUC failed\n");
+			/* A failed apply can leave CFG on; try to persist the off state. */
+			if (app_config_update_int("nuc_correction", 0) != 0) {
+				printf("Could not save NUC off to CFG; check storage/runtime status\n");
+			}
+			nuc_set_enabled(0);
+			ret = -1;
+		} else {
+			printf("Blackbody NUC calibration complete: BPR on, NUC on (CFG saved)\n");
+		}
+	} else {
+		printf("Blackbody NUC calibration failed; NUC was not automatically enabled\n");
+	}
 	if (calibration_state != NULL) {
 		calibration_state("NUC blackbody", 0);
 	}
@@ -2045,10 +1745,6 @@ exit:
 
 int nuc_init_table(void)
 {
-	if (nuc_recover_sensor_temp_tables() != 0) {
-		printf("NUC table recovery failed, disable NUC\n");
-		return -1;
-	}
 	if (nuc_reload_table() != 0) {
 		printf("NUC table not found or invalid, disable NUC\n");
 		return -1;
@@ -2060,8 +1756,8 @@ int nuc_init_table(void)
 
 void nuc_set_enabled(int enable)
 {
-	if (enable && !g_nuc.table_loaded) {
-		printf("NUC table not loaded, keep NUC off\n");
+	if (enable && !g_nuc.table_loaded && nuc_reload_table() != 0) {
+		printf("Five-point Blackbody table not loaded, keep NUC off\n");
 		g_nuc.enabled = 0;
 		printf("NUC off\n");
 		return;
@@ -2084,7 +1780,7 @@ void nuc_set_sensor_temp_interval_sec(UINT32 interval_sec)
 	}
 
 	g_nuc_sensor_temp_interval_sec = interval_sec;
-	printf("NUC Sensor Temperature interval=%u sec\n",
+	printf("Legacy NUC Sensor Temperature interval=%u sec (unused by Blackbody apply)\n",
 	       g_nuc_sensor_temp_interval_sec);
 }
 
@@ -2118,17 +1814,14 @@ int nuc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("NUC menu\n");
-		printf(" 1. Sensor Temperature NUC calibration (capture once, copy to 5 points)\n");
+		printf(" 1. Sensor Temperature NUC calibration (legacy export only)\n");
 		printf(" 2. 5 point Blackbody Temperature NUC calibration (save RAW/K/B)\n");
-		printf(" 3. Toggle per-pixel Blackbody Dynamic NUC\n");
-		printf(" 4. Reload Sensor Temperature K/B table\n");
+		printf(" 3. Reload five-point Blackbody RAW/K/B tables\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: NUC=%s, table mode=%s, Sensor Temperature interval=%u sec\n",
+		printf("runtime: NUC=%s, table mode=5-point Blackbody (4 segments), tables=%s\n",
 		       g_nuc.enabled ? "on" : "off",
-		       g_nuc.blackbody_dynamic_enabled ?
-			"Blackbody Dynamic" : "Sensor Temperature",
-		       g_nuc_sensor_temp_interval_sec);
+		       g_nuc.table_loaded ? "ready" : "not loaded");
 		printf("Settings: CFG Setting -> NUC setting\n");
 
 		option = nuc_read_option();
@@ -2142,11 +1835,6 @@ int nuc_menu_run(void)
 			break;
 
 		case 3:
-			ret = nuc_set_blackbody_dynamic_enabled(
-				!nuc_is_blackbody_dynamic_enabled());
-			break;
-
-		case 4:
 			ret = nuc_reload_table_from_menu();
 			break;
 
@@ -2191,13 +1879,17 @@ static void nuc_finish_dynamic_performance(UINT64 gfx_us)
 	if (g_nuc.dynamic_report_frames < NUC_DYNAMIC_REPORT_FRAME_COUNT) {
 		return;
 	}
+	if (!NUC_DYNAMIC_PERF_LOG_ENABLE) {
+		nuc_reset_dynamic_performance();
+		return;
+	}
 
 	frames = (double)g_nuc.dynamic_report_frames;
 	if (g_nuc.dynamic_interval_us != 0) {
 		fps = (double)g_nuc.dynamic_interval_count * 1000000.0 /
 			(double)g_nuc.dynamic_interval_us;
 	}
-	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
+	for (point = 0; point < NUC_BLACKBODY_SEGMENT_COUNT; point++) {
 		total_pixels += g_nuc.dynamic_point_pixels[point];
 	}
 
@@ -2213,7 +1905,7 @@ static void nuc_finish_dynamic_performance(UINT64 gfx_us)
 			g_nuc.dynamic_flush_us + g_nuc.dynamic_gfx_us) /
 		frames / 1000.0,
 	       (double)g_nuc.dynamic_max_total_us / 1000.0, fps);
-	printf("Dynamic NUC point distribution: P1=%" PRIu64 " (%.2f%%), P2=%" PRIu64 " (%.2f%%), P3=%" PRIu64 " (%.2f%%), P4=%" PRIu64 " (%.2f%%), P5=%" PRIu64 " (%.2f%%)\n",
+	printf("Dynamic NUC segment distribution: S1=%" PRIu64 " (%.2f%%), S2=%" PRIu64 " (%.2f%%), S3=%" PRIu64 " (%.2f%%), S4=%" PRIu64 " (%.2f%%)\n",
 	       (uint64_t)g_nuc.dynamic_point_pixels[0],
 	       total_pixels ? 100.0 * g_nuc.dynamic_point_pixels[0] /
 		(double)total_pixels : 0.0,
@@ -2225,9 +1917,6 @@ static void nuc_finish_dynamic_performance(UINT64 gfx_us)
 		(double)total_pixels : 0.0,
 	       (uint64_t)g_nuc.dynamic_point_pixels[3],
 	       total_pixels ? 100.0 * g_nuc.dynamic_point_pixels[3] /
-		(double)total_pixels : 0.0,
-	       (uint64_t)g_nuc.dynamic_point_pixels[4],
-	       total_pixels ? 100.0 * g_nuc.dynamic_point_pixels[4] /
 		(double)total_pixels : 0.0);
 
 	g_nuc.dynamic_report_frames = 0;
@@ -2255,6 +1944,12 @@ HD_RESULT nuc_apply(HD_VIDEO_FRAME *in_frame,
 	UINT64 gfx_start_us = 0;
 	UINT64 gfx_done_us;
 	HD_RESULT ret;
+
+	if (!g_nuc.enabled || !g_nuc.table_loaded ||
+	    nuc_prepare_blackbody_dynamic_table(in_frame) != 0) {
+		printf("Five-point NUC apply failed: correction disabled or tables/frame unavailable\n");
+		return HD_ERR_NG;
+	}
 
 	memcpy(out_frame, in_frame, sizeof(HD_VIDEO_FRAME));
 

@@ -733,6 +733,12 @@ int app_config_update_int(const char *key, int value)
         } else {
             printf("%s on/off saved and applied (no restart)\n", name);
         }
+    } else if (strcmp(key, "bpr_threshold") == 0) {
+        bpr_set_threshold(g_app_config.bpr_threshold);
+        printf("BPR threshold saved and applied; next Bright/Dark calibration uses it (no restart)\n");
+    } else if (strcmp(key, "runtime_bpr_threshold") == 0) {
+        bpr_set_runtime_threshold(g_app_config.runtime_bpr_threshold);
+        printf("Runtime BPR threshold saved and applied; next detection uses it (no restart)\n");
     } else if (strncmp(key, "dde_", 4) == 0) {
         ret = dde_set_params(&g_app_config.dde);
         if (ret != 0) return ret;
@@ -1102,7 +1108,8 @@ static int app_config_bpr_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("BPR setting\n");
-		printf("BPR on/off applies immediately; other settings require restart.\n");
+		printf("BPR on/off and thresholds apply immediately; Runtime BPR on/off requires restart.\n");
+		printf("New thresholds affect the next calibration/detection, not the existing DPC table.\n");
 		printf(" 1. BPR on/off\n");
 		printf(" 2. Bright/Dark BPR threshold (RAW8 DN)\n");
 		printf(" 3. Runtime BPR on/off\n");
@@ -1225,30 +1232,20 @@ static int app_config_nuc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("NUC setting\n");
-		printf("NUC on/off applies immediately; table interval requires restart.\n");
+		printf("NUC on/off applies five-point Blackbody correction immediately.\n");
 		printf(" 1. NUC on/off\n");
-		printf(" 2. Sensor Temperature table interval\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: NUC=%s, interval=%u sec\n",
-		       nuc_is_enabled() ? "on" : "off",
-		       nuc_get_sensor_temp_interval_sec());
-		printf("pending CFG: NUC=%s, interval=%u sec\n",
-		       g_app_config.nuc_correction ? "on" : "off",
-		       g_app_config.nuc_sensor_temp_interval_sec);
+		printf("runtime: NUC=%s, mode=5-point Blackbody (4 segments)\n",
+		       nuc_is_enabled() ? "on" : "off");
+		printf("pending CFG: NUC=%s\n",
+		       g_app_config.nuc_correction ? "on" : "off");
 
 		option = app_config_read_option();
 		switch (option) {
 		case 1:
 			ret = app_config_prompt_bool("NUC", "nuc_correction",
 				g_app_config.nuc_correction);
-			break;
-		case 2:
-			ret = app_config_prompt_int(
-				"Sensor Temperature table interval",
-				"nuc_sensor_temp_interval_sec",
-				(int)g_app_config.nuc_sensor_temp_interval_sec,
-				1, INT_MAX, " sec");
 			break;
 		case 0:
 		case -1:

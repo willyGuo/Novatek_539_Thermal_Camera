@@ -2763,34 +2763,21 @@ static HD_RESULT exit_module(void)
 
 /* Runtime RAW pipeline helpers. */
 static void liveview_update_temperature_tables_if_needed(
-	UINT64 *nuc_next_update_ms,
 	UINT64 *tdc_next_update_ms)
 {
 	UINT64 now_ms = liveview_get_time_ms();
 
 	/*
 	 * Manual BPR/NUC calibration owns the correction tables while it is
-	 * active. Keep the periodic NUC/TDC loaders out of the same buffers and
+	 * active. Keep the periodic TDC loader out of the same buffers and
 	 * postpone their next check until one full interval after calibration.
 	 */
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	if (g_manual_calibration_active) {
-		*nuc_next_update_ms =
-			now_ms +
-			(UINT64)nuc_get_sensor_temp_interval_sec() * 1000U;
 		*tdc_next_update_ms =
 			now_ms + (UINT64)tdc_get_interval_sec() * 1000U;
 		pthread_mutex_unlock(&g_manual_calibration_lock);
 		return;
-	}
-
-	if (nuc_is_enabled() &&
-	    !nuc_is_blackbody_dynamic_enabled() &&
-	    now_ms >= *nuc_next_update_ms) {
-		nuc_update_sensor_temp_table_periodic();
-		*nuc_next_update_ms =
-			now_ms +
-			(UINT64)nuc_get_sensor_temp_interval_sec() * 1000U;
 	}
 
 	if (tdc_is_enabled() && now_ms >= *tdc_next_update_ms) {
@@ -2805,7 +2792,6 @@ static void liveview_update_temperature_tables_if_needed(
 
 static int liveview_run_ffc_calibration(
 	VIDEO_LIVEVIEW *p_stream0,
-	UINT64 *nuc_next_update_ms,
 	UINT64 *tdc_next_update_ms,
 	int test_mode)
 {
@@ -2839,7 +2825,7 @@ static int liveview_run_ffc_calibration(
 		/* The old outer loop refreshed these tables between FFC frames. */
 		if (frame > 0) {
 			liveview_update_temperature_tables_if_needed(
-				nuc_next_update_ms, tdc_next_update_ms);
+				tdc_next_update_ms);
 			if (!test_mode &&
 			    !ffc_is_enabled() && !bpr_is_runtime_enabled()) {
 				printf("Shutter calibration disabled during FFC\n");
@@ -2875,20 +2861,14 @@ static int liveview_run_ffc_calibration(
 		}
 
 		if (process_ret == HD_OK && nuc_is_enabled()) {
-			if (nuc_prepare_blackbody_dynamic_table(
-				    calibration_frame) != 0) {
-				printf("FFC calibration dynamic NUC table build fail\n");
-				process_ret = HD_ERR_NG;
-			} else {
-				process_ret = nuc_apply(calibration_frame,
-						&nuc_video_frame,
-						p_stream0->thermal_k_frame_pa,
-						p_stream0->thermal_b_frame_pa,
-						p_stream0->thermal_nuc_out_pa,
-						p_stream0->thermal_nuc_out_blk,
-						RAW_SIZE_W,
-						RAW_SIZE_H);
-			}
+			process_ret = nuc_apply(calibration_frame,
+					&nuc_video_frame,
+					p_stream0->thermal_k_frame_pa,
+					p_stream0->thermal_b_frame_pa,
+					p_stream0->thermal_nuc_out_pa,
+					p_stream0->thermal_nuc_out_blk,
+					RAW_SIZE_W,
+					RAW_SIZE_H);
 			if (process_ret != HD_OK) {
 				printf("FFC calibration NUC error=%d\n",
 				       process_ret);
@@ -2958,7 +2938,6 @@ static int liveview_run_ffc_calibration(
 
 static int liveview_run_shutter_calibration_cycle(
 	VIDEO_LIVEVIEW *p_stream0,
-	UINT64 *nuc_next_update_ms,
 	UINT64 *tdc_next_update_ms,
 	int test_mode)
 {
@@ -2984,7 +2963,6 @@ static int liveview_run_shutter_calibration_cycle(
 
 	if (test_mode || ffc_is_enabled()) {
 		if (liveview_run_ffc_calibration(p_stream0,
-						 nuc_next_update_ms,
 						 tdc_next_update_ms,
 						 test_mode) != 0) {
 			calibration_ok = 0;
@@ -3519,25 +3497,21 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	}
 
 	if (!g_manual_calibration_active && nuc_is_enabled()) {
-		if (nuc_prepare_blackbody_dynamic_table(current_frame) != 0) {
-			printf("Dynamic NUC table build failed; bypass NUC for this frame\n");
-		} else {
-			ret = nuc_apply(current_frame,
-					&nuc_video_frame,
-					p_stream0->thermal_k_frame_pa,
-					p_stream0->thermal_b_frame_pa,
-					p_stream0->thermal_nuc_out_pa,
-					p_stream0->thermal_nuc_out_blk,
-					RAW_SIZE_W,
-					RAW_SIZE_H);
-			if (ret != HD_OK) {
-				printf("nuc correction error=%d !!\r\n\r\n", ret);
-				goto release_vcap_frame;
-			}
-
-			current_frame = &nuc_video_frame;
-			current_frame_is_vcap = 0;
+		ret = nuc_apply(current_frame,
+				&nuc_video_frame,
+				p_stream0->thermal_k_frame_pa,
+				p_stream0->thermal_b_frame_pa,
+				p_stream0->thermal_nuc_out_pa,
+				p_stream0->thermal_nuc_out_blk,
+				RAW_SIZE_W,
+				RAW_SIZE_H);
+		if (ret != HD_OK) {
+			printf("nuc correction error=%d !!\r\n\r\n", ret);
+			goto release_vcap_frame;
 		}
+
+		current_frame = &nuc_video_frame;
+		current_frame_is_vcap = 0;
 	}
 
 	if (!g_manual_calibration_active &&
@@ -3772,7 +3746,6 @@ static void *raw_pipeline_thread(void *arg)
 {
 	VIDEO_LIVEVIEW* p_stream0 = (VIDEO_LIVEVIEW *)arg;
 	UINT64 tdc_next_update_ms = 0;
-	UINT64 nuc_sensor_temp_next_update_ms = 0;
 	int shutter_calibration_enabled;
 	int shutter_calibration_result;
 	int shutter_calibration_paused;
@@ -3807,7 +3780,6 @@ static void *raw_pipeline_thread(void *arg)
 			shutter_calibration_result =
 				liveview_run_shutter_calibration_cycle(
 					p_stream0,
-					&nuc_sensor_temp_next_update_ms,
 					&tdc_next_update_ms,
 					1);
 			liveview_finish_ffc_test(shutter_calibration_result);
@@ -3819,7 +3791,6 @@ static void *raw_pipeline_thread(void *arg)
 		}
 
 		liveview_update_temperature_tables_if_needed(
-			&nuc_sensor_temp_next_update_ms,
 			&tdc_next_update_ms);
 
 		if (shutter_calibration_enabled &&
@@ -3829,7 +3800,6 @@ static void *raw_pipeline_thread(void *arg)
 			shutter_calibration_result =
 				liveview_run_shutter_calibration_cycle(
 					p_stream0,
-					&nuc_sensor_temp_next_update_ms,
 					&tdc_next_update_ms,
 					0);
 			if (shutter_calibration_result < 0) {
