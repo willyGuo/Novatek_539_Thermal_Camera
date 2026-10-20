@@ -157,7 +157,7 @@ Shutter control
 
 FPS、startup skip 與 runtime skip 都移到 `CFG Setting -> Liveview setting`。`runtime_skip_frames` 套用後，`raw_pipeline_thread` 每成功送出一張影像，就會丟棄指定數量的 VCAP frame；`0` 表示每張都處理。VCAP buffer 仍只由 RAW pipeline thread pull／release。
 
-自動 FFC 或 Runtime BPR shutter-closed calibration 執行期間，`Shutter open` 與 `Shutter close` 指令會立即被拒絕，不會等待校正結束後再執行。
+自動 FFC shutter-closed calibration 執行期間，`Shutter open` 與 `Shutter close` 指令會立即被拒絕，不會等待校正結束後再執行。
 
 `Snapshot RAW` 會在下一張正常 frame 完成 TDC／NUC／FFC 後寫入 `/mnt/sd/`。檔案只保留有效影像區 `640x512`，每個 pixel 為 little-endian 16-bit container：
 
@@ -166,6 +166,16 @@ FPS、startup skip 與 runtime skip 都移到 `CFG Setting -> Liveview setting`�
 - Histogram P1/P99 AGC (CPU) 成功時：另外保存同一張 frame 在 VideoProc 前的 `snapshot_NNNN_agc_output_raw16_640x512.raw`
 
 每個檔案大小為 `640 * 512 * 2 = 655360 bytes`。RAW pipeline thread 先複製同一張 frame 的各階段資料，再由背景 writer 寫入 SD 卡；快照當下仍會增加一次或多次 frame copy 的負擔。
+
+### Timed Snapshot
+
+在 `Image Pipeline Diagnostics` 選擇 `7. Run Timed Snapshot (every 1 minute, 32 snapshots)` 啟動。Liveview 必須先啟動；Run 後等待 60 秒擷取第一次，此後每隔 60 秒擷取一次，共成功保存 32 次後自動結束，正常情況約 32 分鐘。選單立即返回，可用 `8. Show Timed Snapshot status` 查看進度、`9. Stop Timed Snapshot` 提前停止、`0. Back` 離開選單繼續背景擷取。
+
+每次 Run 建立獨立目錄 `/mnt/sd/thermal_snapshot/raw/timed_<時間戳>_<流水號>/`，不覆蓋既有結果。每次保存同一張 frame 的 `snapshot_0001_input_raw16_640x512.raw`；若套用 TDC／NUC／FFC，另存 `snapshot_0001_corrected_raw16_640x512.raw`；Histogram／Fieldscale CPU AGC 成功時另存 `snapshot_0001_agc_output_raw16_640x512.raw`。編號由 `0001` 到 `0032`，每張 RAW 為 little-endian UINT16，655,360 bytes；ISP Tone Curve 不另存 AGC RAW。
+
+同目錄的 `summary.csv` 可用 Excel 開啟，每次 snapshot 一列，包含次數、從 Run 起算的實際擷取時間 `elapsed_ms`、`sensor_temp_c`（攝氏，小數點後 4 位）、`sensor_temp_status`，以及 input／corrected／agc_output 各自的檔名、`min`、`max`、`mean`、`stddev`。溫度使用與 `Show Current Sensor Temperature` 相同的 `sensor_temp_read()`，於該次 RAW 複製完成後、交給背景 writer 前即時讀取，並印出 `Current Sensor Temperature`；這是擷取附近的感測器溫度，不是影像中的物體溫度，也不是與曝光硬體同步的讀值。讀取成功標記 `ok`，失敗時溫度留空、標記 `read_failed`，仍保存 RAW 與統計，不沿用上一次讀值。統計直接計算已複製的完整 640×512 RAW DN，包含極端值，不轉成 8-bit、不排除壞點；`stddev` 使用母體標準差（除以總 pixel 數）。未產生的 corrected／AGC 階段留空。
+
+RAW 與 CSV 在背景 writer 寫入並同步到 SD 後才累計成功次數；CSV 每次追加一列，完成後為 32 列總表。手動校正、Step Test 或 writer 忙碌時延後至下一張可用影格，延後後不連續補拍，因此完成時間可能超過 32 分鐘。停止 Timed Snapshot 或 Stop／Restart Liveview 會停止後續排程，已排入的當次保存會完成，並保留 RAW 與部分總表；重新 Run 從新目錄重新計數。RAW 複製、存檔或 CSV 寫入失敗會停止並顯示錯誤，失敗次數不計入完成數。Timed Snapshot 與連續 `Recording RAW` 不可同時啟動。
 
 RAW Statistics（包含開機第一張 RAW 的統計）已移除。VideoProc 不再開啟診斷 OUT_1；YUV Statistics 與 ISP Step Test 共用主路 OUT_0，在 VPE 鏡像、CLAHE、DDE 與偽色彩處理前讀取影像。手動執行診斷時，統計與存檔仍可能暫時增加顯示延遲。
 
@@ -211,8 +221,8 @@ pending CFG: boot load on/off
 所有手動調整的持久化參數都集中在這裡。各分類會同時顯示 runtime 與 pending CFG；修改時只寫入 `/mnt/sd/tiffany_thermal.cfg`，必須 Liveview Restart 或重新開機才套用。所有 on/off 項目都會再要求明確輸入 `0: off` 或 `1: on`，不會直接反轉目前設定。
 
 - `Liveview setting`：FPS、startup skip frames、runtime skip frames。
-- `BPR setting`：BPR enable、Bright/Dark threshold、Runtime BPR enable 與 threshold。
-- `Shutter / FFC setting`：FFC enable、FFC/Runtime BPR 共用 shutter interval、shutter close wait time。
+- `BPR setting`：BPR enable 與 Bright/Dark threshold。
+- `Shutter / FFC setting`：FFC enable、shutter interval（0 停止定時校正）、shutter close wait time 與啟動校正開關。
 - `NUC setting`：NUC enable 與 Sensor Temperature table interval。五點 Sensor 溫度由 NUC calibration 自動寫入，不提供手動修改。
 - `TDC setting`：TDC enable 與 update interval。
 - `AGC setting`：Histogram P1/P99 CPU AGC 與 Min/Max ISP Tone Curve AGC，兩者互斥。
@@ -251,8 +261,6 @@ nuc_sensor_temp_point4=0.0000
 nuc_sensor_temp_point5=0.0000
 bpr_correction=1
 bpr_threshold=15
-runtime_bpr_enable=0
-runtime_bpr_threshold=15
 ffc_correction=1
 shutter_interval_sec=60
 shutter_close_wait_ms=200
@@ -280,11 +288,10 @@ videoproc_3dnr_enable=1
 | `nuc_sensor_temp_point1` ... `point5` | 五點 Sensor Temperature NUC 的溫度點 |
 | `bpr_correction` | ISP DPC/BPR runtime on/off |
 | `bpr_threshold` | BPR calibration threshold，單位為 RAW8 DN，預設 `15` |
-| `runtime_bpr_enable` | Runtime BPR on/off，預設 `0`；可獨立依共用 shutter interval 執行 |
-| `runtime_bpr_threshold` | Runtime BPR calibration threshold，單位為 RAW8 DN，預設 `15` |
-| `ffc_correction` | FFC runtime on/off，程式預設為 `1`；啟動後等待第一個 interval 到期才校正 |
-| `shutter_interval_sec` | FFC 與 Runtime BPR 共用的關快門間隔，接受任意大於 `0` 的秒數，預設 `60` |
-| `shutter_close_wait_ms` | 快門關閉後開始 FFC／Runtime BPR 前的等待時間，預設 `200` ms |
+| `ffc_correction` | 是否套用有效 FFC 補償表，預設 `1`；CFG 選單修改立即生效。開啟時若沒有有效表格，先執行一次 FFC，成功後補償；間隔為 `0` 時仍可持續補償 |
+| `ffc_startup_enable` | Liveview 啟動時是否先校正一次，預設 `1`；不受 interval 是否為 `0` 影響，也不會自動改動補償開關 |
+| `shutter_interval_sec` | 定時 FFC 間隔秒數，範圍 `0..INT_MAX`，預設 `60`；`0` 停止定時校正，CFG 選單修改後立即生效 |
+| `shutter_close_wait_ms` | 快門關閉後開始 FFC 前的等待時間，範圍 `1..INT_MAX`，預設 `200` ms；CFG 選單修改後下一次校正就使用新值 |
 | `tdc_correction` | TDC runtime on/off |
 | `tdc_interval_sec` | TDC 更新間隔 |
 | `agc_histogram_p1_p99_enable` | Histogram P1/P99 CPU AGC on/off；三種 AGC 只能擇一開啟 |
@@ -323,9 +330,11 @@ BPR menu
 - `Reload BPR table`：從 SD 卡重新讀取 DPC table，直接套用到 ISP。
 - `BPR debug on/off`：控制 DPC library log 與 `/mnt/sd/` RAW dump。
 
-BPR/Runtime BPR enable 與 threshold 已集中到 `CFG Setting -> BPR setting`；共用 shutter interval 位於 `CFG Setting -> Shutter / FFC setting`。
+BPR enable 與 Bright/Dark threshold 已集中到 `CFG Setting -> BPR setting`；FFC interval 位於 `CFG Setting -> Shutter / FFC setting`。
 
-手動 `Bright/Dark BPR calibration` 開始前會先等待正在執行的自動 shutter cycle 完成，接著暫停 interval 關快門；成功或失敗離開時都會恢復，並從完整的 `shutter_interval_sec` 重新計時。`Runtime BPR` 不會暫停 interval，因為它本身就是共用 shutter cycle 的一部分。
+`bpr_threshold` 在 CFG 選單儲存成功後立即更新執行中的參數，不需重開機，用於下一次 Bright/Dark BPR 校正；修改閾值不會自動重建既有 `dpc_table.bin`。BPR on/off 即時套用。
+
+手動 `Bright/Dark BPR calibration` 開始前會先等待正在執行的自動 shutter cycle 完成，接著暫停 interval 關快門；成功或失敗離開時，若 `shutter_interval_sec>0` 且 FFC 開啟，從完整間隔重新計時；間隔為 `0` 則維持停止定時校正。
 
 BPR calibration 產生 table；runtime 是否補點則由 `bpr_correction` 控制。TY640 RAW14 以 LSB 對齊方式存放在 RAW16 container，每個 pixel 佔 2 bytes；DPC table 產生流程會取有效資料的 bit 13..6 轉成 RAW8，供 calibration library 使用，但 liveview runtime RAW pipeline 仍維持 RAW16，並不因此改成 RAW8。
 
@@ -336,16 +345,16 @@ NUC 是兩點式非均勻性校正。校正時依序取得 low-temperature 與 h
 Sensor Temperature 五點表路徑：
 
 ```text
-K table : /mnt/sd/thermal_op/sensor_temp/point1_K.bin ... point5_K.bin
-B table : /mnt/sd/thermal_op/sensor_temp/point1_B.bin ... point5_B.bin
+K table : /mnt/sd/thermal_op/sensor_temp_q14/point1_K.bin ... point5_K.bin
+B table : /mnt/sd/thermal_op/sensor_temp_q14/point1_B.bin ... point5_B.bin
 ```
 
 Blackbody Temperature 五點保存路徑：
 
 ```text
-Reference RAW : /mnt/sd/thermal_op/blackbody_temp/point1_RAW.bin ... point5_RAW.bin
-K table : /mnt/sd/thermal_op/blackbody_temp/point1_K.bin ... point5_K.bin
-B table : /mnt/sd/thermal_op/blackbody_temp/point1_B.bin ... point5_B.bin
+Reference RAW : /mnt/sd/thermal_op/blackbody_temp_q14/point1_RAW.bin ... point5_RAW.bin
+K table : /mnt/sd/thermal_op/blackbody_temp_q14/point1_K.bin ... point5_K.bin
+B table : /mnt/sd/thermal_op/blackbody_temp_q14/point1_B.bin ... point5_B.bin
 ```
 
 NUC 選單：
@@ -361,24 +370,36 @@ NUC menu
 
 NUC enable 與 Sensor Temperature table interval 已集中到 `CFG Setting -> NUC setting`。
 
-`5 point Sensor Temperature NUC calibration` 量測五個 Sensor 溫度點。每個溫度點的 Low 與 High 都連續擷取 4 張 RAW，由 CPU 對 `640x512` 做平均，再產生獨立的 K/B table；runtime 依目前 Sensor 溫度選擇最接近的 table。完整 K/B table 為 `640x512`，對應板端 VCAP 實際回傳的 active-only RAW frame。校正過程先將五點 K/B table 寫入 `.new` 暫存檔，全部成功且大小正確後才替換正式檔案；任一點失敗都會放棄本次結果，保留原本五點 table。啟用 NUC 前，point1 到 point5 的 K/B 檔案必須全部存在且大小正確。
+`Sensor Temperature NUC calibration (capture once, copy to 5 points)` 只量測一次 Low／High，每個條件連續擷取 4 張 RAW，由 CPU 對 `640x512` 做平均，產生同一組 K/B 並複製到五點；五個 Sensor 溫度值也使用同一次量測結果。完整 K/B table 為 `640x512`，對應板端 VCAP 實際回傳的 active-only RAW frame。校正過程先將五點 K/B table 寫入 `.new` 暫存檔，全部成功且大小正確後才替換正式檔案；任一點失敗都會放棄本次結果，保留原本五點 table。啟用 NUC 前，point1 到 point5 的 K/B 檔案必須全部存在且大小正確。
 
-`5 point Blackbody Temperature NUC calibration (save RAW/K/B)` 必須由低溫到高溫依序量測五個黑體爐點，每點連續擷取 4 張 RAW 並平均。每點會保存該張 `pointN_RAW.bin` 參考影像，並建立一組 one-point offset table：所有 K 都是 Q8 的 `256`，B 為 `pixel_average - frame_average`，因此 GFX 公式會把校正點的均勻黑體影像拉回該張影像的全畫面平均值。五組 RAW/K/B 先寫入 `.new`，15 個檔案全部完成且大小正確後才替換 `blackbody_temp` 內的正式檔案；失敗時保留上一批結果。此校正選項本身只產生及保存檔案，不更新 Sensor Temperature CFG、不自動切換 runtime 模式。point1 到 point5 的實際黑體爐溫度值由操作者記錄，firmware 目前不保存溫度 metadata。
+Low／High 都取像成功後，在計算 K/B 前保存四張平均的輸入至 `/mnt/sd/thermal_op/sensor_temp_q14/low_RAW_BPR{閾值}.bin` 與 `high_RAW_BPR{閾值}.bin`，例如 `low_RAW_BPR15.bin`、`high_RAW_BPR15.bin`。後綴使用開始 Low／High 取像前的 `bpr_threshold` 設定值，兩檔使用相同值；此值不代表既有 DPC table 建立時的閾值。格式為無檔頭 UINT16 RAW（板端 little-endian、640×512、每檔 655,360 bytes），未做 8-bit 映射。每檔先寫 `.new` 並驗證大小，再取代同名檔；相同閾值再次校正會覆寫，不同閾值分開保留，存檔失敗會中止校正。這兩檔記錄最近取像結果，即使後續 K/B 計算失敗仍保留，不與 K/B table 一起回復。兩檔分別更新，第二檔存檔失敗時可能分屬不同次取像，需以存檔成功訊息確認。
+
+`5 point Blackbody Temperature NUC calibration (save RAW/K/B)` 必須由低溫到高溫依序量測五個黑體爐點，每點連續擷取 4 張 RAW 並平均。每點會保存該張 `pointN_RAW.bin` 參考影像，並建立一組 one-point offset table：所有 K 都是 Q14 的 `16384`，B 為 `pixel_average - frame_average`，因此 GFX 公式會把校正點的均勻黑體影像拉回該張影像的全畫面平均值。五組 RAW/K/B 先寫入 `.new`，15 個檔案全部完成且大小正確後才替換 `blackbody_temp_q14` 內的正式檔案；失敗時保留上一批結果。此校正選項本身只產生及保存檔案，不更新 Sensor Temperature CFG、不自動切換 runtime 模式。point1 到 point5 的實際黑體爐溫度值由操作者記錄，firmware 目前不保存溫度 metadata。
 
 `Toggle per-pixel Blackbody Dynamic NUC` 開啟時會一次載入五組 K/B，並由五張 reference RAW 預先計算每個 Pixel 的四個相鄰中點。每張即時 RAW 送進 NUC 前，CPU 對 `640x512` 每個 Pixel 比較四個中點，選出 point1 到 point5，將該點同座標的 K/B 複製到目前的 DDR K/B table，再交給 `VENDOR_GRPH_CMD_Non_uni_correction`。等於中點時選較高 point。若某 Pixel 的五個 reference RAW 不是嚴格遞增，該 Pixel 改用五張 reference RAW 的全畫面平均中點，並在開啟時列出 fallback Pixel 數量。為了暫時進行板端效能測試，目前即使五個全畫面平均不是由低到高也只會印出警告並繼續啟用；此時只可使用 CPU／GFX／FPS 數據，校正畫質與 point distribution 不具判定意義。
 
 Dynamic NUC 逐幀不讀 SD 卡。常駐 CPU heap 為五組 K/B `6,553,600` bytes，加四組 UINT16 threshold `2,621,440` bytes，共 `9,175,040` bytes；現有 GFX DDR 動態 K/B buffer 另為 `1,310,720` bytes。每 60 張會列出 mmap/cache、CPU 選表、K/B cache flush、三者合計的 `CPU added`、GFX 與 NUC 總耗時平均值、最大值、pipeline FPS，以及 P1 到 P5 的 Pixel 分布。`CPU added` 是相對原本固定 table NUC 新增的主要 CPU 成本；30 FPS 的單幀時間預算約為 `33.3 ms`。關閉 Dynamic NUC 時會釋放來源 table/threshold，並重新載入 Sensor Temperature table；Dynamic NUC 開啟期間不執行週期性的 Sensor Temperature table 更新。
 
-手動 Bright/Dark BPR 校正前會自動關閉 BPR 與 NUC；校正成功後載入新表並開啟 BPR，NUC 保持關閉。接著執行 Sensor Temperature NUC 校正時，會先關閉 NUC、載入最新的 `dpc_table.bin` 並開啟 BPR；只有 NUC 校正、儲存與重新載入全部成功後，才自動開啟 NUC。開關同步存入 CFG，必要的開關切換或 BPR table 載入失敗時會中止校正。此流程不變更 Runtime BPR 與 Blackbody 校正的使用方式。
+手動 Bright/Dark BPR 校正前會自動關閉 BPR 與 NUC；校正成功後載入新表並開啟 BPR，NUC 保持關閉。接著執行 Sensor Temperature NUC 校正時，會先關閉 NUC、載入最新的 `dpc_table.bin` 並開啟 BPR；只有 NUC 校正、儲存與重新載入全部成功後，才自動開啟 NUC。開關同步存入 CFG，必要的開關切換或 BPR table 載入失敗時會中止校正。Blackbody 校正的使用方式維持原樣。
 
-NUC 校正開始前會先等待正在執行的自動 shutter cycle 完成；接著暫停 interval 觸發的 FFC／Runtime BPR 關快門，讓 Low／High RAW 擷取期間保持快門開啟。校正成功或失敗離開時都會恢復自動 shutter cycle，並從完整的 `shutter_interval_sec` 重新計時。
+NUC 校正開始前會先等待正在執行的自動 shutter cycle 完成；接著暫停 interval 觸發的 FFC 關快門，讓 Low／High RAW 擷取期間保持快門開啟。校正成功或失敗離開時，若 FFC 開啟且間隔大於 `0`，從完整的 `shutter_interval_sec` 重新計時；`0` 則維持停止定時校正。
 
-K 使用 Q8 格式：
+Sensor Temperature NUC（Low／High）校正成功、重新載入校正表並啟用 NUC 後，會自動要求一次 snapshot，不需手動操作。請求會等到成功套用 NUC 的影格，再依既有流程保存 input／corrected RAW；Histogram 或 Fieldscale CPU AGC 啟用且當張處理成功時，也會保存 AGC output RAW。背景 writer 忙碌時延後至可接收的影格；校正失敗不觸發，停止 Liveview 或開始下一次手動校正會取消尚未擷取的自動請求。不額外等待 AGC 時間平滑穩定，ISP Tone Curve AGC 不另存 AGC RAW。以 `snapshot saved:` 訊息確認各檔案寫入完成。
+
+NUC runtime 與新校正的 K 使用 Q14 格式（FFC 仍使用自身的 Q8 格式）：
 
 ```text
-NUC_GAIN_SHIFT = 8
-K = stored_K / 256
+NUC_GAIN_SHIFT = 14
+K = stored_K / 16384
+identity stored_K = 16384
+valid stored_K = 1..32767 (maximum gain = 1.99993896484375)
 ```
+
+載入時優先使用 `sensor_temp_q14`／`blackbody_temp_q14`。若對應目錄完全沒有正式 table，才讀取舊 `sensor_temp`／`blackbody_temp` 的 Q8 table，並在 RAM 將 K 乘以 64；B 維持 signed INT16 DN，原始檔案不改寫。任一 Q14 正式 table 已存在但整組不完整時會報錯，不混用兩種格式。舊目錄若留下 `.new`／`.bak` 未完成交易也會拒絕載入。
+
+格式以目錄區分，勿將舊 Q8 檔案直接複製到 `_q14` 目錄。五點 K 都會檢查：Q14 必須在 `1..32767`，舊 Q8 必須在 `1..511` 才能安全轉換；超出範圍會拒絕載入。校正計算超過此範圍也會中止，保留上一組正式 table，不把過大的正 K 截成上限或當負數套用。因此增益 `2.1` 不適用目前 Q14 格式。
+
+舊 Q8 乘以 64 只維持原有增益，無法補回已量化的精度；重新校正才會直接以 Q14 計算新 K。整合後仍須重新編譯 Tiffany 並上板驗證影像。
 
 每個 pixel 先以舊的線性形式算出 gain 與 output additive offset：
 
@@ -406,10 +427,11 @@ Image C = NUC output
 Image D = NUC B table
 property = NUC_GAIN_SHIFT
 
-output = (stored_K * (input - new_B)) >> NUC_GAIN_SHIFT
+signed_output = clamp_int16((stored_K * (input - new_B) + 8192) >> 14)
+output_bits = (UINT16)signed_output
 ```
 
-啟動時會嘗試載入 `K.bin` 與 `B.bin`。任一檔案不存在或大小不符時，NUC table 會標記為未載入，並保持 NUC off。執行 calibration 或 reload 成功後才可啟用。
+啟動時會嘗試載入選定目錄的五組 `pointN_K.bin` 與 `pointN_B.bin`。任一檔案不存在、大小不符或 K 超出上述範圍時，NUC table 會標記為未載入，並保持 NUC off。執行 calibration 或 reload 成功後才可啟用。
 
 ## TDC
 
@@ -448,16 +470,30 @@ FFC status
  0. Back
 ```
 
-FFC enable、共用 shutter interval 與 shutter close wait time 已集中到 `CFG Setting -> Shutter / FFC setting`。
+FFC enable、FFC interval 與 shutter close wait time 已集中到 `CFG Setting -> Shutter / FFC setting`。選單第 2 項為 `FFC interval (0 = periodic off)`。
 
-FFC 或 Runtime BPR 任一功能啟用後，會先等待一個完整的 `shutter_interval_sec`，再執行第一次共用 shutter cycle；之後依相同 interval 定期執行：
+在 CFG 選單切換 `ffc_correction` 不需重啟 Liveview。有有效表格時立即套用；沒有表格時會顯示等待校正，透過影像執行緒完成一次 FFC 與 GFX 檢查，成功且快門重新開啟後才補償。失敗時保持補償關閉，失敗的首次表格不會保留為有效表格；使用者可再次開啟以重試。等待校正時改為關閉補償，校正完成後仍維持關閉。手動執行 `Run FFC test` 本身不會自動改動補償開關。
+
+`shutter_close_wait_ms` 修改後供下一次校正使用；若正在校正，會等待這次完成再套用。`ffc_startup_enable` 維持下次 Liveview 啟動時使用，修改當下不會觸發校正。Liveview 已停止時，這些修改只儲存 CFG，待下次啟動載入。
+
+`ffc_startup_enable=1` 時，Liveview 啟動後先執行一次 FFC。`ffc_correction=1` 且 `shutter_interval_sec>0` 時，之後依完整間隔定期執行 shutter cycle；`shutter_interval_sec=0` 則停止定時校正，仍可執行開機／手動 FFC，並持續套用已有的有效補償表。
+
+只要開機校正一次、之後持續補償，可設定：
+
+```ini
+ffc_correction=1
+shutter_interval_sec=0
+shutter_close_wait_ms=200
+ffc_startup_enable=1
+```
+
+間隔大於 `0` 時的定時流程：
 
 ```text
 interval 時間到
   -> 關閉 shutter
   -> 等待 shutter_close_wait_ms
   -> FFC 啟用時取得四張 VCAP RAW 並更新 offset table
-  -> Runtime BPR 啟用時執行 BPR calibration 並直接套用新的 DPC table
   -> 開啟 shutter
   -> 安排下一次 shutter cycle
 ```
@@ -540,7 +576,7 @@ low      : open shutter
 high     : close shutter
 ```
 
-GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shutter 失敗時都會重新初始化 GPIO 並最多嘗試三次；三次仍失敗會設定 `shutter_fault`，並由外部 worker 停止 Liveview。FFC 與 Runtime BPR 共用同一個自動 shutter cycle；整段 shutter-closed calibration 會持有 calibration lock，期間所有手動 shutter 指令都會被阻擋。
+GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shutter 失敗時都會重新初始化 GPIO 並最多嘗試三次；三次仍失敗會設定 `shutter_fault`，並由外部 worker 停止 Liveview。整段 FFC shutter-closed calibration 會持有 calibration lock，期間所有手動 shutter 指令都會被阻擋。
 
 ## Runtime 檔案總表
 
@@ -548,9 +584,9 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 |---|---|---|
 | `/mnt/sd/tiffany_thermal.cfg` | 使用者設定 | 設定時立即保存；Liveview Start／Restart 或開機時載入 |
 | `/mnt/sd/isp_ty640_0.cfg` | ISP cfg，包含 Gamma 完整參數與預設 enable | Liveview 啟動時載入；Gamma menu 只暫時修改目前 runtime enable |
-| `/mnt/sd/thermal_op/dpc_table.bin` | BPR/DPC table | Liveview 啟動時由 Tiffany 直接載入 ISP；Bright/Dark BPR 或 Runtime BPR 產生新表後，也可直接更新 ISP |
-| `/mnt/sd/thermal_op/sensor_temp/point1_K.bin` ... `point5_K.bin` | NUC gain tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
-| `/mnt/sd/thermal_op/sensor_temp/point1_B.bin` ... `point5_B.bin` | NUC offset tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
+| `/mnt/sd/thermal_op/dpc_table.bin` | BPR/DPC table | Liveview 啟動時由 Tiffany 直接載入 ISP；Bright/Dark BPR 產生新表後，也可直接更新 ISP |
+| `/mnt/sd/thermal_op/sensor_temp_q14/point1_K.bin` ... `point5_K.bin` | NUC gain tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
+| `/mnt/sd/thermal_op/sensor_temp_q14/point1_B.bin` ... `point5_B.bin` | NUC offset tables | Sensor Temperature 五點校正產生；依 Sensor 溫度選用 |
 | FFC DDR buffer | FFC offset table | shutter frame 更新；不寫檔 |
 
 ## 建議上板檢查
@@ -572,3 +608,17 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 - 命令列 `?` help 的參數順序目前和 source 實際解析順序不一致。
 - `hd_gfx_init()`／`hd_gfx_uninit()` 已納入 liveview start/stop；shutter GPIO fd 目前仍沒有公開的 deinit/close 流程。
 "# Novatek_539_Thermal_Camera" 
+
+
+## Image Count Recording 溫度紀錄與三段測試
+
+進入 `Liveview -> Recording RAW -> Image Count Recording`，在 `Select RAW type` 選擇：
+
+- `1. Original RAW`、`2. Corrected RAW`、`3. AGC output RAW`：各保存指定張數。
+- `4. Original -> Corrected -> Original (BPR off)`：依序保存 N 張 Original、N 張 Corrected，再關閉 BPR、排除切換前的影格後保存 N 張 Original。總共 3N 張；前兩段沿用錄製前的 BPR 狀態。
+
+每張均在同目錄的 `summary.csv` 記錄時間、sensor 溫度、BPR 開關、階段及 RAW 檔名。時間取板端系統時鐘，以 UTC 毫秒格式保存；溫度讀取失敗時留白並標記 `read_failed`。第三段檔名使用 `original_bpr_off`。
+
+三段測試完成、手動停止、Liveview 停止或存檔失敗後，會在最後一張排程檔案寫完後恢復錄製前的 BPR 狀態，不改寫 BPR CFG。ISP 恢復失敗會顯示錯誤並保留待恢復狀態。錄製期間請先停止三段測試，再從 CFG 改變 BPR。
+
+主機回歸測試：`python tests/test_image_count_recording.py <gcc 路徑>`。實際 BPR 切換後的影像與 SD 寫入仍需上板驗證。

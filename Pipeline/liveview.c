@@ -37,6 +37,7 @@
 #include "../Config/app_config.h"
 #include "../Config/hardware_config.h"
 #include "../Device/FOS/fos.h"
+#include "../Device/SensorTemp/sensor_temp.h"
 #include "vendor_isp.h"
 #include "../Correction/BPR/bpr.h"
 #include "../Correction/FFC/ffc.h"
@@ -49,6 +50,9 @@
 #include "../Enhancement/Gamma/gamma.h"
 #include "../ISP/videoproc/videoproc_isp.h"
 #include "../Diagnostics/ISP/isp_raw_to_y_step_diagnostic.h"
+#include "../Diagnostics/timed_snapshot.h"
+#include "../Diagnostics/minute_raw_recording.h"
+#include "../Diagnostics/raw_recording_log.h"
 #include "../Driver/GPIO/gpio_control.h"
 #include "Output/video_output.h"
 
@@ -103,6 +107,9 @@
 #define THERMAL_SNAPSHOT_DIR          "/mnt/sd/thermal_snapshot"
 #define RAW_SNAPSHOT_DIR              THERMAL_SNAPSHOT_DIR "/raw"
 #define DISPLAY_DIAG_DIR              THERMAL_SNAPSHOT_DIR "/display_diag"
+#define SCHEDULED_TIMED_SNAPSHOT 1
+#define SCHEDULED_MINUTE_RAW     2
+
 #define SNAPSHOT_PREFIX               "snapshot_"
 #define DISPLAY_DIAG_PREFIX           "display_diag_"
 #define SNAPSHOT_FRAME_BYTES          \
@@ -180,6 +187,8 @@ static VIDEO_OUTPUT *g_diagnostic_video_output = NULL;
 static int g_proc_input_format_logged = 0;
 static UINT64 g_shutter_next_calibration_ms = 0;
 static int g_manual_calibration_active = 0;
+/* Protected by g_manual_calibration_lock; consumed only after successful NUC. */
+static int g_nuc_snapshot_pending = 0;
 static int g_shutter_reschedule_after_manual_calibration = 0;
 static int display_diag_get_next_id(UINT32 *p_diag_id);
 ///////////////////////////////////////////////////////////////////////////////
@@ -355,26 +364,13 @@ static void liveview_schedule_next_shutter_calibration(void)
 	UINT32 interval_sec = ffc_get_shutter_interval_sec();
 
 	if (interval_sec == 0) {
-		interval_sec = 1;
+		g_shutter_next_calibration_ms = 0;
+		return;
 	}
 	g_shutter_next_calibration_ms =
 		liveview_get_time_ms() + (UINT64)interval_sec * 1000;
 }
 
-static void liveview_run_runtime_bpr_while_shutter_closed(void)
-{
-	int runtime_bpr_ret;
-
-	if (!bpr_is_runtime_enabled()) {
-		return;
-	}
-
-	runtime_bpr_ret = bpr_run_runtime_calibration();
-	if (runtime_bpr_ret != 0) {
-		printf("Runtime BPR calibration fail=%d\n",
-		       runtime_bpr_ret);
-	}
-}
 
 static HD_RESULT mem_init(void)
 {
@@ -391,8 +387,8 @@ static HD_RESULT mem_init(void)
     													+VDO_LA_BUF_SIZE(LA_WIN_NUM_W, LA_WIN_NUM_H);
 
 	mem_cfg.pool_info[id].blk_size += VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
-	mem_cfg.pool_info[id].blk_cnt = 2 + 10;
-	// 10 => TDC out + NUC k + NUC b + NUC out + FFC k + FFC b + FFC out + FFC sum + shared CPU AGC out + ISP step test
+	mem_cfg.pool_info[id].blk_cnt = 2 + 11;
+	// 11 => TDC out + NUC k + NUC b + NUC out + FFC k + FFC b + FFC out + FFC sum + FFC zero + shared CPU AGC out + ISP step test
 	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
 
 	// config common pool (main)
@@ -753,6 +749,9 @@ typedef struct _VIDEO_LIVEVIEW {
 	HD_COMMON_MEM_VB_BLK thermal_ffc_sum_blk;
 	UINTPTR thermal_ffc_sum_pa;
 	UINTPTR thermal_ffc_sum_va;
+	HD_COMMON_MEM_VB_BLK thermal_ffc_zero_blk;
+	UINTPTR thermal_ffc_zero_pa;
+	UINTPTR thermal_ffc_zero_va;
 
 	HD_COMMON_MEM_VB_BLK thermal_ffc_k_frame_blk;
 	UINTPTR thermal_ffc_k_frame_pa;
@@ -821,13 +820,20 @@ typedef struct {
 
 /* Protected by g_snapshot_writer.lock; job owns input_buffer until written. */
 static struct {
-	int active, job, type;
+	int active, job, type, phase;
+	int transition_pending, restore_pending, initial_bpr, control_busy;
 	UINT64 started_ms;
+	unsigned long long phase_saved;
+	RAW_RECORDING_LOG metadata;
 	unsigned long long target_frames;
 	unsigned long long saved, skipped, sequence;
 	char directory[192], path[320];
 	const char *reason;
 } g_raw_recording;
+
+/* Serialized with snapshot buffer ownership by g_snapshot_writer.lock. */
+static TIMED_SNAPSHOT g_timed_snapshot;
+static MINUTE_RAW_RECORDING g_minute_raw;
 
 static LIVEVIEW_CONTEXT g_liveview;
 static UINT32 g_snapshot_count = 0;
@@ -848,6 +854,8 @@ static int g_ffc_test_pending = 0;
 static int g_ffc_test_running = 0;
 static int g_ffc_test_worker_active = 0;
 static int g_ffc_test_result = -1;
+/* Protected by g_ffc_test_lock; only CFG enable requests auto-apply a test. */
+static int g_ffc_enable_after_test = 0;
 static pthread_mutex_t g_isp_step_test_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_isp_step_test_cond = PTHREAD_COND_INITIALIZER;
 static int g_isp_step_test_pending = 0;
@@ -906,14 +914,32 @@ static int liveview_take_ffc_test_request(void)
 
 static void liveview_finish_ffc_test(int result)
 {
+	pthread_mutex_lock(&g_shutter_calibration_lock);
+	pthread_mutex_lock(&g_manual_calibration_lock);
 	pthread_mutex_lock(&g_ffc_test_lock);
 	if (g_ffc_test_pending || g_ffc_test_running) {
+		if (g_ffc_enable_after_test) {
+			int ready = result == 0 && ffc_table_is_ready();
+			int requested = g_ffc_enable_after_test > 0;
+			if (!ready)
+				ffc_init_table();
+			ffc_set_enabled(ready && requested);
+			g_shutter_reschedule_after_manual_calibration = 1;
+			if (!ready)
+				printf("FFC enable calibration failed; compensation remains off\n");
+			else
+				printf(requested ? "FFC calibration complete; compensation applied\n" :
+				       "FFC calibration complete; compensation remains off as requested\n");
+		}
+		g_ffc_enable_after_test = 0;
 		g_ffc_test_pending = 0;
 		g_ffc_test_running = 0;
 		g_ffc_test_result = result;
 		pthread_cond_broadcast(&g_ffc_test_cond);
 	}
 	pthread_mutex_unlock(&g_ffc_test_lock);
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	pthread_mutex_unlock(&g_shutter_calibration_lock);
 }
 
 static void liveview_set_ffc_test_worker_active(int active)
@@ -925,6 +951,7 @@ static void liveview_set_ffc_test_worker_active(int active)
 		g_ffc_test_pending = 0;
 		g_ffc_test_running = 0;
 		g_ffc_test_result = -1;
+		g_ffc_enable_after_test = 0;
 		pthread_cond_broadcast(&g_ffc_test_cond);
 	}
 	pthread_mutex_unlock(&g_ffc_test_lock);
@@ -1209,10 +1236,11 @@ static void liveview_on_manual_calibration_state(const char *name, int active)
 	pthread_mutex_lock(&g_shutter_calibration_lock);
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	shutter_calibration_enabled =
-		ffc_is_enabled() || bpr_is_runtime_enabled();
+		ffc_is_enabled() && ffc_get_shutter_interval_sec() > 0;
 	if (active) {
 		g_shutter_reschedule_after_manual_calibration = 0;
 		g_manual_calibration_active = 1;
+		g_nuc_snapshot_pending = 0;
 		if (shutter_calibration_enabled) {
 			printf("Automatic shutter calibration paused for %s calibration\n",
 			       calibration_name);
@@ -1229,13 +1257,14 @@ static void liveview_on_manual_calibration_state(const char *name, int active)
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
 }
 
-static int liveview_prepare_shutter_interval(int enabled)
+static int liveview_prepare_shutter_interval(int *enabled)
 {
 	int paused;
 
 	pthread_mutex_lock(&g_shutter_calibration_lock);
+	*enabled = ffc_is_enabled() && ffc_get_shutter_interval_sec() > 0;
 	if (g_shutter_reschedule_after_manual_calibration) {
-		if (enabled) {
+		if (*enabled) {
 			liveview_schedule_next_shutter_calibration();
 		} else {
 			g_shutter_next_calibration_ms = 0;
@@ -1363,6 +1392,11 @@ exit:
 		fclose(fp);
 	}
 	return ret;
+}
+
+static int save_minute_raw_buffer(const unsigned char *raw, size_t bytes, const char *path)
+{
+	return save_raw_buffer_internal(raw, bytes, path, 1);
 }
 
 static int save_y8_diagnostic_buffer(const unsigned char *y_buffer,
@@ -1844,8 +1878,16 @@ static void raw_recording_stop_locked(const char *reason)
 
 static void raw_recording_check_limit_locked(void)
 {
-	if (g_raw_recording.active && g_raw_recording.saved >= g_raw_recording.target_frames)
+	if (!g_raw_recording.active || g_raw_recording.phase_saved < g_raw_recording.target_frames)
+		return;
+	if (g_raw_recording.type == 3 && g_raw_recording.phase < 2) {
+		g_raw_recording.phase++;
+		g_raw_recording.phase_saved = 0;
+		if (g_raw_recording.phase == 2) g_raw_recording.transition_pending = 1;
+		printf("RAW recording: advancing to stage %d/3\n", g_raw_recording.phase + 1);
+	} else {
 		raw_recording_stop_locked("requested image count reached");
+	}
 }
 
 static int raw_recording_has_space(const char *path)
@@ -1863,45 +1905,57 @@ static int raw_recording_has_space(const char *path)
 
 /* VCAP owner only, before releasing any source buffer. No disk I/O here. */
 static void raw_recording_queue(HD_VIDEO_FRAME *input,
-	HD_VIDEO_FRAME *corrected, HD_VIDEO_FRAME *agc)
+	HD_VIDEO_FRAME *corrected, HD_VIDEO_FRAME *agc, int64_t capture_unix_ms)
 {
 	HD_VIDEO_FRAME *selected;
+	const char *stage;
+	const char *filename;
+	int type;
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	raw_recording_check_limit_locked();
-	if (!g_raw_recording.active) goto done;
+	if (!g_raw_recording.active || g_raw_recording.transition_pending ||
+	    g_raw_recording.control_busy) goto done;
 	if (g_snapshot_writer.busy) {
 		g_raw_recording.skipped++;
 		goto done;
 	}
-	selected = g_raw_recording.type == 0 ? input :
-		(g_raw_recording.type == 1 ? corrected : agc);
+	type = g_raw_recording.type == 3 ?
+		(g_raw_recording.phase == 1 ? 1 : 0) : g_raw_recording.type;
+	stage = g_raw_recording.type == 3 && g_raw_recording.phase == 2 ?
+		"original_bpr_off" : (type == 0 ? "original" :
+		(type == 1 ? "corrected" : "agc_output"));
+	selected = type == 0 ? input : (type == 1 ? corrected : agc);
 	if (selected == NULL) {
 		raw_recording_stop_locked("selected RAW output unavailable");
 		goto done;
 	}
 	g_snapshot_writer.busy = 1;
 	if (copy_active_raw_frame(selected, g_snapshot_writer.input_buffer,
-				SNAPSHOT_FRAME_BYTES) != 0) {
+	                         SNAPSHOT_FRAME_BYTES) != 0) {
 		g_snapshot_writer.busy = 0;
 		raw_recording_stop_locked("RAW copy failed");
 		goto done;
 	}
-	raw_recording_check_limit_locked();
-	if (!g_raw_recording.active) {
-		g_snapshot_writer.busy = 0;
-		goto done;
-	}
+	memset(&g_raw_recording.metadata, 0, sizeof(g_raw_recording.metadata));
+	g_raw_recording.metadata.sequence = g_raw_recording.sequence++;
+	g_raw_recording.metadata.phase_frame = g_raw_recording.phase_saved + 1;
+	g_raw_recording.metadata.elapsed_ms = liveview_get_time_ms() - g_raw_recording.started_ms;
+	g_raw_recording.metadata.capture_unix_ms = capture_unix_ms;
+	g_raw_recording.metadata.sensor_temp_valid =
+		sensor_temp_read(&g_raw_recording.metadata.sensor_temp_c) == 0;
+	g_raw_recording.metadata.bpr_enabled = bpr_is_enabled();
+	g_raw_recording.metadata.stage = stage;
 	snprintf(g_raw_recording.path, sizeof(g_raw_recording.path),
-		"%s/frame_%06llu_t%llums_%s_raw16_%ux%u.raw",
-		g_raw_recording.directory, g_raw_recording.sequence++,
-		(unsigned long long)(liveview_get_time_ms() - g_raw_recording.started_ms),
-		g_raw_recording.type == 0 ? "original" :
-			(g_raw_recording.type == 1 ? "corrected" : "agc_output"),
+		"%s/frame_%06llu_t%llums_%s_raw16_%ux%u.raw", g_raw_recording.directory,
+		(unsigned long long)g_raw_recording.metadata.sequence,
+		(unsigned long long)g_raw_recording.metadata.elapsed_ms, stage,
 		RAW_ACTIVE_W, RAW_ACTIVE_H);
+	filename = strrchr(g_raw_recording.path, '/');
+	g_raw_recording.metadata.raw_file = filename ? filename + 1 : g_raw_recording.path;
 	g_raw_recording.job = 1;
 	g_snapshot_writer.pending = 1;
 	pthread_cond_signal(&g_snapshot_writer.cond);
-done:
+ done:
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 }
 
@@ -1912,6 +1966,8 @@ static void *snapshot_writer_thread(void *arg)
 	int has_agc_output;
 	int write_ret;
 	int recording_job;
+	int timed_job;
+	int minute_job;
 
 	(void)arg;
 	for (;;) {
@@ -1927,6 +1983,8 @@ static void *snapshot_writer_thread(void *arg)
 		}
 
 		recording_job = g_raw_recording.job;
+		timed_job = g_timed_snapshot.in_flight;
+		minute_job = g_minute_raw.in_flight;
 		snapshot_id = g_snapshot_writer.snapshot_id;
 		final_is_input = g_snapshot_writer.final_is_input;
 		has_agc_output = g_snapshot_writer.has_agc_output;
@@ -1938,6 +1996,20 @@ static void *snapshot_writer_thread(void *arg)
 				save_raw_buffer_internal(g_snapshot_writer.input_buffer, SNAPSHOT_FRAME_BYTES,
 					g_raw_recording.path, 1) : -1;
 			if (write_ret != 0) remove(g_raw_recording.path);
+			else
+				write_ret = raw_recording_log_append(g_raw_recording.directory,
+					&g_raw_recording.metadata);
+		} else if (minute_job) {
+			write_ret = raw_recording_has_space(g_minute_raw.directory) ?
+				minute_raw_save(&g_minute_raw, g_snapshot_writer.input_buffer,
+					g_snapshot_writer.corrected_buffer, RAW_ACTIVE_W, RAW_ACTIVE_H,
+					save_minute_raw_buffer) : -1;
+		} else if (timed_job) {
+			write_ret = timed_snapshot_save(&g_timed_snapshot,
+				g_snapshot_writer.input_buffer,
+				final_is_input ? NULL : g_snapshot_writer.corrected_buffer,
+				has_agc_output ? g_snapshot_writer.agc_output_buffer : NULL,
+				RAW_ACTIVE_W, RAW_ACTIVE_H, save_raw_buffer);
 		} else {
 			write_ret = snapshot_write_job(snapshot_id, final_is_input,
 						       has_agc_output);
@@ -1946,9 +2018,14 @@ static void *snapshot_writer_thread(void *arg)
 		}
 
 		pthread_mutex_lock(&g_snapshot_writer.lock);
+		if (timed_job) timed_snapshot_finish(&g_timed_snapshot, write_ret);
+		if (minute_job) minute_raw_finish(&g_minute_raw, write_ret);
 		if (recording_job) {
 			g_raw_recording.job = 0;
-			if (write_ret == 0) g_raw_recording.saved++;
+			if (write_ret == 0) {
+				g_raw_recording.saved++;
+				g_raw_recording.phase_saved++;
+			}
 			else raw_recording_stop_locked("write failed or insufficient SD space");
 			raw_recording_check_limit_locked();
 			if (!g_raw_recording.active)
@@ -2064,18 +2141,39 @@ static void snapshot_writer_cancel_request(void)
 {
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	if (!g_snapshot_writer.pending) {
+		timed_snapshot_finish(&g_timed_snapshot, -1);
+		minute_raw_finish(&g_minute_raw, -1);
 		g_snapshot_writer.busy = 0;
 	}
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 }
 
+static int timed_snapshot_reserve_request(void)
+{
+	int reserved = 0;
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (g_snapshot_writer.thread_created && !g_snapshot_writer.exit_requested &&
+	    !g_snapshot_writer.busy && !g_raw_recording.active && !g_raw_recording.job) {
+		if (minute_raw_claim(&g_minute_raw, liveview_get_time_ms()))
+			reserved = SCHEDULED_MINUTE_RAW;
+		else if (timed_snapshot_claim(&g_timed_snapshot, liveview_get_time_ms()))
+			reserved = SCHEDULED_TIMED_SNAPSHOT;
+		if (reserved) g_snapshot_writer.busy = 1;
+	}
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	return reserved;
+}
+
 static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 	HD_VIDEO_FRAME *p_final_frame, int final_is_input,
-	HD_VIDEO_FRAME *p_agc_output_frame, int has_agc_output)
+	HD_VIDEO_FRAME *p_agc_output_frame, int has_agc_output, int timed_job, int64_t capture_unix_ms)
 {
-	UINT32 snapshot_id;
+	UINT32 snapshot_id = 0;
+	float sensor_temp_c = 0.0f;
+	int sensor_temp_valid = 0;
 
-	if (snapshot_get_next_id(&snapshot_id) != 0) {
+	if (timed_job == SCHEDULED_MINUTE_RAW) has_agc_output = 0;
+	if (!timed_job && snapshot_get_next_id(&snapshot_id) != 0) {
 		snapshot_writer_cancel_request();
 		return -1;
 	}
@@ -2086,7 +2184,7 @@ static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 		snapshot_writer_cancel_request();
 		return -1;
 	}
-	if (!final_is_input &&
+	if ((!final_is_input || timed_job == SCHEDULED_MINUTE_RAW) &&
 	    copy_active_raw_frame(p_final_frame,
 				  g_snapshot_writer.corrected_buffer,
 				  SNAPSHOT_FRAME_BYTES) != 0) {
@@ -2103,9 +2201,17 @@ static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 		return -1;
 	}
 
+	/* Read alongside the copied frame, before publishing to the SD writer.
+	 * Use the same fresh reading as Show Current Sensor Temperature. */
+	if (timed_job) {
+		sensor_temp_valid = sensor_temp_read(&sensor_temp_c) == 0;
+	}
+
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	if (!g_snapshot_writer.thread_created ||
 	    g_snapshot_writer.exit_requested) {
+		timed_snapshot_finish(&g_timed_snapshot, -1);
+		minute_raw_finish(&g_minute_raw, -1);
 		g_snapshot_writer.busy = 0;
 		pthread_mutex_unlock(&g_snapshot_writer.lock);
 		printf("snapshot writer stopped before queue\n");
@@ -2115,11 +2221,28 @@ static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 	g_snapshot_writer.final_is_input = final_is_input;
 	g_snapshot_writer.has_agc_output = has_agc_output ? 1 : 0;
 	g_snapshot_writer.pending = 1;
+	if (timed_job == SCHEDULED_MINUTE_RAW) {
+		g_minute_raw.captured_unix_ms = capture_unix_ms;
+		g_minute_raw.sensor_temp_c = sensor_temp_c;
+		g_minute_raw.sensor_temp_valid = sensor_temp_valid;
+	} else if (timed_job == SCHEDULED_TIMED_SNAPSHOT) {
+		g_timed_snapshot.sensor_temp_c = sensor_temp_c;
+		g_timed_snapshot.sensor_temp_valid = sensor_temp_valid;
+		printf("Timed Snapshot %u/%u copied; background save queued\n",
+			g_timed_snapshot.saved + 1U, TIMED_SNAPSHOT_COUNT);
+		if (sensor_temp_valid) {
+			printf("Current Sensor Temperature = %.4f C\n", (double)sensor_temp_c);
+		} else {
+			printf("Current Sensor Temperature read failed; saving snapshot with empty temperature\n");
+		}
+	}
 	pthread_cond_signal(&g_snapshot_writer.cond);
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 
-	printf("Snapshot %04u copied; background save queued, AGC output=%s\n",
-	       snapshot_id, has_agc_output ? "yes" : "no");
+	if (!timed_job) {
+		printf("Snapshot %04u copied; background save queued, AGC output=%s\n",
+		       snapshot_id, has_agc_output ? "yes" : "no");
+	}
 	return 0;
 }
 
@@ -2214,6 +2337,8 @@ static int liveview_run_ffc_gfx_test(VIDEO_LIVEVIEW *p_stream,
 	if (p_stream == NULL || lineoffset == 0 ||
 	    p_stream->thermal_ffc_out_pa == 0 ||
 	    p_stream->thermal_ffc_out_va == 0 ||
+	    p_stream->thermal_ffc_zero_pa == 0 ||			// Tim FFC
+	    p_stream->thermal_ffc_zero_va == 0 ||
 	    p_stream->thermal_ffc_k_frame_pa == 0 ||
 	    p_stream->thermal_ffc_k_frame_va == 0 ||
 	    p_stream->thermal_ffc_b_frame_pa == 0 ||
@@ -2321,7 +2446,7 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		return HD_ERR_NG;
 	}
 
-	//temporarily set to K=1.0 in Q8 format
+	/* Initialize NUC unity gain in the selected fixed-point format (Q14). */
 	for (i = 0; i < blk_size; i += 4) {
 		*(UINT32 *)(p_stream->thermal_k_frame_va + i) =
 			(NUC_GAIN_ONE << 16) | NUC_GAIN_ONE;
@@ -2391,7 +2516,7 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 
 	for (i = 0; i < blk_size; i += 4) {
 		*(UINT32 *)(p_stream->thermal_ffc_k_frame_va + i) =
-			(NUC_GAIN_ONE << 16) | NUC_GAIN_ONE;
+			(FFC_GAIN_ONE << 16) | FFC_GAIN_ONE;
 	}
 	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_k_frame_va, blk_size);
 
@@ -2455,6 +2580,27 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	}
 	memset((void *)p_stream->thermal_ffc_sum_va, 0, blk_size);
 	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_sum_va, blk_size);
+
+	// init FFC zero frame (read-only GFX source)
+	p_stream->thermal_ffc_zero_blk = hd_common_mem_get_block(HD_COMMON_MEM_COMMON_POOL, blk_size, DDR_ID0);
+	if (p_stream->thermal_ffc_zero_blk == 0) {
+		printf("get ffc zero block fail (0x%" PRIu64 ")\r\n", (uint64_t)p_stream->thermal_ffc_zero_blk);
+		return HD_ERR_NG;
+	}
+
+	p_stream->thermal_ffc_zero_pa = hd_common_mem_blk2pa(p_stream->thermal_ffc_zero_blk);
+	if (p_stream->thermal_ffc_zero_pa == 0) {
+		printf("blk2pa fail, thermal_ffc_zero_blk = 0x%" PRIu64 "\r\n", (uint64_t)p_stream->thermal_ffc_zero_blk);
+		return HD_ERR_NG;
+	}
+
+	p_stream->thermal_ffc_zero_va = (UINTPTR)hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE_CACHE, p_stream->thermal_ffc_zero_pa, blk_size);
+	if (p_stream->thermal_ffc_zero_va == 0) {
+		printf("Error: mmap ffc zero pa fail !\r\n");
+		return HD_ERR_NG;
+	}
+	memset((void *)p_stream->thermal_ffc_zero_va, 0, blk_size);
+	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_zero_va, blk_size);
 
 	// init shared CPU AGC output frame
 	p_stream->thermal_agc_histogram_p1_p99_out_blk =
@@ -2592,6 +2738,8 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		p_stream->thermal_ffc_out_blk, "FFC output");
 	RELEASE_THERMAL_BUFFER(p_stream->thermal_ffc_sum_va,
 		p_stream->thermal_ffc_sum_blk, "FFC sum");
+	RELEASE_THERMAL_BUFFER(p_stream->thermal_ffc_zero_va,
+		p_stream->thermal_ffc_zero_blk, "FFC zero");
 	RELEASE_THERMAL_BUFFER(p_stream->thermal_agc_histogram_p1_p99_out_va,
 		p_stream->thermal_agc_histogram_p1_p99_out_blk,
 		"shared CPU AGC output");
@@ -2609,6 +2757,7 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	p_stream->thermal_ffc_b_frame_pa = 0;
 	p_stream->thermal_ffc_out_pa = 0;
 	p_stream->thermal_ffc_sum_pa = 0;
+	p_stream->thermal_ffc_zero_pa = 0;
 	p_stream->thermal_agc_histogram_p1_p99_out_pa = 0;
 	p_stream->thermal_isp_step_test_pa = 0;
 	free(p_stream->agc_histogram_p1_p99_workspace);
@@ -2807,7 +2956,8 @@ static int liveview_run_ffc_calibration(
 	VIDEO_LIVEVIEW *p_stream0,
 	UINT64 *nuc_next_update_ms,
 	UINT64 *tdc_next_update_ms,
-	int test_mode)
+	int test_mode,
+	int startup_ffc)
 {
 	HD_VIDEO_FRAME vcap_video_frame = {0};
 	HD_VIDEO_FRAME tdc_video_frame = {0};
@@ -2840,8 +2990,8 @@ static int liveview_run_ffc_calibration(
 		if (frame > 0) {
 			liveview_update_temperature_tables_if_needed(
 				nuc_next_update_ms, tdc_next_update_ms);
-			if (!test_mode &&
-			    !ffc_is_enabled() && !bpr_is_runtime_enabled()) {
+			if (!test_mode && !startup_ffc &&
+			    (!ffc_is_enabled() || ffc_get_shutter_interval_sec() == 0)) {
 				printf("Shutter calibration disabled during FFC\n");
 				return -1;
 			}
@@ -2901,8 +3051,8 @@ static int liveview_run_ffc_calibration(
 			sum_pa = p_stream0->thermal_ffc_out_pa;
 			out_pa = p_stream0->thermal_ffc_sum_pa;
 		} else {
-			sum_pa = p_stream0->thermal_ffc_sum_pa;
-			out_pa = p_stream0->thermal_ffc_out_pa;
+			sum_pa = p_stream0->thermal_ffc_out_pa;
+			out_pa = p_stream0->thermal_ffc_sum_pa;
 		}
 		if (frame == FFC_AVERAGE_FRAME_COUNT - 1U) {
 			shift = FFC_AVERAGE_SHIFT;
@@ -2911,7 +3061,7 @@ static int liveview_run_ffc_calibration(
 		if (process_ret == HD_OK) {
 			process_ret = ffc_accumulate_frame(
 				calibration_frame->phy_addr[0],
-				sum_pa, out_pa,
+				sum_pa, out_pa, p_stream0->thermal_ffc_zero_pa,
 				RAW_SIZE_W, RAW_SIZE_H, shift);
 			if (process_ret == HD_OK) {
 				printf("FFC average frame %u/%u, shift=%u\n",
@@ -2945,9 +3095,7 @@ static int liveview_run_ffc_calibration(
 
 	if (liveview_update_ffc_table_from_average(p_stream0, lineoffset) != 0) {
 		printf("FFC update table fail\n");
-		if (test_mode) {
-			return -1;
-		}
+		return -1;
 	} else if (test_mode &&
 		   liveview_run_ffc_gfx_test(p_stream0, lineoffset) != 0) {
 		return -1;
@@ -2960,12 +3108,20 @@ static int liveview_run_shutter_calibration_cycle(
 	VIDEO_LIVEVIEW *p_stream0,
 	UINT64 *nuc_next_update_ms,
 	UINT64 *tdc_next_update_ms,
-	int test_mode)
+	int test_mode,
+	int startup_ffc)
 {
 	int calibration_ok = 1;
 	int shutter_result = 0;
 
 	pthread_mutex_lock(&g_shutter_calibration_lock);
+	/* Recheck after taking the lock: the interval may have changed since
+	 * the worker checked its deadline. Startup/manual FFC bypass this timer. */
+	if (!test_mode && !startup_ffc &&
+	    (!ffc_is_enabled() || ffc_get_shutter_interval_sec() == 0)) {
+		pthread_mutex_unlock(&g_shutter_calibration_lock);
+		return SHUTTER_CALIBRATION_PAUSED;
+	}
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	if (g_manual_calibration_active) {
 		pthread_mutex_unlock(&g_manual_calibration_lock);
@@ -2982,22 +3138,15 @@ static int liveview_run_shutter_calibration_cycle(
 
 	liveview_sleep_ms(g_shutter_close_wait_ms);
 
-	if (test_mode || ffc_is_enabled()) {
+	if (test_mode || startup_ffc || ffc_is_enabled()) {
 		if (liveview_run_ffc_calibration(p_stream0,
 						 nuc_next_update_ms,
 						 tdc_next_update_ms,
-						 test_mode) != 0) {
+						 test_mode, startup_ffc) != 0) {
 			calibration_ok = 0;
 		}
 	}
 
-	if (!test_mode && bpr_is_runtime_enabled()) {
-		if (calibration_ok) {
-			liveview_run_runtime_bpr_while_shutter_closed();
-		} else {
-			printf("Skip Runtime BPR because FFC calibration failed\n");
-		}
-	}
 
 	if (gpio_shutter_open() != 0) {
 		printf("Shutter calibration open shutter fail\n");
@@ -3005,7 +3154,7 @@ static int liveview_run_shutter_calibration_cycle(
 	}
 
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
-	if (test_mode && !calibration_ok) {
+	if ((test_mode || startup_ffc) && !calibration_ok) {
 		return -1;
 	}
 	return shutter_result;
@@ -3416,8 +3565,12 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	int snapshot_requested = 0;
 	int snapshot_final_is_input = 0;
 	int snapshot_has_agc_output = 0;
+	int timed_snapshot_job = 0;
+	struct timespec capture_wall_time;
+	int64_t capture_unix_ms = -1;
 	int raw_copy_handled = 0;
 	int correction_lock_held = 0;
+	int nuc_applied = 0;
 	int isp_step_test_requested = 0;
 	UINT32 isp_step_test_run_id = 0;
 	UINT32 isp_step_test_min_raw_dn = 0U;
@@ -3440,6 +3593,9 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		}
 		return;
 	}
+	if (clock_gettime(CLOCK_REALTIME, &capture_wall_time) == 0)
+		capture_unix_ms = (int64_t)capture_wall_time.tv_sec * 1000 +
+			capture_wall_time.tv_nsec / 1000000;
 	liveview_apply_agc_request(p_stream0);
 
 	if (g_raw_copy_pending) {
@@ -3537,6 +3693,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 
 			current_frame = &nuc_video_frame;
 			current_frame_is_vcap = 0;
+			nuc_applied = 1;
 		}
 	}
 
@@ -3559,6 +3716,23 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		current_frame_is_vcap = 0;
 	}
 
+	/* Claim the request while still holding the correction lock, so a frame
+	 * processed before calibration completed cannot consume the new request.
+	 * If the writer is busy, keep it pending for a later corrected frame.
+	 */
+	if (g_nuc_snapshot_pending && nuc_applied &&
+	    !p_stream0->cap_snap && snapshot_writer_reserve_request() == 0) {
+		g_nuc_snapshot_pending = 0;
+		snapshot_requested = 1;
+		snapshot_final_is_input = current_frame_is_vcap;
+		printf("NUC automatic snapshot: corrected frame ready\n");
+	}
+	if (!g_manual_calibration_active && !raw_copy_handled &&
+	    !snapshot_requested && !p_stream0->cap_snap &&
+	    (timed_snapshot_job = timed_snapshot_reserve_request()) != 0) {
+		snapshot_requested = 1;
+		snapshot_final_is_input = current_frame_is_vcap;
+	}
 	pthread_mutex_unlock(&g_manual_calibration_lock);
 	correction_lock_held = 0;
 
@@ -3698,13 +3872,18 @@ after_corrections:
 				    snapshot_final_frame,
 				    snapshot_final_is_input,
 				    snapshot_agc_output_frame,
-				    snapshot_has_agc_output) != 0) {
+				    snapshot_has_agc_output,
+				    timed_snapshot_job, capture_unix_ms) != 0) {
 		printf("Snapshot frame queue failed\n");
 	}
 
-	if (!isp_step_test_requested)
-		raw_recording_queue(&vcap_video_frame, snapshot_final_frame,
-			snapshot_agc_output_frame);
+	if (!isp_step_test_requested && !raw_copy_handled) {
+		pthread_mutex_lock(&g_manual_calibration_lock);
+		if (!g_manual_calibration_active)
+			raw_recording_queue(&vcap_video_frame, snapshot_final_frame,
+				snapshot_agc_output_frame, capture_unix_ms);
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+	}
 
 	/* A processed frame no longer depends on the held VCAP buffer. */
 	if (!current_frame_is_vcap) {
@@ -3768,6 +3947,76 @@ release_vcap_frame:
 	}
 }
 
+/* Called by the VCAP owner only. Drop queued frames, then four fresh frames,
+ * so the final stage does not consume frames acquired before the ISP switch. */
+static int raw_recording_settle_bpr(VIDEO_LIVEVIEW *stream)
+{
+	HD_VIDEO_FRAME frame = {0};
+	HD_RESULT ret;
+	UINT32 i, tries;
+	for (i = 0; i < 64U; i++) {
+		if (stream->cap_exit) return -1;
+		ret = hd_videocap_pull_out_buf(stream->cap_path, &frame, 0);
+		if (ret == HD_ERR_UNDERRUN) break;
+		if (ret != HD_OK) return -1;
+		if (hd_videocap_release_out_buf(stream->cap_path, &frame) != HD_OK) return -1;
+	}
+	if (i == 64U) return -1;
+	for (i = 0; i < 4U; i++) {
+		for (tries = 0; tries < 20U; tries++) {
+			if (stream->cap_exit) return -1;
+			ret = hd_videocap_pull_out_buf(stream->cap_path, &frame, 100);
+			if (ret != HD_ERR_UNDERRUN) break;
+		}
+		if (ret != HD_OK) return -1;
+		if (hd_videocap_release_out_buf(stream->cap_path, &frame) != HD_OK) return -1;
+	}
+	return 0;
+}
+
+/* No lifecycle lock: Stop owns it while joining this worker. Lock order is
+ * correction -> writer, matching the normal RAW processing path. No CFG write. */
+static void raw_recording_service_bpr(VIDEO_LIVEVIEW *stream)
+{
+	int restoring = 0, desired = 0, work = 0, ret;
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (!g_raw_recording.job && !g_raw_recording.control_busy) {
+		if (g_raw_recording.restore_pending && !g_raw_recording.active) {
+			restoring = work = 1;
+			desired = g_raw_recording.initial_bpr;
+		} else if (g_raw_recording.active && g_raw_recording.transition_pending &&
+		           !g_manual_calibration_active) {
+			work = 1;
+		}
+	}
+	if (work) g_raw_recording.control_busy = 1;
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	if (!work) {
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+		return;
+	}
+	ret = bpr_set_enabled(desired);
+	if (ret >= 0 && (!restoring || !stream->cap_exit))
+		ret = raw_recording_settle_bpr(stream);
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (ret < 0) {
+		raw_recording_stop_locked(restoring ? "BPR restore failed" : "BPR switch/settle failed");
+		printf("RAW recording BPR %s failed; restoration remains pending\n",
+			restoring ? "restore" : "switch");
+	} else if (restoring) {
+		g_raw_recording.restore_pending = 0;
+		g_raw_recording.transition_pending = 0;
+		printf("RAW recording restored initial BPR=%s\n", desired ? "on" : "off");
+	} else {
+		g_raw_recording.transition_pending = 0;
+		printf("RAW recording: BPR off, stale frames discarded; starting final Original stage\n");
+	}
+	g_raw_recording.control_busy = 0;
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+}
+
 static void *raw_pipeline_thread(void *arg)
 {
 	VIDEO_LIVEVIEW* p_stream0 = (VIDEO_LIVEVIEW *)arg;
@@ -3776,6 +4025,7 @@ static void *raw_pipeline_thread(void *arg)
 	int shutter_calibration_enabled;
 	int shutter_calibration_result;
 	int shutter_calibration_paused;
+	int startup_ffc_pending;
 
 	//------ wait flow_start ------
 	while (p_stream0->cap_enter == 0 && p_stream0->cap_exit == 0) usleep(100);
@@ -3790,17 +4040,25 @@ static void *raw_pipeline_thread(void *arg)
 	printf("startup skip %u frame --\r\n", g_startup_skip_frames);
 
 	shutter_calibration_enabled =
-		ffc_is_enabled() || bpr_is_runtime_enabled();
+		ffc_is_enabled() && ffc_get_shutter_interval_sec() > 0;
 	g_shutter_next_calibration_ms = 0;
 	g_shutter_reschedule_after_manual_calibration = 0;
-	if (shutter_calibration_enabled) {
+	/* Startup calibration is independent of continuous FFC correction. */
+	startup_ffc_pending = ffc_is_startup_enabled();
+	if (startup_ffc_pending) {
+		printf("Startup FFC calibration requested\n");
+	} else if (shutter_calibration_enabled) {
 		liveview_schedule_next_shutter_calibration();
 	}
 
 	while (p_stream0->cap_exit == 0) {
+		raw_recording_service_bpr(p_stream0);
+		pthread_mutex_lock(&g_snapshot_writer.lock);
+		minute_raw_expire(&g_minute_raw, liveview_get_time_ms());
+		pthread_mutex_unlock(&g_snapshot_writer.lock);
 		shutter_calibration_paused =
 			liveview_prepare_shutter_interval(
-				shutter_calibration_enabled);
+				&shutter_calibration_enabled);
 
 		if (!shutter_calibration_paused &&
 		    liveview_take_ffc_test_request()) {
@@ -3809,7 +4067,7 @@ static void *raw_pipeline_thread(void *arg)
 					p_stream0,
 					&nuc_sensor_temp_next_update_ms,
 					&tdc_next_update_ms,
-					1);
+					1, 0);
 			liveview_finish_ffc_test(shutter_calibration_result);
 			if (shutter_calibration_enabled) {
 				liveview_schedule_next_shutter_calibration();
@@ -3822,23 +4080,26 @@ static void *raw_pipeline_thread(void *arg)
 			&nuc_sensor_temp_next_update_ms,
 			&tdc_next_update_ms);
 
-		if (shutter_calibration_enabled &&
-		    !shutter_calibration_paused &&
-		    liveview_get_time_ms() >=
-			g_shutter_next_calibration_ms) {
+		if (!shutter_calibration_paused &&
+		    (startup_ffc_pending ||
+		     (shutter_calibration_enabled &&
+		      liveview_get_time_ms() >= g_shutter_next_calibration_ms))) {
 			shutter_calibration_result =
 				liveview_run_shutter_calibration_cycle(
 					p_stream0,
 					&nuc_sensor_temp_next_update_ms,
 					&tdc_next_update_ms,
-					0);
+					0, startup_ffc_pending);
 			if (shutter_calibration_result < 0) {
 				g_shutter_next_calibration_ms = 0;
 				break;
 			}
 
 			if (shutter_calibration_result == 0) {
-				liveview_schedule_next_shutter_calibration();
+				startup_ffc_pending = 0;
+				if (shutter_calibration_enabled) {
+					liveview_schedule_next_shutter_calibration();
+				}
 			}
 			usleep(100);
 			continue;
@@ -3850,7 +4111,9 @@ static void *raw_pipeline_thread(void *arg)
 
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	raw_recording_stop_locked("RAW pipeline stopped");
+	minute_raw_stop(&g_minute_raw, "RAW pipeline stopped");
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	raw_recording_service_bpr(p_stream0);
 	liveview_set_ffc_test_worker_active(0);
 	return 0;
 }
@@ -4235,6 +4498,8 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	raw_recording_stop_locked("Liveview stopped");
+	timed_snapshot_stop(&g_timed_snapshot, "Liveview stopped");
+	minute_raw_stop(&g_minute_raw, "Liveview stopped");
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 	g_diagnostic_video_output = NULL;
 	/* Wake threads that may still be waiting for the pipeline to start. */
@@ -4247,6 +4512,13 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		ctx->cap_thread_created = 0;
 		stream[0].cap_thread_id = 0;
 	}
+	/* Drain the last count-recording job before any cleanup can return early.
+	 * BPR restoration needs the ISP to remain initialized. */
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	while (g_raw_recording.job)
+		pthread_cond_wait(&g_snapshot_writer.cond, &g_snapshot_writer.lock);
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	raw_recording_service_bpr(&stream[0]);
 	liveview_finish_ffc_test(-1);
 	if (ctx->proc_thread_created) {
 		pthread_join(stream[0].proc_thread_id, NULL);
@@ -4278,6 +4550,8 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		snapshot_writer_stop();
 		ctx->snapshot_writer_started = 0;
 	}
+	/* A final queued RAW save may have kept BPR restoration pending until now. */
+	raw_recording_service_bpr(&stream[0]);
 
 
 	ret = video_output_stop(&stream[0].video_output);
@@ -4325,6 +4599,7 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	g_shutter_next_calibration_ms = 0;
 	g_manual_calibration_active = 0;
+	g_nuc_snapshot_pending = 0;
 	g_shutter_reschedule_after_manual_calibration = 0;
 	pthread_mutex_unlock(&g_manual_calibration_lock);
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
@@ -4471,7 +4746,16 @@ static int liveview_set_correction_enabled(int is_bpr, int enabled)
 	if (g_liveview.running) {
 		pthread_mutex_lock(&g_manual_calibration_lock);
 		if (is_bpr) {
-			ret = bpr_set_enabled(enabled);
+			int recording_owns_bpr;
+			pthread_mutex_lock(&g_snapshot_writer.lock);
+			recording_owns_bpr = g_raw_recording.restore_pending;
+			pthread_mutex_unlock(&g_snapshot_writer.lock);
+			if (recording_owns_bpr) {
+				printf("Stop sequence RAW recording before changing BPR\n");
+				ret = -1;
+			} else {
+				ret = bpr_set_enabled(enabled);
+			}
 		} else {
 			nuc_set_enabled(enabled);
 			ret = nuc_is_enabled() == !!enabled ? 0 : -1;
@@ -4492,6 +4776,81 @@ int liveview_set_nuc_enabled(int enabled)
 	return liveview_set_correction_enabled(0, enabled);
 }
 
+int liveview_set_ffc_enabled(int enabled)
+{
+	int ret = 1;
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	if (g_liveview.running) {
+		pthread_mutex_lock(&g_shutter_calibration_lock);
+		pthread_mutex_lock(&g_manual_calibration_lock);
+		pthread_mutex_lock(&g_ffc_test_lock);
+		if (!enabled) {
+			if (g_ffc_enable_after_test)
+				g_ffc_enable_after_test = -1; /* Keep ownership, cancel auto-apply. */
+			ffc_set_enabled(0);
+			g_shutter_reschedule_after_manual_calibration = 1;
+			ret = 0;
+		} else if (g_ffc_enable_after_test) {
+			g_ffc_enable_after_test = 1;
+			ret = 2;
+		} else if (ffc_table_is_ready()) {
+			ffc_set_enabled(enabled);
+			g_shutter_reschedule_after_manual_calibration = 1;
+			ret = 0;
+		} else if (g_ffc_test_worker_active) {
+			ffc_set_enabled(0);
+			g_ffc_enable_after_test = 1;
+			if (!g_ffc_test_pending && !g_ffc_test_running) {
+				g_ffc_test_result = -1;
+				g_ffc_test_pending = 1;
+			}
+			printf("FFC enable requested; calibrating before applying compensation\n");
+			ret = 2;
+		} else {
+			printf("FFC enable unavailable: calibration worker is not active\n");
+			ret = -1;
+		}
+		pthread_mutex_unlock(&g_ffc_test_lock);
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+		pthread_mutex_unlock(&g_shutter_calibration_lock);
+	}
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+	return ret;
+}
+
+int liveview_apply_shutter_close_wait_ms(unsigned int wait_ms)
+{
+	int ret = 1;
+	if (wait_ms == 0 || wait_ms > INT_MAX) return -1;
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	if (g_liveview.running) {
+		pthread_mutex_lock(&g_shutter_calibration_lock);
+		liveview_set_shutter_close_wait_ms(wait_ms);
+		pthread_mutex_unlock(&g_shutter_calibration_lock);
+		ret = 0;
+	}
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+	return ret;
+}
+
+int liveview_set_shutter_interval_sec(unsigned int interval_sec)
+{
+	int ret = 1;
+	if (interval_sec > INT_MAX) return -1;
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	if (g_liveview.running) {
+		pthread_mutex_lock(&g_shutter_calibration_lock);
+		ffc_set_shutter_interval_sec(interval_sec);
+		g_shutter_reschedule_after_manual_calibration = 1;
+		if (interval_sec == 0)
+			g_shutter_next_calibration_ms = 0;
+		pthread_mutex_unlock(&g_shutter_calibration_lock);
+		ret = 0;
+	}
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+	return ret;
+}
+
 int liveview_get_result(void)
 {
 	return g_liveview.result;
@@ -4505,6 +4864,57 @@ int liveview_get_shutter_fault(void)
 	fault = g_liveview_shutter_fault;
 	pthread_mutex_unlock(&g_liveview_fault_lock);
 	return fault;
+}
+
+int liveview_request_nuc_snapshot(void)
+{
+	int ret = -1;
+
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	if (g_liveview.running && !g_manual_calibration_active &&
+	    nuc_is_enabled()) {
+		g_nuc_snapshot_pending = 1;
+		printf("NUC automatic snapshot requested; waiting for a corrected frame\n");
+		ret = 0;
+	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	return ret;
+}
+
+int liveview_start_timed_snapshot(void)
+{
+	int ret = -1;
+
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (!g_liveview.running || !g_snapshot_writer.thread_created ||
+	    g_snapshot_writer.exit_requested || liveview_stop_is_requested()) {
+		printf("Start Liveview before running Timed Snapshot\n");
+	} else if (g_minute_raw.active || g_minute_raw.in_flight) {
+		printf("Stop Minute RAW before running Timed Snapshot\n");
+	} else if (g_raw_recording.active || g_raw_recording.job || g_raw_recording.restore_pending) {
+		printf("Stop RAW recording before running Timed Snapshot\n");
+	} else {
+		ret = timed_snapshot_start(&g_timed_snapshot, RAW_SNAPSHOT_DIR,
+			liveview_get_time_ms());
+	}
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+	return ret;
+}
+
+void liveview_stop_timed_snapshot(void)
+{
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	timed_snapshot_stop(&g_timed_snapshot, "user requested stop");
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+}
+
+void liveview_show_timed_snapshot_status(void)
+{
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	timed_snapshot_print_status(&g_timed_snapshot, liveview_get_time_ms());
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
 }
 
 static int liveview_request_snapshot(void)
@@ -4740,7 +5150,7 @@ static int raw_recording_is_busy(void)
 	int busy;
 	pthread_mutex_lock(&g_snapshot_writer.lock);
 	raw_recording_check_limit_locked();
-	busy = g_raw_recording.active || g_raw_recording.job;
+	busy = g_raw_recording.active || g_raw_recording.job || g_raw_recording.restore_pending;
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 	return busy;
 }
@@ -4753,7 +5163,12 @@ static void raw_recording_print_status(void)
 	elapsed = g_raw_recording.started_ms ? liveview_get_time_ms() - g_raw_recording.started_ms : 0;
 	printf("RAW Recording: %s, saved=%llu/%llu, skipped=%llu",
 		g_raw_recording.active ? "Recording" : (g_raw_recording.job ? "Stopping" : "Stopped"),
-		g_raw_recording.saved, g_raw_recording.target_frames, g_raw_recording.skipped);
+		g_raw_recording.saved, g_raw_recording.target_frames *
+			(g_raw_recording.type == 3 ? 3ULL : 1ULL), g_raw_recording.skipped);
+	if (g_raw_recording.type == 3)
+		printf(", stage=%d/3, stage_saved=%llu/%llu%s", g_raw_recording.phase + 1,
+			g_raw_recording.phase_saved, g_raw_recording.target_frames,
+			g_raw_recording.restore_pending && !g_raw_recording.active ? ", restoring BPR" : "");
 	if (g_raw_recording.active) printf(", elapsed=%llu s", (unsigned long long)(elapsed / 1000));
 	printf("\n");
 	if (!g_raw_recording.active && g_raw_recording.reason)
@@ -4776,8 +5191,16 @@ static void raw_recording_toggle(int type, int frame_count)
 		raw_recording_stop_locked("user requested stop");
 		goto done;
 	}
-	if (g_raw_recording.job) {
-		printf("RAW recording is finishing the last file; please wait\n");
+	if (g_raw_recording.job || g_raw_recording.restore_pending) {
+		printf("RAW recording is finishing the last file / restoring BPR; please wait\n");
+		goto done;
+	}
+	if (g_minute_raw.active || g_minute_raw.in_flight) {
+		printf("Stop Minute RAW before starting RAW recording\n");
+		goto done;
+	}
+	if (g_timed_snapshot.active || g_timed_snapshot.in_flight) {
+		printf("Stop Timed Snapshot before starting RAW recording\n");
 		goto done;
 	}
 	if (!g_liveview.running || !g_snapshot_writer.thread_created ||
@@ -4785,7 +5208,7 @@ static void raw_recording_toggle(int type, int frame_count)
 		printf("Start Liveview before recording\n");
 		goto done;
 	}
-	if (type < 0 || type > 2 || frame_count <= 0) goto done;
+	if (type < 0 || type > 3 || frame_count <= 0) goto done;
 	if (type == 2 && !agc_histogram_p1_p99_is_enabled() && !agc_fieldscale_is_enabled()) {
 		printf("AGC output RAW requires Histogram P1/P99 or Fieldscale AGC\n");
 		goto done;
@@ -4806,14 +5229,25 @@ static void raw_recording_toggle(int type, int frame_count)
 		goto done;
 	}
 	snprintf(g_raw_recording.directory, sizeof(g_raw_recording.directory), "%s", directory);
+	if (raw_recording_log_create(directory) != 0) {
+		printf("Cannot create recording summary.csv\n");
+		goto done;
+	}
 	g_raw_recording.type = type;
+	g_raw_recording.phase = 0;
+	g_raw_recording.phase_saved = 0;
+	g_raw_recording.transition_pending = 0;
+	g_raw_recording.control_busy = 0;
+	g_raw_recording.initial_bpr = bpr_is_enabled();
+	g_raw_recording.restore_pending = type == 3;
 	g_raw_recording.started_ms = liveview_get_time_ms();
 	g_raw_recording.target_frames = (unsigned long long)frame_count;
 	g_raw_recording.saved = g_raw_recording.skipped = g_raw_recording.sequence = 0;
 	g_raw_recording.reason = NULL;
 	g_raw_recording.active = 1;
 	pthread_cond_signal(&g_snapshot_writer.cond);
-	printf("RAW recording started: target=%d images, output=%s\n", frame_count, directory);
+	printf("RAW recording started: %d images per stage, %d stage(s), output=%s\n",
+		frame_count, type == 3 ? 3 : 1, directory);
 #else
 	printf("RAW recording requires Linux SD storage\n");
 #endif
@@ -4832,10 +5266,11 @@ static int liveview_raw_type_menu_run(int selected_raw_type)
 		printf(" 1. Original RAW\n");
 		printf(" 2. Corrected RAW\n");
 		printf(" 3. AGC output RAW\n");
+		printf(" 4. Original -> Corrected -> Original (BPR off)\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		option = liveview_read_option();
-		if (option >= 1 && option <= 3) {
+		if (option >= 1 && option <= 4) {
 			return option - 1;
 		}
 		if (option == 0 || option == -1) {
@@ -4847,27 +5282,104 @@ static int liveview_raw_type_menu_run(int selected_raw_type)
 	}
 }
 
-static int liveview_raw_recording_menu_run(void)
+static void liveview_minute_raw_toggle(unsigned int minutes)
+{
+	pthread_mutex_lock(&g_liveview_lifecycle_lock);
+	pthread_mutex_lock(&g_snapshot_writer.lock);
+	if (g_minute_raw.active) {
+		minute_raw_stop(&g_minute_raw, "user requested stop");
+	} else if (g_minute_raw.in_flight) {
+		printf("Minute RAW is finishing the current pair; please wait\n");
+	} else if (!g_liveview.running || !g_snapshot_writer.thread_created ||
+	           g_snapshot_writer.exit_requested || liveview_stop_is_requested()) {
+		printf("Start Liveview before running Minute RAW\n");
+	} else if (g_raw_recording.active || g_raw_recording.job || g_raw_recording.restore_pending ||
+	           g_timed_snapshot.active || g_timed_snapshot.in_flight) {
+		printf("Stop Recording RAW / Timed Snapshot before running Minute RAW\n");
+	} else if (!raw_recording_has_space(RAW_SNAPSHOT_DIR)) {
+		printf("Cannot record: SD unavailable or less than 256 MiB reserve free\n");
+	} else if (minute_raw_start(&g_minute_raw, RAW_SNAPSHOT_DIR,
+	                           liveview_get_time_ms(), minutes) != 0) {
+		printf("Cannot start Minute RAW; check SD storage\n");
+	}
+	pthread_mutex_unlock(&g_snapshot_writer.lock);
+	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+}
+
+static int liveview_minute_raw_menu_run(void)
+{
+	static unsigned int minutes = 32;
+	int option, busy;
+	for (;;) {
+		printf("----------------------------------------\n");
+		printf("Minute Interval Recording: Original + Corrected (10 pairs/minute)\n");
+		printf(" 1. Set total minutes (1..1440)\n");
+		printf(" 2. Start / Stop\n");
+		printf(" 3. Show status\n");
+		printf(" 0. Back\n");
+		printf("Total: %u min; first 10 pairs immediately, next batch every 60 s.\n", minutes);
+		printf("Stops at duration; a queued pair finishes saving. Late/missed captures are not backfilled.\n");
+		printf("Corrected RAW is before AGC. Temperature/time are recorded for each pair.\n");
+		pthread_mutex_lock(&g_snapshot_writer.lock);
+		minute_raw_expire(&g_minute_raw, liveview_get_time_ms());
+		minute_raw_status(&g_minute_raw, liveview_get_time_ms());
+		pthread_mutex_unlock(&g_snapshot_writer.lock);
+		option = liveview_read_option();
+		switch (option) {
+		case 1:
+			pthread_mutex_lock(&g_snapshot_writer.lock);
+			busy = g_minute_raw.active || g_minute_raw.in_flight;
+			pthread_mutex_unlock(&g_snapshot_writer.lock);
+			if (busy) {
+				printf("Stop Minute RAW before changing duration\n");
+				break;
+			}
+			printf("Enter total minutes (1..1440, q to cancel)\n");
+			option = liveview_read_option();
+			if (option >= 1 && option <= 1440) minutes = (unsigned int)option;
+			else printf("Duration unchanged\n");
+			break;
+		case 2:
+			liveview_minute_raw_toggle(minutes);
+			break;
+		case 3:
+		case MENU_OPTION_REFRESH:
+			break;
+		case 0:
+		case -1:
+			return 0;
+		default:
+			printf("Invalid option\n");
+			break;
+		}
+	}
+}
+
+static int liveview_image_count_recording_menu_run(void)
 {
 	static int selected_raw_type = 0;
 	static int recording_frame_count = 30;
 	static const char * const raw_type_names[] = {
-		"Original RAW", "Corrected RAW", "AGC output RAW"
+		"Original RAW", "Corrected RAW", "AGC output RAW",
+		"Original -> Corrected -> Original (BPR off)"
 	};
 	int option;
 
 	for (;;) {
 		printf("----------------------------------------\n");
-		printf("Recording RAW\n");
+		printf("Image Count Recording\n");
 		printf(" 1. Select RAW type\n");
 		printf(" 2. Set recording image count\n");
 		printf(" 3. Start / Stop recording\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("Selected: %s\n", raw_type_names[selected_raw_type]);
-		printf("Target: %d images\n", recording_frame_count);
+		printf("Target: %d images per stage (%d stages)\n", recording_frame_count,
+			selected_raw_type == 3 ? 3 : 1);
 		raw_recording_print_status();
-		printf("Save selected RAW only; frames may be skipped. Stops after the requested number of images are saved.\n");
+		printf("Each image records sensor temperature and capture time in summary.csv.\n");
+		printf("Sequence mode: save N Original, N Corrected, then N Original with BPR off.\n");
+		printf("BPR is restored to its initial state after sequence recording stops.\n");
 		printf("AGC output RAW is available only in supported AGC modes.\n");
 
 		option = liveview_read_option();
@@ -4894,6 +5406,39 @@ static int liveview_raw_recording_menu_run(void)
 			break;
 		case 3:
 			raw_recording_toggle(selected_raw_type, recording_frame_count);
+			break;
+		case 0:
+		case -1:
+			return 0;
+		case MENU_OPTION_REFRESH:
+			break;
+		default:
+			printf("Invalid option\n");
+			break;
+		}
+	}
+}
+
+static int liveview_raw_recording_menu_run(void)
+{
+	int option;
+	for (;;) {
+		printf("----------------------------------------\n");
+		printf("Recording RAW\n");
+		printf(" 1. Image Count Recording\n");
+		printf(" 2. Minute Interval Recording\n");
+		printf(" 0. Back\n");
+		printf("----------------------------------------\n");
+		printf("Image Count: select a RAW type or 3-stage sequence and set images per stage.\n");
+		printf("Minute Interval: save 10 Original + Corrected pairs/minute with time and temperature.\n");
+		printf("Select a mode to configure duration/count and start or stop recording.\n");
+		option = liveview_read_option();
+		switch (option) {
+		case 1:
+			liveview_image_count_recording_menu_run();
+			break;
+		case 2:
+			liveview_minute_raw_menu_run();
 			break;
 		case 0:
 		case -1:

@@ -112,8 +112,6 @@ static IQT_DPC_PARAM dpc_param;
 static IQT_SHADING_PARAM shading_par;
 static unsigned int g_bpr_threshold = 15;
 static int g_bpr_enabled = 1;
-static unsigned int g_runtime_bpr_threshold = 15;
-static int g_runtime_bpr_enabled;
 static BPR_CALIBRATION_STATE_CB g_bpr_calibration_state;
 
 void bpr_bind_calibration_state_callback(
@@ -296,29 +294,9 @@ exit:
 	return ret;
 }
 
-void bpr_set_runtime_enabled(int enable)
-{
-	g_runtime_bpr_enabled = enable ? 1 : 0;
-	printf("Runtime BPR %s\n",
-	       g_runtime_bpr_enabled ? "on" : "off");
-}
 
-int bpr_is_runtime_enabled(void)
-{
-	return g_runtime_bpr_enabled;
-}
 
-void bpr_set_runtime_threshold(unsigned int threshold)
-{
-	g_runtime_bpr_threshold = threshold;
-	printf("Runtime BPR threshold=%u RAW8 DN\n",
-	       g_runtime_bpr_threshold);
-}
 
-unsigned int bpr_get_runtime_threshold(void)
-{
-	return g_runtime_bpr_threshold;
-}
 
 static int dpc_make_output_dir(void)
 {
@@ -655,61 +633,6 @@ static int dpc_run_raw(const char *step_name, unsigned int sensor_id,
 	return 0;
 }
 
-int bpr_run_runtime_calibration(void)
-{
-	ISPT_RAW_INFO raw_info = {0};
-	ISPT_SENSOR_MODE_INFO sensor_mode_info;
-	CAL_ALG_DP_RST dp_rst;
-	char *raw_buf = NULL;
-	char *tmp_buf = NULL;
-	UINT32 *dp_buf = NULL;
-	unsigned int raw_size;
-	int ret = -1;
-
-	if (!g_runtime_bpr_enabled) {
-		return 0;
-	}
-
-	raw_info.id = g_thermal_pipeline_id;
-	if (dpc_get_sensor_info(g_thermal_pipeline_id, &sensor_mode_info) != 0) {
-		printf("Runtime BPR get sensor info fail\n");
-		return -1;
-	}
-	raw_size = sensor_mode_info.info.crp_size.w *
-		sensor_mode_info.info.crp_size.h;
-	print_sensor_crop_setting(&sensor_mode_info);
-	printf("Runtime BPR start: threshold=%u RAW8 DN, raw_size=%u\r\n",
-	       g_runtime_bpr_threshold, raw_size);
-
-	if (dpc_alloc_buf(raw_size, BPR_MAX_DP_COUNT,
-			  &raw_buf, &tmp_buf, &dp_buf) != 0) {
-		goto exit;
-	}
-
-	memset(&dp_rst, 0, sizeof(dp_rst));
-	if (dpc_run_raw("Runtime BPR Shutter Close Pixel",
-			g_thermal_pipeline_id, &raw_info, &sensor_mode_info,
-			raw_buf, tmp_buf, dp_buf, raw_size,
-			g_runtime_bpr_threshold, 0, BPR_MAX_DP_COUNT,
-			DP_PARAM_CHGFMT_AUTO, &dp_rst) != 0) {
-		goto exit;
-	}
-
-	if (dpc_save_bin(dp_buf) != 0) {
-		goto exit;
-	}
-
-	if (bpr_load_table() != 0) {
-		goto exit;
-	}
-
-	printf("Runtime BPR calibration done\n");
-	ret = 0;
-
-exit:
-	dpc_free_buf(&raw_buf, &tmp_buf, &dp_buf);
-	return ret;
-}
 
 static int dpc_run_bright_dark(unsigned int sensor_id, unsigned int dpc_th, UINT32 max_cnt)
 {
@@ -1161,12 +1084,8 @@ int bpr_menu_run(void)
 		printf(" 3. BPR debug on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: BPR=%s, threshold=%u RAW8 DN, "
-		       "Runtime BPR=%s, threshold=%u RAW8 DN\r\n",
-		       bpr_is_enabled() ? "on" : "off",
-		       bpr_get_threshold(),
-		       bpr_is_runtime_enabled() ? "on" : "off",
-		       bpr_get_runtime_threshold());
+		printf("runtime: BPR=%s, threshold=%u RAW8 DN\r\n",
+		       bpr_is_enabled() ? "on" : "off", bpr_get_threshold());
 		printf("Settings: CFG Setting -> BPR setting\r\n");
 
 		do {

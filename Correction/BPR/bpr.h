@@ -11,10 +11,5 @@ unsigned int bpr_get_threshold(void);
 int bpr_set_enabled(int enable);
 int bpr_is_enabled(void);
 int bpr_load_table(void);
-void bpr_set_runtime_enabled(int enable);
-int bpr_is_runtime_enabled(void);
-void bpr_set_runtime_threshold(unsigned int threshold);
-unsigned int bpr_get_runtime_threshold(void);
-int bpr_run_runtime_calibration(void);
 
 #endif

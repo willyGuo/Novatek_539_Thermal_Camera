@@ -70,6 +70,9 @@ SRC += \
 	ISP/menu.c \
 	ISP/videoproc/videoproc_isp.c \
 	Diagnostics/diagnostics_menu.c \
+	Diagnostics/raw_recording_log.c \
+	Diagnostics/minute_raw_recording.c \
+	Diagnostics/timed_snapshot.c \
 	Diagnostics/ISP/isp_ob_runtime_diagnostic.c \
 	Diagnostics/ISP/isp_raw_to_y_step_diagnostic.c \
 	Driver/GPIO/gpio_control.c \

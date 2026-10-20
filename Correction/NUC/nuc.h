@@ -3,8 +3,7 @@
 
 #include "hdal.h"
 
-#define NUC_GAIN_SHIFT 8
-#define NUC_GAIN_ONE (1U << NUC_GAIN_SHIFT)
+#include "nuc_gain_format.h"
 
 typedef int (*NUC_CAPTURE_RAW_CB)(UINTPTR dst_va, UINT32 size);
 typedef void (*NUC_CALIBRATION_STATE_CB)(const char *name, int active);

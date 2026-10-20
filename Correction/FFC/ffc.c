@@ -8,7 +8,6 @@
 #include "vendor_gfx.h"
 
 #define SHUTTER_DEFAULT_INTERVAL_SEC 60U
-#define FFC_GAIN_SHIFT 8U
 #define MENU_OPTION_REFRESH (-2)
 
 typedef struct {
@@ -17,12 +16,14 @@ typedef struct {
 	UINT32 shutter_interval_sec;
 	FFC_TEST_CB run_test;
 	int enabled;
+	int startup_enabled;
 	int table_ready;
 } FFC_CONTEXT;
 
 static FFC_CONTEXT g_ffc = {
 	.shutter_interval_sec = SHUTTER_DEFAULT_INTERVAL_SEC,
 	.enabled = 1,
+	.startup_enabled = 1,
 };
 
 static int ffc_read_option(void)
@@ -177,13 +178,22 @@ int ffc_is_enabled(void)
 	return g_ffc.enabled;
 }
 
+void ffc_set_startup_enabled(int enable)
+{
+	g_ffc.startup_enabled = enable ? 1 : 0;
+}
+
+int ffc_is_startup_enabled(void)
+{
+	return g_ffc.startup_enabled;
+}
+
 void ffc_set_shutter_interval_sec(UINT32 interval_sec)
 {
-	if (interval_sec == 0) {
-		printf("Shutter interval must be greater than 0 sec\n");
+	if (interval_sec > INT_MAX) {
+		printf("Shutter interval exceeds INT_MAX sec\n");
 		return;
 	}
-
 	g_ffc.shutter_interval_sec = interval_sec;
 	printf("Shutter interval=%u sec\n",
 	       g_ffc.shutter_interval_sec);
@@ -279,6 +289,7 @@ int ffc_compare_gfx_samples(UINTPTR input_va,
 HD_RESULT ffc_accumulate_frame(UINTPTR raw_pa,
 			       UINTPTR sum_pa,
 			       UINTPTR out_pa,
+				   UINTPTR zero_pa,
 			       UINT32 raw_width,
 			       UINT32 raw_height,
 			       UINT32 shift)
@@ -290,7 +301,7 @@ HD_RESULT ffc_accumulate_frame(UINTPTR raw_pa,
 	param.format = VENDOR_GFX_GRPH_FORMAT_16BITS;
 	param.property[0].en = 1;
 	param.property[0].id = VENDOR_GFX_GRPH_PROPERTY_ID_NORMAL;
-	param.property[0].data.property = VENDOR_GFX_GRPH_PLUS_PROPTY(shift);
+	param.property[0].data.property = VENDOR_GFX_GRPH_PLUS_PROPTY(0);
 
 	param.images[0].img_id = VENDOR_GFX_GRPH_IMG_ID_A;
 	param.images[0].dram_addr = raw_pa;
@@ -309,6 +320,35 @@ HD_RESULT ffc_accumulate_frame(UINTPTR raw_pa,
 	ret = vendor_gfx_grph_trigger(1, &param);
 	if (ret != HD_OK) {
 		printf("FFC accumulate frame fail=%d\n", ret);
+		return ret;
+	}
+
+	// Tim FFC
+	if (shift == 2){
+		param.command = VENDOR_GFX_GRPH_CMD_PLUS_SHF;
+		param.format = VENDOR_GFX_GRPH_FORMAT_16BITS;
+		param.property[0].en = 1;
+		param.property[0].id = VENDOR_GFX_GRPH_PROPERTY_ID_NORMAL;
+		param.property[0].data.property = VENDOR_GFX_GRPH_PLUS_PROPTY(shift);
+
+		param.images[0].img_id = VENDOR_GFX_GRPH_IMG_ID_A;
+		param.images[0].dram_addr = out_pa;
+		param.images[0].lineoffset = raw_width * 2;
+		param.images[0].width = raw_width * 2;
+		param.images[0].height = raw_height;
+
+		param.images[1].img_id = VENDOR_GFX_GRPH_IMG_ID_B;
+		param.images[1].dram_addr = zero_pa;
+		param.images[1].lineoffset = raw_width * 2;
+
+		param.images[2].img_id = VENDOR_GFX_GRPH_IMG_ID_C;
+		param.images[2].dram_addr = sum_pa;
+		param.images[2].lineoffset = raw_width * 2;
+
+		ret = vendor_gfx_grph_trigger(1, &param);
+		if (ret != HD_OK) {
+			printf("FFC divide 4 frame fail=%d\n", ret);
+		}
 	}
 
 	return ret;

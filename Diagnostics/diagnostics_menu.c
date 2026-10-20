@@ -57,9 +57,13 @@ int diagnostics_menu_run(void)
 		printf(" 4. Show ISP OB runtime parameters\n");
 		printf(" 5. Run Full RAW14 Step Test with ISP OB forced to zero\n");
 		printf(" 6. Show last Step Test result in this run\n");
-		printf(" 7. Back\n");
+		printf(" 7. Run Timed Snapshot (every 1 minute, 32 snapshots)\n");
+		printf(" 8. Show Timed Snapshot status\n");
+		printf(" 9. Stop Timed Snapshot\n");
+		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("Liveview must be running; one test-pattern frame is sent\n");
+		printf("Liveview must be running for Step Tests and Timed Snapshot.\n");
+		printf("Step Tests send one test-pattern frame; Timed Snapshot saves live RAW.\n");
 
 		option = diagnostics_menu_read_option();
 		switch (option) {
@@ -89,6 +93,19 @@ int diagnostics_menu_run(void)
 			break;
 
 		case 7:
+			ret = liveview_start_timed_snapshot();
+			break;
+
+		case 8:
+			liveview_show_timed_snapshot_status();
+			break;
+
+		case 9:
+			liveview_stop_timed_snapshot();
+			liveview_show_timed_snapshot_status();
+			break;
+
+		case 0:
 		case -1:
 			running = 0;
 			break;

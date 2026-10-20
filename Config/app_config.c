@@ -49,9 +49,8 @@ typedef struct {
 	float nuc_sensor_temp_points[APP_CONFIG_SENSOR_TEMP_POINT_COUNT];
 	int bpr_correction;
 	unsigned int bpr_threshold;
-	int runtime_bpr_enable;
-	unsigned int runtime_bpr_threshold;
 	int ffc_correction;
+	int ffc_startup_enable;
 	unsigned int shutter_interval_sec;
 	unsigned int shutter_close_wait_ms;
 	int tdc_correction;
@@ -195,10 +194,8 @@ static void cfg_initialize_from_runtime(void)
 	}
 	g_app_config.bpr_correction = bpr_is_enabled();
 	g_app_config.bpr_threshold = bpr_get_threshold();
-	g_app_config.runtime_bpr_enable = bpr_is_runtime_enabled();
-	g_app_config.runtime_bpr_threshold =
-		bpr_get_runtime_threshold();
 	g_app_config.ffc_correction = ffc_is_enabled();
+	g_app_config.ffc_startup_enable = ffc_is_startup_enabled();
 	g_app_config.shutter_interval_sec =
 		ffc_get_shutter_interval_sec();
 	g_app_config.shutter_close_wait_ms =
@@ -364,22 +361,19 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 	} else if (strcmp(key, "bpr_threshold") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0 || int_value < 0) return -1;
 		config->bpr_threshold = (unsigned int)int_value;
-	} else if (strcmp(key, "runtime_bpr_enable") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0) return -1;
-		config->runtime_bpr_enable = int_value ? 1 : 0;
-	} else if (strcmp(key, "runtime_bpr_threshold") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0 ||
-		    int_value < 0 || int_value > 100) return -1;
-		config->runtime_bpr_threshold = (unsigned int)int_value;
 	} else if (strcmp(key, "ffc_correction") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->ffc_correction = int_value ? 1 : 0;
+	} else if (strcmp(key, "ffc_startup_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0 ||
+		    (int_value != 0 && int_value != 1)) return -1;
+		config->ffc_startup_enable = (int)int_value;
 	} else if (strcmp(key, "shutter_interval_sec") == 0 ||
 		   strcmp(key, "ffc_interval_sec") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0 || int_value <= 0) return -1;
+		if (cfg_parse_long(value, &int_value) != 0 || int_value < 0 || int_value > INT_MAX) return -1;
 		config->shutter_interval_sec = (unsigned int)int_value;
 	} else if (strcmp(key, "shutter_close_wait_ms") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0 || int_value <= 0) return -1;
+		if (cfg_parse_long(value, &int_value) != 0 || int_value <= 0 || int_value > INT_MAX) return -1;
 		config->shutter_close_wait_ms = (unsigned int)int_value;
 	} else if (strcmp(key, "tdc_correction") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
@@ -487,12 +481,11 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	if (bpr_set_enabled(config->bpr_correction) < 0) {
 		apply_result = -1;
 	}
-	bpr_set_runtime_threshold(config->runtime_bpr_threshold);
-	bpr_set_runtime_enabled(config->runtime_bpr_enable);
 
 	ffc_set_shutter_interval_sec(config->shutter_interval_sec);
 	liveview_set_shutter_close_wait_ms(config->shutter_close_wait_ms);
 	ffc_set_enabled(config->ffc_correction);
+	ffc_set_startup_enabled(config->ffc_startup_enable);
 	tdc_set_interval_sec(config->tdc_interval_sec);
 	tdc_set_enabled(config->tdc_correction);
 	if (config->agc_histogram_p1_p99_enable +
@@ -640,12 +633,10 @@ int app_config_get_int(const char *key, int *value)
 		*value = g_app_config.bpr_correction;
 	} else if (strcmp(key, "bpr_threshold") == 0) {
 		*value = (int)g_app_config.bpr_threshold;
-	} else if (strcmp(key, "runtime_bpr_enable") == 0) {
-		*value = g_app_config.runtime_bpr_enable;
-	} else if (strcmp(key, "runtime_bpr_threshold") == 0) {
-		*value = (int)g_app_config.runtime_bpr_threshold;
 	} else if (strcmp(key, "ffc_correction") == 0) {
 		*value = g_app_config.ffc_correction;
+	} else if (strcmp(key, "ffc_startup_enable") == 0) {
+		*value = g_app_config.ffc_startup_enable;
 	} else if (strcmp(key, "shutter_interval_sec") == 0) {
 		*value = (int)g_app_config.shutter_interval_sec;
 	} else if (strcmp(key, "shutter_close_wait_ms") == 0) {
@@ -718,7 +709,26 @@ int app_config_update_int(const char *key, int value)
 		return -1;
 	}
 
-    if (strcmp(key, "bpr_correction") == 0 || strcmp(key, "nuc_correction") == 0) {
+    if (strcmp(key, "ffc_correction") == 0) {
+        ret = liveview_set_ffc_enabled(g_app_config.ffc_correction);
+        if (ret < 0) {
+            printf("FFC CFG saved, but runtime apply failed\n");
+            return ret;
+        }
+        if (ret == 1) app_config_print_restart_required();
+        else if (ret == 2) printf("FFC CFG saved; waiting for calibration to enable compensation\n");
+        else printf("FFC compensation saved and applied immediately\n");
+    } else if (strcmp(key, "shutter_close_wait_ms") == 0) {
+        ret = liveview_apply_shutter_close_wait_ms(g_app_config.shutter_close_wait_ms);
+        if (ret < 0) return ret;
+        if (ret == 1) app_config_print_restart_required();
+        else printf("Shutter close wait saved; next FFC uses the new value\n");
+    } else if (strcmp(key, "shutter_interval_sec") == 0 || strcmp(key, "ffc_interval_sec") == 0) {
+        ret = liveview_set_shutter_interval_sec(g_app_config.shutter_interval_sec);
+        if (ret < 0) return ret;
+        if (ret == 1) app_config_print_restart_required();
+        else printf("FFC interval saved and applied immediately (0 disables periodic calibration)\n");
+    } else if (strcmp(key, "bpr_correction") == 0 || strcmp(key, "nuc_correction") == 0) {
         int is_bpr = strcmp(key, "bpr_correction") == 0;
         const char *name = is_bpr ? "BPR" : "NUC";
         ret = is_bpr ? liveview_set_bpr_enabled(g_app_config.bpr_correction) :
@@ -733,6 +743,9 @@ int app_config_update_int(const char *key, int value)
         } else {
             printf("%s on/off saved and applied (no restart)\n", name);
         }
+    } else if (strcmp(key, "bpr_threshold") == 0) {
+        bpr_set_threshold(g_app_config.bpr_threshold);
+        printf("BPR threshold saved and applied; next Bright/Dark calibration uses it (no restart)\n");
     } else if (strncmp(key, "dde_", 4) == 0) {
         ret = dde_set_params(&g_app_config.dde);
         if (ret != 0) return ret;
@@ -858,11 +871,6 @@ static int app_config_show_file(void)
 	       g_app_config.bpr_correction ? "on" : "off");
 	printf("  2. %-31s = %u RAW8 DN\n", "bpr_threshold",
 	       g_app_config.bpr_threshold);
-	printf("  3. %-31s = %d (%s)\n", "runtime_bpr_enable",
-	       g_app_config.runtime_bpr_enable,
-	       g_app_config.runtime_bpr_enable ? "on" : "off");
-	printf("  4. %-31s = %u RAW8 DN\n", "runtime_bpr_threshold",
-	       g_app_config.runtime_bpr_threshold);
 
 	printf("\n[Shutter / FFC]\n");
 	printf("  1. %-31s = %d (%s)\n", "ffc_correction",
@@ -872,6 +880,9 @@ static int app_config_show_file(void)
 	       g_app_config.shutter_interval_sec);
 	printf("  3. %-31s = %u ms\n", "shutter_close_wait_ms",
 	       g_app_config.shutter_close_wait_ms);
+	printf("  4. %-31s = %d (%s)\n", "ffc_startup_enable",
+	       g_app_config.ffc_startup_enable,
+	       g_app_config.ffc_startup_enable ? "on" : "off");
 
 	printf("\n[NUC]\n");
 	printf("  1. %-31s = %d (%s)\n", "nuc_correction",
@@ -1102,24 +1113,17 @@ static int app_config_bpr_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("BPR setting\n");
-		printf("BPR on/off applies immediately; other settings require restart.\n");
+		printf("BPR on/off and threshold apply immediately.\n");
+		printf("The threshold affects the next Bright/Dark calibration, not the existing DPC table.\n");
 		printf(" 1. BPR on/off\n");
 		printf(" 2. Bright/Dark BPR threshold (RAW8 DN)\n");
-		printf(" 3. Runtime BPR on/off\n");
-		printf(" 4. Runtime BPR threshold (RAW8 DN)\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: BPR=%s, threshold=%u RAW8 DN, "
-		       "Runtime BPR=%s, threshold=%u RAW8 DN\n",
-		       bpr_is_enabled() ? "on" : "off", bpr_get_threshold(),
-		       bpr_is_runtime_enabled() ? "on" : "off",
-		       bpr_get_runtime_threshold());
-		printf("pending CFG: BPR=%s, threshold=%u RAW8 DN, "
-		       "Runtime BPR=%s, threshold=%u RAW8 DN\n",
+		printf("runtime: BPR=%s, threshold=%u RAW8 DN\n",
+		       bpr_is_enabled() ? "on" : "off", bpr_get_threshold());
+		printf("pending CFG: BPR=%s, threshold=%u RAW8 DN\n",
 		       g_app_config.bpr_correction ? "on" : "off",
-		       g_app_config.bpr_threshold,
-		       g_app_config.runtime_bpr_enable ? "on" : "off",
-		       g_app_config.runtime_bpr_threshold);
+		       g_app_config.bpr_threshold);
 
 		option = app_config_read_option();
 		switch (option) {
@@ -1131,17 +1135,6 @@ static int app_config_bpr_menu_run(void)
 			ret = app_config_prompt_int("Bright/Dark BPR threshold",
 				"bpr_threshold",
 				(int)g_app_config.bpr_threshold,
-				0, 100, " RAW8 DN");
-			break;
-		case 3:
-			ret = app_config_prompt_bool("Runtime BPR",
-				"runtime_bpr_enable",
-				g_app_config.runtime_bpr_enable);
-			break;
-		case 4:
-			ret = app_config_prompt_int("Runtime BPR threshold",
-				"runtime_bpr_threshold",
-				(int)g_app_config.runtime_bpr_threshold,
 				0, 100, " RAW8 DN");
 			break;
 		case 0:
@@ -1168,9 +1161,10 @@ static int app_config_shutter_ffc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("Shutter / FFC setting\n");
-		printf(" 1. FFC on/off\n");
-		printf(" 2. Shared shutter interval\n");
-		printf(" 3. Shutter close wait time\n");
+		printf(" 1. FFC on/off (apply immediately)\n");
+		printf(" 2. FFC interval (0 = periodic off)\n");
+		printf(" 3. Shutter close wait time (next calibration)\n");
+		printf(" 4. FFC at startup on/off\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: FFC=%s, shutter interval=%u sec, close wait=%u ms\n",
@@ -1181,7 +1175,11 @@ static int app_config_shutter_ffc_menu_run(void)
 		       g_app_config.ffc_correction ? "on" : "off",
 		       g_app_config.shutter_interval_sec,
 		       g_app_config.shutter_close_wait_ms);
-		printf("FFC and Runtime BPR share this shutter interval.\n");
+		printf("runtime: FFC at startup=%s; pending CFG=%s\n",
+		       ffc_is_startup_enabled() ? "on" : "off",
+		       g_app_config.ffc_startup_enable ? "on" : "off");
+		printf("Startup FFC runs once independently of FFC on/off; applies on restart or reboot.\n");
+		printf("Shutter interval: 0 disables periodic FFC; startup/manual FFC and correction remain available.\n");
 
 		option = app_config_read_option();
 		switch (option) {
@@ -1190,16 +1188,20 @@ static int app_config_shutter_ffc_menu_run(void)
 				g_app_config.ffc_correction);
 			break;
 		case 2:
-			ret = app_config_prompt_int("Shared shutter interval",
+			ret = app_config_prompt_int("FFC interval (0 = periodic off)",
 				"shutter_interval_sec",
 				(int)g_app_config.shutter_interval_sec,
-				1, INT_MAX, " sec");
+				0, INT_MAX, " sec");
 			break;
 		case 3:
 			ret = app_config_prompt_int("Shutter close wait time",
 				"shutter_close_wait_ms",
 				(int)g_app_config.shutter_close_wait_ms,
 				1, INT_MAX, " ms");
+			break;
+		case 4:
+			ret = app_config_prompt_bool("FFC at startup", "ffc_startup_enable",
+				g_app_config.ffc_startup_enable);
 			break;
 		case 0:
 		case -1:
@@ -1894,11 +1896,8 @@ int app_config_save(void)
 	}
 	fprintf(fp, "bpr_correction=%d\n", g_app_config.bpr_correction);
 	fprintf(fp, "bpr_threshold=%u\n", g_app_config.bpr_threshold);
-	fprintf(fp, "runtime_bpr_enable=%d\n",
-		g_app_config.runtime_bpr_enable);
-	fprintf(fp, "runtime_bpr_threshold=%u\n",
-		g_app_config.runtime_bpr_threshold);
 	fprintf(fp, "ffc_correction=%d\n", g_app_config.ffc_correction);
+	fprintf(fp, "ffc_startup_enable=%d\n", g_app_config.ffc_startup_enable);
 	fprintf(fp, "shutter_interval_sec=%u\n",
 		g_app_config.shutter_interval_sec);
 	fprintf(fp, "shutter_close_wait_ms=%u\n",
