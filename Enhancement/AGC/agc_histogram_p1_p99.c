@@ -31,7 +31,7 @@
 #define AGC_PERCENT_SCALE            100U
 #define MENU_OPTION_REFRESH          (-2)
 
-#define AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS {90U, 1U, 99U}
+#define AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS {90U, 1U, 99U, 0U}
 static const AGC_HISTOGRAM_P1_P99_PARAMS g_histogram_defaults =
 	AGC_HISTOGRAM_P1_P99_DEFAULT_PARAMS;
 static AGC_HISTOGRAM_P1_P99_PARAMS g_histogram_params =
@@ -50,6 +50,7 @@ int agc_histogram_p1_p99_validate_params(
 	const AGC_HISTOGRAM_P1_P99_PARAMS *params)
 {
 	if (params == NULL || params->temporal_previous_percent > 99U ||
+	    params->gain_limit_tenths > 40U ||
 	    params->percentile_high > 100U ||
 	    params->percentile_low >= params->percentile_high) {
 		return -1;
@@ -266,6 +267,19 @@ int agc_histogram_p1_p99_apply_u14(const uint16_t *input,
 	}
 
 	range = (uint32_t)p99_value - p1_value;
+    /* Reuse the histogram as a LUT after percentile extraction. Limit the
+     * continuous slope, preserving the P-low/P-high midpoint. Build once
+     * per frame so the pixel loop needs no signed 64-bit division. */
+    if (params.gain_limit_tenths && range * params.gain_limit_tenths < 2550U) {
+        for (bin = 0; bin < AGC_HISTOGRAM_BIN_COUNT; bin++) {
+            int64_t mapped = ((int64_t)2 * bin - p1_value - p99_value) *
+                params.gain_limit_tenths * AGC_RAW_MAX + (int64_t)2550 * AGC_RAW_MAX;
+            if (mapped <= 0) histogram_workspace[bin] = 0;
+            else if (mapped >= (int64_t)5100 * AGC_RAW_MAX)
+                histogram_workspace[bin] = AGC_RAW_MAX;
+            else histogram_workspace[bin] = (uint32_t)(mapped / 5100);
+        }
+    }
 	for (y = 0; y < height; y++) {
 		const uint16_t *input_row =
 			(const uint16_t *)((const uint8_t *)input +
@@ -277,7 +291,10 @@ int agc_histogram_p1_p99_apply_u14(const uint16_t *input,
 		for (x = 0; x < width; x++) {
 			uint32_t value = input_row[x] & AGC_RAW_MAX;
 
-			if (value <= p1_value) {
+            if (params.gain_limit_tenths &&
+                range * params.gain_limit_tenths < 2550U) {
+                output_row[x] = (uint16_t)histogram_workspace[value];
+            } else if (value <= p1_value) {
 				output_row[x] = 0U;
 			} else if (value >= p99_value) {
 				output_row[x] = AGC_RAW_MAX;
@@ -319,8 +336,10 @@ int agc_histogram_p1_p99_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("selected runtime AGC: %s\n",
 		       agc_mode_name(agc_mode_get()));
-		printf("mapping: P%u..P%u -> RAW14 0..16383, CPU Linear Stretch\n",
+		printf("mapping: P%u..P%u, RAW14 container 0..16383, CPU Linear Stretch\n",
 		       params.percentile_low, params.percentile_high);
+		printf("Gain Limit: %.1f Gray/RAW DN (0 off)\n",
+               params.gain_limit_tenths / 10.0);
 		printf("pipeline: after RAW snapshot, before VideoProc\n");
 		printf("Settings: CFG Setting -> AGC setting (mutually exclusive)\n");
 

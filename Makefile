@@ -61,6 +61,7 @@ SRC += \
 	Correction/FFC/ffc.c \
 	Correction/TDC/tdc.c \
 	Enhancement/AGC/agc_mode.c \
+	Enhancement/AGC/agc_weighted.c \
 	Enhancement/AGC/agc_fieldscale.c \
 	Enhancement/AGC/agc_histogram_p1_p99.c \
 	Enhancement/AGC/agc_min_max_tone_curve.c \

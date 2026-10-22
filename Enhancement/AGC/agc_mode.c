@@ -6,37 +6,31 @@
 #include <pthread.h>
 
 #include "agc_fieldscale.h"
+#include "agc_weighted.h"
 #include "agc_histogram_p1_p99.h"
 #include "agc_min_max_tone_curve.h"
 
 #define MENU_OPTION_REFRESH (-2)
 
 static AGC_MODE g_agc_mode = AGC_MODE_OFF;
-static AGC_MODE g_session_mode = AGC_MODE_OFF;
 static int g_requested_mode = -1;
 static pthread_mutex_t g_mode_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void agc_mode_begin_session(void)
 {
     pthread_mutex_lock(&g_mode_lock);
-    g_session_mode = g_agc_mode;
     g_requested_mode = -1;
     pthread_mutex_unlock(&g_mode_lock);
 }
 
-/* A different algorithm is saved for restart, not switched live. */
+/* The RAW worker consumes the latest selection at a frame boundary. */
 int agc_mode_request(AGC_MODE mode)
 {
-    int ret = 0;
+    if (mode < AGC_MODE_OFF || mode > AGC_MODE_WEIGHTED_CPU) return -1;
     pthread_mutex_lock(&g_mode_lock);
-    if (mode != AGC_MODE_OFF && mode != g_session_mode) {
-        g_requested_mode = -1;
-        ret = 1;
-    } else {
-        g_requested_mode = (int)mode;
-    }
+    g_requested_mode = (int)mode;
     pthread_mutex_unlock(&g_mode_lock);
-    return ret;
+    return 0;
 }
 
 int agc_mode_take_request(void)
@@ -55,7 +49,8 @@ int agc_mode_set(AGC_MODE mode)
 	if (mode != AGC_MODE_OFF &&
 	    mode != AGC_MODE_HISTOGRAM_P1_P99_CPU &&
 	    mode != AGC_MODE_MIN_MAX_TONE_CURVE_ISP &&
-	    mode != AGC_MODE_FIELDSCALE_CPU) {
+	    mode != AGC_MODE_FIELDSCALE_CPU &&
+	    mode != AGC_MODE_WEIGHTED_CPU) {
 		return -1;
 	}
 
@@ -83,6 +78,8 @@ const char *agc_mode_name(AGC_MODE mode)
 		return "Min/Max Tone Curve AGC (ISP)";
 	case AGC_MODE_FIELDSCALE_CPU:
 		return "Fieldscale Local Adaptive AGC (CPU)";
+	case AGC_MODE_WEIGHTED_CPU:
+		return "Weighted Mapping AGC (CPU)";
 	case AGC_MODE_OFF:
 	default:
 		return "off";
@@ -134,6 +131,7 @@ int agc_menu_run(void)
 		printf(" 2. Min/Max Tone Curve (ISP)\n");
 		printf(" 3. Fieldscale Local Adaptive AGC (CPU)\n");
 		printf(" 4. Disable all AGC\n");
+		printf(" 5. Weighted Mapping AGC (CPU, 1x1)\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("selected runtime AGC: %s\n",
@@ -152,6 +150,10 @@ int agc_menu_run(void)
 
 		case 3:
 			ret = agc_fieldscale_menu_run();
+			break;
+
+		case 5:
+			ret = agc_weighted_menu_run();
 			break;
 
 		case 4:

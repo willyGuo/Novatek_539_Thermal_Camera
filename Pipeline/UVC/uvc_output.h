@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "hdal.h"
+#include "../frame_trace.h"
 
 typedef struct {
 	HD_PATH_ID enc_path;
@@ -24,6 +25,14 @@ typedef struct {
 	uintptr_t frame_pa;
 	uintptr_t frame_va;
 	UINT32 frame_size;
+	int uvac_frame_pending;
+	int bitstream_held;
+	HD_VIDEOENC_BS held_bitstream;
+	unsigned long long pulled, released, release_errors, wait_errors;
+	uintptr_t encoder_va;
+	UINT32 encoder_map_size;
+	volatile int failed;
+	FRAME_TRACE encoder_output_trace, usb_submit_trace, usb_done_trace;
 } UVC_OUTPUT;
 
 HD_RESULT uvc_output_open(UVC_OUTPUT *output, UINT32 width, UINT32 height,

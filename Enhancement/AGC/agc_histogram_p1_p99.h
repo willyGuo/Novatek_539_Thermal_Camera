@@ -12,6 +12,7 @@ typedef struct {
 	uint32_t temporal_previous_percent;
 	uint32_t percentile_low;  /* Integer percentile: 0..99, below high. */
 	uint32_t percentile_high; /* Integer percentile: 1..100, above low. */
+	uint32_t gain_limit_tenths; /* 0 off; 1..40 in 8-bit Gray / RAW DN. */
 } AGC_HISTOGRAM_P1_P99_PARAMS;
 
 typedef struct {

@@ -14,6 +14,7 @@ typedef enum {
 typedef struct {
 	VIDEO_OUTPUT_MODE mode;
 	int opened;
+	FRAME_TRACE encoder_input_trace;
 	union {
 		UVC_OUTPUT uvc;
 		RTSP_OUTPUT rtsp;

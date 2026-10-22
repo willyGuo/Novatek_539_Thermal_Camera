@@ -265,6 +265,9 @@ static HD_RESULT uvc_copy_and_send_mjpeg(UVC_OUTPUT *output,
 	UVAC_STRM_FRM stream_frame = {0};
 	UINT32 total_size = 0;
 	UINT32 i;
+	ER wait_ret;
+	HD_RESULT cache_ret;
+	if (output->uvac_frame_pending) return HD_ERR_NG;
 
 	if (bitstream->pack_num == 0) {
 		return HD_ERR_NG;
@@ -289,12 +292,16 @@ static HD_RESULT uvc_copy_and_send_mjpeg(UVC_OUTPUT *output,
 			return HD_ERR_NG;
 		}
 
+		cache_ret = hd_common_mem_cache_sync((void *)(encoder_va + pack_offset),
+			pack_size, HD_COMMON_MEM_DMA_FROM_DEVICE);
+		if (cache_ret != HD_OK) return cache_ret;
 		memcpy((void *)(output->frame_va + total_size),
 			(const void *)(encoder_va + pack_offset), pack_size);
 		total_size += pack_size;
 	}
 
-	hd_common_mem_flush_cache((void *)output->frame_va, total_size);
+	cache_ret = hd_common_mem_flush_cache((void *)output->frame_va, total_size);
+	if (cache_ret != HD_OK) return cache_ret;
 	if (send_to_host) {
 		stream_frame.path = UVAC_STRM_VID;
 		stream_frame.addr = output->frame_pa;
@@ -305,7 +312,16 @@ static HD_RESULT uvc_copy_and_send_mjpeg(UVC_OUTPUT *output,
 		stream_frame.timestamp = bitstream->timestamp;
 		stream_frame.frame_type = UVAC_VIDEO_FRM_NORMAL;
 		UVAC_SetEachStrmInfo(&stream_frame);
-		UVAC_WaitStrmDone(UVAC_STRM_VID);
+		frame_trace_sample(&output->usb_submit_trace, "USB_SUBMIT", 0, bitstream->timestamp);
+		output->uvac_frame_pending = 1;
+		wait_ret = UVAC_WaitStrmDone(UVAC_STRM_VID);
+		if (wait_ret != E_OK) {
+			output->wait_errors++;
+			printf("UVC wait failed=%d; retain transfer buffer until UVAC close\n", wait_ret);
+			return HD_ERR_NG;
+		}
+		output->uvac_frame_pending = 0;
+		frame_trace_sample(&output->usb_done_trace, "USB_DONE", 0, bitstream->timestamp);
 	}
 	uvc_save_mjpeg_snapshot(output->frame_va, total_size,
 		bitstream->timestamp);
@@ -319,11 +335,13 @@ static void *uvc_output_thread(void *arg)
 	HD_VIDEOENC_BS bitstream = {0};
 	uintptr_t encoder_va;
 	HD_RESULT ret;
+	HD_RESULT send_ret;
 
 	ret = hd_videoenc_get(output->enc_path, HD_VIDEOENC_PARAM_BUFINFO,
 		&encoder_buffer);
 	if (ret != HD_OK) {
 		printf("get UVC MJPEG buffer info failed=%d\n", ret);
+		output->failed = 1;
 		return NULL;
 	}
 	encoder_va = (uintptr_t)hd_common_mem_mmap(
@@ -331,9 +349,12 @@ static void *uvc_output_thread(void *arg)
 		encoder_buffer.buf_info.buf_size);
 	if (encoder_va == 0) {
 		printf("map UVC MJPEG buffer failed\n");
+		output->failed = 1;
 		return NULL;
 	}
 
+	output->encoder_va = encoder_va;
+	output->encoder_map_size = encoder_buffer.buf_info.buf_size;
 	while (!output->thread_exit) {
 		ret = hd_videoenc_pull_out_buf(output->enc_path, &bitstream,
 			UVC_FRAME_TIMEOUT_MS);
@@ -345,10 +366,15 @@ static void *uvc_output_thread(void *arg)
 		}
 
 		/* Always drain the encoder so it cannot fill before the host opens UVC. */
+		output->held_bitstream = bitstream;
+		output->bitstream_held = 1;
+		output->pulled++;
+		frame_trace_sample(&output->encoder_output_trace, "ENC_OUT", 0, bitstream.timestamp);
+		send_ret = HD_OK;
 		if ((output->host_streaming &&
 		     output->host_format == UVAC_VIDEO_FORMAT_MJPG) ||
 		    uvc_mjpeg_snapshot_is_pending()) {
-			uvc_copy_and_send_mjpeg(output, &encoder_buffer,
+			send_ret = uvc_copy_and_send_mjpeg(output, &encoder_buffer,
 				encoder_va, &bitstream,
 				output->host_streaming &&
 				output->host_format == UVAC_VIDEO_FORMAT_MJPG);
@@ -356,7 +382,17 @@ static void *uvc_output_thread(void *arg)
 
 		ret = hd_videoenc_release_out_buf(output->enc_path, &bitstream);
 		if (ret != HD_OK) {
+			output->release_errors++;
 			printf("UVC encoder release failed=%d\n", ret);
+			output->failed = 1;
+			break;
+		}
+		output->bitstream_held = 0;
+		output->released++;
+		if (send_ret != HD_OK) {
+			printf("UVC delivery failed=%d; Stop/Restart required\n", send_ret);
+			output->failed = 1;
+			break;
 		}
 	}
 
@@ -364,6 +400,9 @@ static void *uvc_output_thread(void *arg)
 		encoder_buffer.buf_info.buf_size);
 	if (ret != HD_OK) {
 		printf("unmap UVC MJPEG buffer failed=%d\n", ret);
+		output->failed = 1;
+	} else {
+		output->encoder_va = 0;
 	}
 	return NULL;
 }
@@ -572,6 +611,7 @@ HD_RESULT uvc_output_start(UVC_OUTPUT *output)
 	}
 	output->encoder_started = 1;
 	output->thread_exit = 0;
+	output->failed = 0;
 	thread_ret = pthread_create(&output->thread_id, NULL,
 		uvc_output_thread, output);
 	if (thread_ret != 0) {
@@ -601,10 +641,33 @@ HD_RESULT uvc_output_stop(UVC_OUTPUT *output)
 		output->thread_started = 0;
 		output->thread_id = (pthread_t)0;
 	}
+	/* USB owns frame_va until completion or a synchronous UVAC close. */
+	if (output->uvac_frame_pending && output->uvac_opened) {
+		UVAC_Close();
+		output->uvac_opened = 0;
+		output->uvac_frame_pending = 0;
+	}
+	if (output->bitstream_held) {
+		HD_VIDEOENC_BS descriptor = output->held_bitstream;
+		ret = hd_videoenc_release_out_buf(output->enc_path, &descriptor);
+		if (ret != HD_OK) { output->release_errors++; return ret; }
+		output->bitstream_held = 0;
+		output->released++;
+	}
+    if (FRAME_DIAGNOSTICS_ENABLED)
+    printf("UVC ownership: pull=%llu release=%llu held=%d release_error=%llu wait_error=%llu\n",
+		output->pulled, output->released, output->bitstream_held,
+		output->release_errors, output->wait_errors);
+	if (output->encoder_va) {
+		ret = hd_common_mem_munmap((void *)output->encoder_va, output->encoder_map_size);
+		if (ret != HD_OK) return ret;
+		output->encoder_va = 0;
+	}
 	if (output->encoder_started) {
 		ret = hd_videoenc_stop(output->enc_path);
 		if (ret != HD_OK) {
 			printf("stop UVC MJPEG encoder failed=%d\n", ret);
+			return ret;
 		}
 		output->encoder_started = 0;
 	}
@@ -621,6 +684,7 @@ HD_RESULT uvc_output_close(UVC_OUTPUT *output)
 	}
 
 	ret = uvc_output_stop(output);
+	if (ret != HD_OK) return ret;
 	if (output->uvac_opened) {
 		UVAC_Close();
 		output->uvac_opened = 0;
@@ -632,22 +696,21 @@ HD_RESULT uvc_output_close(UVC_OUTPUT *output)
 		close_ret = hd_videoenc_close(output->enc_path);
 		if (close_ret != HD_OK) {
 			printf("close UVC MJPEG encoder failed=%d\n", close_ret);
-			ret = close_ret;
+			return close_ret;
 		}
+		output->enc_path = 0;
 	}
 	if (output->frame_pa != 0 && output->frame_va != 0) {
 		close_ret = hd_common_mem_free(output->frame_pa,
 			(void *)output->frame_va);
-		if (close_ret != HD_OK && ret == HD_OK) {
-			ret = close_ret;
-		}
+		if (close_ret != HD_OK) return close_ret;
+		output->frame_pa = output->frame_va = 0;
 	}
 	if (output->uvac_pa != 0 && output->uvac_va != 0) {
 		close_ret = hd_common_mem_free(output->uvac_pa,
 			(void *)output->uvac_va);
-		if (close_ret != HD_OK && ret == HD_OK) {
-			ret = close_ret;
-		}
+		if (close_ret != HD_OK) return close_ret;
+		output->uvac_pa = output->uvac_va = 0;
 	}
 	uvc_output_reset(output);
 	return ret;

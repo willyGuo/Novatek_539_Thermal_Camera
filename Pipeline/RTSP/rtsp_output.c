@@ -283,6 +283,7 @@ HD_RESULT rtsp_output_stop(RTSP_OUTPUT *output)
 		ret = hd_videoenc_stop(output->enc_path);
 		if (ret != HD_OK) {
 			printf("stop RTSP encoder failed=%d\n", ret);
+			return ret;
 		}
 		output->encoder_started = 0;
 	}
@@ -299,13 +300,12 @@ HD_RESULT rtsp_output_close(RTSP_OUTPUT *output)
 	}
 
 	ret = rtsp_output_stop(output);
+	if (ret != HD_OK) return ret;
 	if (output->enc_path != 0) {
 		HD_RESULT close_ret = hd_videoenc_close(output->enc_path);
 		if (close_ret != HD_OK) {
 			printf("close RTSP encoder failed=%d\n", close_ret);
-			if (ret == HD_OK) {
-				ret = close_ret;
-			}
+			return close_ret;
 		}
 	}
 	rtsp_output_reset(output);

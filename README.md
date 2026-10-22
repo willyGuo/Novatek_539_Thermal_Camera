@@ -196,7 +196,17 @@ VCAP RAW
   -> VideoOut
 ```
 
-NUC 與 FFC 都關閉時，VCAP frame 直接送入 VideoProc。任一校正啟用時，capture loop 會使用校正後的 output frame，並依 buffer ownership 正確釋放原始 VCAP frame。
+RAW→VideoProc 使用既有影像 buffer；逐幀 RAW staging 與額外 3 個 pool block 維持撤回。校正／CPU AGC 輸出送入 RAWALL 前，先登記該幀 timestamp／count；收到相同 timestamp 的 RAWALL OUT_0（timestamp 為 0 時才使用非零 count）後，RAW worker 才繼續下一幀，避免固定輸出 buffer 在下游完成前被下一幀覆寫。登記早於非阻塞 push，避免快速輸出造成漏接通知；push 失敗會取消登記。等待最多 500 ms，未確認完成時停止 pipeline，保留資源至 Stop 清理；Stop 會喚醒等待中的 RAW worker。直接使用 VCAP 時維持先 push 再 release，交由 SDK 的來源 buffer reference 管理。
+
+啟動時印出 `RAW_INPUT_SYNC enabled`；第一筆及每完成 300 幀印出 `RAW_INPUT_SYNC ok`，包含 `completed`、`wait_error` 及 `max_wait_us`（送入前登記至對應 RAWALL 輸出被拉取的最長時間）。此同步會限制 RAW worker 的提前處理量，需上板比較 FPS、最大等待時間及殘影是否改善；主機同步測試不代表已證明原本殘影的根因。
+
+VCAP、RAWALL 與 VPE 各自保存成功 pull 的原始 frame descriptor；release 失敗時保留該幀、停止後續取幀並要求停止 Liveview，由 Stop 重試。Stop 清理失敗時保留對應 handle 與狀態，須再次執行 Stop，成功前不允許 Start／Restart。開啟測試診斷輸出時，VCAP 與 RAWALL 每成功釋放 300 幀印出 `ownership` 計數，停止時另列出 VPE 與 UVC 計數；`pull`／`release` 為應用程式成功次數，`held` 為尚未釋放幀數，`release_error` 為失敗次數，不等同 kernel `/proc` 計數定義。
+
+`Pipeline/frame_diagnostics.h` 的 `FRAME_DIAGNOSTICS_ENABLED` 預設為 `0`，暫停 `FRAME_TRACE`、正常 ownership 計數、RAW_INPUT_SYNC 成功計數與 Weighted 定期耗時輸出；buffer 釋放、RAW 輸入同步保護與錯誤訊息仍保留。需要恢復追蹤時，以 `-DFRAME_DIAGNOSTICS_ENABLED=1` 編譯。以下影格時序追蹤說明適用於開啟診斷輸出時。
+
+UVC 在複製 cacheable encoder bitstream 前執行 DMA-from-device cache 同步。`UVAC_WaitStrmDone()` 失敗時停止送流，保留 MJPEG 傳輸 buffer，直到 Stop join worker 並關閉 UVAC 後才允許回收；編碼輸出的 release 失敗也保留 descriptor 供 Stop 重試。上板時需在出流期間連續擷取 `cat /proc/hdal/*/info`，對照應用程式計數及錯誤訊息，另驗證長時間播放、UVC 開關、Stop／Restart 與畫面異常。
+
+影格時序追蹤使用 `FRAME_TRACE` 前綴，記錄 `VCAP`、`RAWALL_IN`、`RAWALL_OUT`、`VPE_OUT`（鏡像啟用時）、`ENC_IN`、`ENC_OUT`、`USB_SUBMIT` 與 `USB_DONE`。各階段第一幀及約每 300 幀印一次，各階段錯開輸出以降低 UART 集中印字的影響；時間戳倒退／重複、非零序號倒退、到達間隔超過 200 ms，或相對首幀的延遲增量超過 200 ms 時印出 event，異常輸出最多每階段每秒一行。累計數不受日誌限速影響。`wall` 是板端 monotonic 時間，`pts` 是 SDK frame timestamp，皆以微秒表示；`back`／`dup` 是時間戳倒退／重複次數，`cback` 是非零序號倒退次數。`lag_growth_us`／`maxlag_us` 是該階段相對首幀的延遲增量／最大增量，不是絕對端到端延遲；時間戳為 0 時累計 `zero`，不能據此判斷重播。FFC、手動校正、負載或 UART 印字也可能造成間隔增加，event 是調查線索。USB_DONE 只表示 UVAC 等待完成，不代表電腦螢幕已顯示。追蹤不改寫時間戳、不額外複製影像、不丟棄影格；新時間戳搭配舊像素仍需另查內容與 buffer 使用時序。
 
 ## CFG Setting 選單
 
@@ -294,14 +304,41 @@ videoproc_3dnr_enable=1
 | `shutter_close_wait_ms` | 快門關閉後開始 FFC 前的等待時間，範圍 `1..INT_MAX`，預設 `200` ms；CFG 選單修改後下一次校正就使用新值 |
 | `tdc_correction` | TDC runtime on/off |
 | `tdc_interval_sec` | TDC 更新間隔 |
-| `agc_histogram_p1_p99_enable` | Histogram P1/P99 CPU AGC on/off；三種 AGC 只能擇一開啟 |
-| `agc_min_max_tone_curve_enable` | Min/Max ISP Tone Curve AGC on/off；三種 AGC 只能擇一開啟 |
-| `agc_fieldscale_enable` | Fieldscale 8x8 Local Adaptive CPU AGC on/off；三種 AGC 只能擇一開啟 |
+| `agc_histogram_p1_p99_enable` | Histogram P1/P99 CPU AGC on/off；四種 AGC 只能擇一開啟 |
+| `agc_min_max_tone_curve_enable` | Min/Max ISP Tone Curve AGC on/off；四種 AGC 只能擇一開啟 |
+| `agc_fieldscale_enable` | Fieldscale 8x8 Local Adaptive CPU AGC on/off；四種 AGC 只能擇一開啟 |
+| `agc_weighted_enable` | Weighted Mapping CPU AGC on/off，預設 0；四種 AGC 只能擇一開啟 |
 | `videoproc_af_enable` | VideoProc AF flag on/off，預設 `1` |
 | `videoproc_wdr_enable` | VideoProc WDR flag on/off，預設 `1` |
 | `videoproc_defog_enable` | VideoProc DEFOG flag on/off，預設 `1` |
 | `videoproc_3dnr_enable` | VideoProc 3DNR 與 3DNR statistics flag on/off，預設 `1` |
 如果檔案不存在，程式會建立預設 cfg。任何設定修改只寫入 cfg；使用者必須執行 `Liveview Restart` 或重新開機才會套用。
+
+Histogram P1/P99 的設定選單新增 `5. Gain Limit`，CFG 為 `agc_histogram_p1_p99_gain_limit=0.0`：預設 0 關閉，可設 0.1..4.0，步進 0.1，單位為 8-bit Gray／原始 RAW DN。設定會儲存並於下一張 Histogram frame 套用，同時重置門檻平滑歷史。限制作用於平滑後的線性斜率，保留 Low／High DN 中點的中灰亮度；生效時不強制拉滿黑白，區間外依同一斜率延伸並限制在 RAW14 0..16383。全平影像保留既有 RAW14 複製行為。關閉時保留原本逐像素結果；Gain Limit 不影響既有 Smooth 權重設定。計算重用 histogram workspace 建立 LUT，不另配置影像記憶體。
+
+## Weighted Mapping AGC（全畫面 1×1）
+
+從 `CFG Setting → AGC setting → 5. Weighted Mapping AGC (CPU, 1x1) setting` 開啟並設定參數。Liveview 執行中選擇不同 AGC 或關閉 AGC 時，由 RAW worker 等待上一張 RAWALL 輸入完成後，在下一張影格交界重置 Smooth 並更新 ISP Tone Curve；不 Stop／Start Liveview，不關閉 UVC 或編碼器，也不重新執行 Startup FFC。錄製與 Timed Snapshot 保持原本排程，切換後的影像使用新 AGC。快速連續選擇以 worker 取出時最新的請求為準；工作記憶體缺失、ISP baseline 不可用或 Tone Curve 更新失敗時保留原 runtime 並印出錯誤。即使 `cfg_boot_load=0`，本次選擇仍會套用；Liveview 原本停止時不會因選擇 AGC 自動開始出流。UVC 連線不重建，切換瞬間是否有停格或亮度跳動仍需上板驗證。`AGC → 5. Weighted Mapping AGC` 可查看 runtime 狀態。
+
+| CFG key | 預設 | 範圍／用途 |
+|---|---|---|
+| `agc_weighted_enable` | 0 | 開啟時停用其他 AGC |
+| `agc_weighted_clip_limit` | 2.0 | 0 關閉；0.1..100.0，步進 0.1；Clip count = round(Clip × pixel count / Unique Levels)，最少 1 |
+| `agc_weighted_redistribute` | 1 | 0／1；依目前 Toolkit 原始碼向完整 RAW14 DN 範圍、含空 bin，重新分配裁切餘量，仍受 Clip count 上限限制 |
+| `agc_weighted_bright_weight` | 1.0 | 1.0、1.05、1.1..2.0；亮部區間權重倍率 |
+| `agc_weighted_bright_percentile` | 80.0 | 0..100，步進 0.1；從原始輸入計算亮部門檻 |
+| `agc_weighted_gain_limit` | 0.0 | 0 關閉；0.1..4.0，步進 0.1；單位為 8-bit Gray／原始 RAW DN |
+| `agc_weighted_temporal_previous_percent` | 90 | 前一幀 LUT 權重 0..99%；0 關閉 Smooth |
+
+移植自 Toolkit `thermal_toolkit/algorithms/histogram.py` 的全域 Tone Weighted Mapping：輸入先限制於 0..16383，計算直方圖、手動 Clip、Redistribution，再依 `W(i)=H(i)+H(i+1)` 建立累積 LUT。區間中點達到 Bright Percentile 的權重乘上 Bright Weight，之後重新正規化。THL／THH 與 ACI automatic Clip 本次不加入。Smooth 關閉或尚未建立歷史 LUT 時，單一 DN 的全平影像對應零輸出，與停用 automatic Clip 時的 Toolkit 行為一致。
+
+Smooth 參考 Fieldscale 的時間權重方式，平滑整張映射 LUT，不平均前後影像像素。預設以前一幀 LUT 90%、當前 LUT 10% 混合，在 0.1 Gray 精度下累積，再套用 Gain Limit；設為 0 可停用。任何 Weighted 參數或影像尺寸變更、AGC 切換及 Liveview Restart 都會重置歷史，下一幀直接建立新的 LUT。
+
+原始 0..255 LUT 先取整，再依設定執行 Smooth。Gain Limit 套用在這份 LUT，相鄰步階以 0.1 Gray 累積限制，保留 lower-median DN 在平滑後的亮度，再 half-up 取整。限制後不重新拉滿 0..255；它是斜率上限，實際灰階差可能更小。為接入既有 RAWALL，LUT 的 8-bit 結果以 `round(Gray × 16383 / 255)` 轉回 RAW14 container；Gain Limit 的單位仍沿用 Toolkit，不能解讀成 RAW14 輸出 DN／輸入 DN。ISP 與後續顯示增強仍可能改變最終畫面。
+
+沿用現有 CPU AGC 輸出 block、快照／錄製及 RAW_INPUT_SYNC。每次 Liveview Start 在 CFG 載入後預先配置一次約 176 KiB Weighted workspace（含歷史 LUT），供不中斷 UVC 的 AGC 切換使用，逐幀不配置記憶體，Stop 時釋放；Histogram 與 Fieldscale workspace 同樣預先備妥。所有 RAW 輸入（含直接 VCAP 路徑）都會等待對應 RAWALL 輸出，逾時仍依既有保護流程停止。CPU AGC 啟用時繞過 ISP Tone Curve；AGC output RAW 保存的是上述轉回 RAW14 的結果。
+
+主機在 Smooth 關閉時，以停用 THL／THH automatic Clip 的 Toolkit 原函式完成 2,320 組完整 LUT／RAW14 像素比對，涵蓋 Clip、Redistribution、亮部權重、小數 Gain Limit、全平／稀疏／全 DN 範圍、三份板端快照與隨機參數；另外檢查 stride padding、in-place、小數 CFG、參數拒絕與 AGC 互斥。另驗證 90/10 LUT 混合、平滑後 Gain Limit、參數／尺寸／模式重置，以及當前影像使用平滑 LUT 的行為。仍需 Novatek SDK 編譯與上板量測耗時、FPS、畫質與長時間出流。
 
 ## BPR／DPC
 

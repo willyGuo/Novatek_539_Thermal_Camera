@@ -5,6 +5,8 @@ int liveview_init(void);
 int liveview_start(void);
 void liveview_stop(void);
 int liveview_restart(void);
+/* Queue AGC at the next RAW frame boundary; stopped pipelines stay stopped. */
+int liveview_switch_agc(int mode);
 int liveview_is_running(void);
 int liveview_get_result(void);
 int liveview_get_shutter_fault(void);

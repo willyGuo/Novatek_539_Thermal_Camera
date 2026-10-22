@@ -13,6 +13,8 @@
 */
 
 #include "liveview.h"
+#include "frame_lease.h"
+#include "frame_trace.h"
 #include "../Enhancement/CLAHE/clahe_frame.h"
 #include "../Enhancement/DDE/dde_frame.h"
 #include "../ISP/Pseudo/pseudo.h"
@@ -47,6 +49,7 @@
 #include "../Enhancement/AGC/agc_histogram_p1_p99.h"
 #include "../Enhancement/AGC/agc_min_max_tone_curve.h"
 #include "../Enhancement/AGC/agc_mode.h"
+#include "../Enhancement/AGC/agc_weighted.h"
 #include "../Enhancement/Gamma/gamma.h"
 #include "../ISP/videoproc/videoproc_isp.h"
 #include "../Diagnostics/ISP/isp_raw_to_y_step_diagnostic.h"
@@ -651,7 +654,7 @@ static HD_RESULT liveview_bypass_isp_tone_for_cpu_agc(void)
 	UINT32 previous_enable;
 
 	if (!agc_histogram_p1_p99_is_enabled() &&
-	    !agc_fieldscale_is_enabled()) {
+	    !agc_fieldscale_is_enabled() && !agc_weighted_is_enabled()) {
 		return HD_OK;
 	}
 
@@ -720,7 +723,11 @@ typedef struct _VIDEO_LIVEVIEW {
 	HD_PATH_ID proc_ctrl;
 	HD_PATH_ID proc_path;
 	HD_PATH_ID proc_path_3dnr;
-	HD_VIDEO_FRAME vpe_held_input;
+	FRAME_LEASE cap_lease, proc_lease;
+	FRAME_TRACE cap_trace, rawall_input_trace, rawall_output_trace, vpe_output_trace;
+	int raw_input_pending;
+	UINT64 raw_input_timestamp, raw_input_count, raw_input_submit_us;
+	UINT64 raw_input_completed, raw_input_timeouts, raw_input_max_wait_us;
 	int vpe_input_held;
 
 	// (3) Selected UVC MJPEG or RTSP H.265 output
@@ -764,6 +771,8 @@ typedef struct _VIDEO_LIVEVIEW {
 	HD_COMMON_MEM_VB_BLK thermal_agc_histogram_p1_p99_out_blk;
 	UINTPTR thermal_agc_histogram_p1_p99_out_pa;
 	UINTPTR thermal_agc_histogram_p1_p99_out_va;
+	AGC_WEIGHTED_WORKSPACE *agc_weighted_workspace;
+	UINT32 agc_weighted_frame_count, agc_weighted_error_count;
 	uint32_t *agc_histogram_p1_p99_workspace;
 	AGC_HISTOGRAM_P1_P99_STATE agc_histogram_p1_p99_state;
 	uint32_t *agc_fieldscale_horizontal_workspace;
@@ -842,6 +851,8 @@ static SNAPSHOT_WRITER g_snapshot_writer = {
 	.cond = PTHREAD_COND_INITIALIZER,
 };
 static pthread_mutex_t g_liveview_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_raw_input_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_raw_input_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_liveview_fault_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_shutter_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_manual_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1158,7 +1169,7 @@ static void *liveview_fault_stop_worker(void *arg)
 {
 	(void)arg;
 
-	printf("Shutter fault: stopping liveview\n");
+	printf("Pipeline fault: stopping liveview\n");
 	liveview_stop();
 
 	pthread_mutex_lock(&g_liveview_fault_lock);
@@ -1168,14 +1179,14 @@ static void *liveview_fault_stop_worker(void *arg)
 	return 0;
 }
 
-static void liveview_request_shutter_fault_stop(VIDEO_LIVEVIEW *stream)
+static void liveview_request_fault_stop(VIDEO_LIVEVIEW *stream, int shutter_fault)
 {
 	pthread_t stop_thread_id;
 	int ret;
 	int create_worker = 0;
 
 	pthread_mutex_lock(&g_liveview_fault_lock);
-	g_liveview_shutter_fault = 1;
+	if (shutter_fault) g_liveview_shutter_fault = 1;
 	g_liveview_stop_request = 1;
 	if (!g_liveview_fault_stop_worker_active) {
 		g_liveview_fault_stop_worker_active = 1;
@@ -1192,7 +1203,7 @@ static void liveview_request_shutter_fault_stop(VIDEO_LIVEVIEW *stream)
 	ret = pthread_create(&stop_thread_id, NULL,
 			     liveview_fault_stop_worker, NULL);
 	if (ret != 0) {
-		printf("create shutter fault stop worker failed=%d\n", ret);
+		printf("create pipeline fault stop worker failed=%d\n", ret);
 		pthread_mutex_lock(&g_liveview_fault_lock);
 		g_liveview_fault_stop_worker_active = 0;
 		pthread_mutex_unlock(&g_liveview_fault_lock);
@@ -1200,6 +1211,55 @@ static void liveview_request_shutter_fault_stop(VIDEO_LIVEVIEW *stream)
 	}
 	pthread_detach(stop_thread_id);
 }
+
+static void liveview_request_shutter_fault_stop(VIDEO_LIVEVIEW *stream)
+{
+	liveview_request_fault_stop(stream, 1);
+}
+
+static HD_RESULT liveview_cap_pull(VIDEO_LIVEVIEW *stream,
+	HD_VIDEO_FRAME *frame, INT32 wait_ms)
+{
+	HD_RESULT ret = frame_lease_pull(&stream->cap_lease, hd_videocap_pull_out_buf,
+		stream->cap_path, frame, wait_ms);
+	if (ret == HD_OK)
+		frame_trace_sample(&stream->cap_trace, "VCAP", frame->count, frame->timestamp);
+	return ret;
+}
+
+static HD_RESULT liveview_cap_release(VIDEO_LIVEVIEW *stream,
+	HD_VIDEO_FRAME *frame)
+{
+	HD_RESULT ret;
+	(void)frame;
+	ret = frame_lease_release(&stream->cap_lease,
+		hd_videocap_release_out_buf, stream->cap_path);
+	if (ret != HD_OK) {
+		stream->cap_exit = 1;
+		stream->proc_exit = 1;
+		frame_lease_report("VCAP release failed; retaining frame", &stream->cap_lease);
+		liveview_request_fault_stop(stream, 0);
+	}
+	if (FRAME_DIAGNOSTICS_ENABLED && ret == HD_OK && stream->cap_lease.released % 300U == 0)
+		frame_lease_report("VCAP", &stream->cap_lease);
+	return ret;
+}
+
+static HD_RESULT liveview_proc_release(VIDEO_LIVEVIEW *stream)
+{
+	HD_RESULT ret = frame_lease_release(&stream->proc_lease,
+		hd_videoproc_release_out_buf, stream->proc_path);
+	if (ret != HD_OK) {
+		stream->cap_exit = 1;
+		stream->proc_exit = 1;
+		frame_lease_report("RAWALL release failed; retaining frame", &stream->proc_lease);
+		liveview_request_fault_stop(stream, 0);
+	}
+	if (FRAME_DIAGNOSTICS_ENABLED && ret == HD_OK && stream->proc_lease.released % 300U == 0)
+		frame_lease_report("RAWALL", &stream->proc_lease);
+	return ret;
+}
+
 
 static void liveview_on_shutter_failure(void)
 {
@@ -2690,6 +2750,7 @@ static HD_RESULT release_thermal_frame_buffer(UINTPTR *p_va,
 		ret = hd_common_mem_munmap((void *)*p_va, blk_size);
 		if (ret != HD_OK) {
 			printf("munmap %s error=%d\n", name, ret);
+			return ret;
 		}
 		*p_va = 0;
 	}
@@ -2702,7 +2763,7 @@ static HD_RESULT release_thermal_frame_buffer(UINTPTR *p_va,
 				ret = release_ret;
 			}
 		}
-		*p_blk = 0;
+		if (release_ret == HD_OK) *p_blk = 0;
 	}
 
 	return ret;
@@ -2760,6 +2821,8 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	p_stream->thermal_ffc_zero_pa = 0;
 	p_stream->thermal_agc_histogram_p1_p99_out_pa = 0;
 	p_stream->thermal_isp_step_test_pa = 0;
+	free(p_stream->agc_weighted_workspace);
+	p_stream->agc_weighted_workspace = NULL;
 	free(p_stream->agc_histogram_p1_p99_workspace);
 	p_stream->agc_histogram_p1_p99_workspace = NULL;
 	free(p_stream->agc_fieldscale_horizontal_workspace);
@@ -2784,14 +2847,14 @@ static void skip_vcap_frame(VIDEO_LIVEVIEW *p_stream0, UINT32 skip_cnt)
 	HD_RESULT ret = HD_OK;
 
 	for (i = 0; i < skip_cnt && p_stream0->cap_exit == 0;) {
-		ret = hd_videocap_pull_out_buf(p_stream0->cap_path, &vcap_video_frame, 100);
+		ret = liveview_cap_pull(p_stream0, &vcap_video_frame, 100);
 		if (ret != HD_OK) {
 			if (ret != HD_ERR_UNDERRUN) {
 				printf("skip_vcap_frame vcap pull error=%d !!\r\n\r\n", ret);
 			}
 			continue;
 		}
-		ret = hd_videocap_release_out_buf(p_stream0->cap_path, &vcap_video_frame);
+		ret = liveview_cap_release(p_stream0, &vcap_video_frame);
 		if (ret != HD_OK) {
 			printf("skip_vcap_frame cap_release error=%d !!\r\n\r\n", ret);
 		}
@@ -2799,26 +2862,19 @@ static void skip_vcap_frame(VIDEO_LIVEVIEW *p_stream0, UINT32 skip_cnt)
 	}
 }
 
+static int cap_module_ready, proc_module_ready, enc_module_ready, gfx_module_ready;
+
 static HD_RESULT init_module(void)
 {
 	HD_RESULT ret;
-	if ((ret = hd_videocap_init()) != HD_OK)
-		return ret;
-	if ((ret = hd_videoproc_init()) != HD_OK) {
-		hd_videocap_uninit();
-		return ret;
-	}
-	if ((ret = video_output_module_init()) != HD_OK) {
-		hd_videoproc_uninit();
-		hd_videocap_uninit();
-		return ret;
-	}
-	if ((ret = hd_gfx_init()) != HD_OK) {
-		video_output_module_uninit();
-		hd_videoproc_uninit();
-		hd_videocap_uninit();
-		return ret;
-	}
+	if ((ret = hd_videocap_init()) != HD_OK) return ret;
+	cap_module_ready = 1;
+	if ((ret = hd_videoproc_init()) != HD_OK) return ret;
+	proc_module_ready = 1;
+	if ((ret = video_output_module_init()) != HD_OK) return ret;
+	enc_module_ready = 1;
+	if ((ret = hd_gfx_init()) != HD_OK) return ret;
+	gfx_module_ready = 1;
 	return HD_OK;
 }
 
@@ -2870,7 +2926,7 @@ static HD_RESULT close_module(VIDEO_LIVEVIEW *p_stream)
 				printf("close %s fail=%d\n", (name), close_ret); \
 				if (ret == HD_OK) ret = close_ret; \
 			} \
-			(path) = 0; \
+			if (close_ret == HD_OK) (path) = 0; \
 		} \
 	} while (0)
 
@@ -2888,26 +2944,16 @@ static HD_RESULT close_module(VIDEO_LIVEVIEW *p_stream)
 
 static HD_RESULT exit_module(void)
 {
-	HD_RESULT ret = HD_OK;
-	HD_RESULT uninit_ret;
-
-#define UNINIT_MODULE(uninit_fn, name) \
-	do { \
-		uninit_ret = uninit_fn(); \
-		if (uninit_ret != HD_OK) { \
-			printf("uninit %s fail=%d\n", (name), uninit_ret); \
-			if (ret == HD_OK) ret = uninit_ret; \
-		} \
-	} while (0)
-
-	UNINIT_MODULE(hd_gfx_uninit, "gfx");
-	UNINIT_MODULE(video_output_module_uninit, "videoenc");
-	UNINIT_MODULE(hd_videoproc_uninit, "videoproc");
-	UNINIT_MODULE(hd_videocap_uninit, "videocap");
-
-#undef UNINIT_MODULE
-
-	return ret;
+	HD_RESULT ret;
+#define UNINIT_READY(ready, fn) do { \
+	if (ready) { ret = fn(); if (ret != HD_OK) return ret; ready = 0; } \
+} while (0)
+	UNINIT_READY(gfx_module_ready, hd_gfx_uninit);
+	UNINIT_READY(enc_module_ready, video_output_module_uninit);
+	UNINIT_READY(proc_module_ready, hd_videoproc_uninit);
+	UNINIT_READY(cap_module_ready, hd_videocap_uninit);
+#undef UNINIT_READY
+	return HD_OK;
 }
 
 /* Runtime RAW pipeline helpers. */
@@ -2997,8 +3043,7 @@ static int liveview_run_ffc_calibration(
 			}
 		}
 
-		process_ret = hd_videocap_pull_out_buf(
-			p_stream0->cap_path, &vcap_video_frame, 100);
+		process_ret = liveview_cap_pull(p_stream0, &vcap_video_frame, 100);
 		if (process_ret != HD_OK) {
 			if (process_ret != HD_ERR_UNDERRUN) {
 				printf("FFC cap_pull error=%d !!\r\n\r\n",
@@ -3072,8 +3117,7 @@ static int liveview_run_ffc_calibration(
 			}
 		}
 
-		release_ret = hd_videocap_release_out_buf(
-			p_stream0->cap_path, &vcap_video_frame);
+		release_ret = liveview_cap_release(p_stream0, &vcap_video_frame);
 		if (release_ret != HD_OK) {
 			printf("FFC cap_release error=%d !!\r\n\r\n",
 			       release_ret);
@@ -3248,6 +3292,107 @@ static int liveview_apply_agc_histogram_p1_p99(
 		&p_stream->agc_histogram_p1_p99_state,
 		p1_result,
 		p99_result);
+
+	if (agc_status >= AGC_HISTOGRAM_P1_P99_STATUS_OK) {
+		/* The CPU wrote the output; publish it before VideoProc reads it. */
+		hd_common_mem_flush_cache(
+			(void *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+			output_size);
+		memcpy(output_frame, input_frame, sizeof(*output_frame));
+		output_frame->phy_addr[0] =
+			p_stream->thermal_agc_histogram_p1_p99_out_pa;
+		output_frame->blk =
+			p_stream->thermal_agc_histogram_p1_p99_out_blk;
+		output_frame->loff[0] = output_stride;
+		output_frame->ph[0] = RAW_SIZE_H;
+	}
+
+	unmap_ret = hd_common_mem_munmap((void *)map_va, map_size);
+	if (unmap_ret != HD_OK) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	return agc_status;
+}
+
+static int liveview_apply_agc_weighted(
+	VIDEO_LIVEVIEW *p_stream,
+	const HD_VIDEO_FRAME *input_frame,
+	HD_VIDEO_FRAME *output_frame)
+{
+	UINTPTR block_pa;
+	UINTPTR map_pa;
+	UINTPTR map_va;
+	UINTPTR input_va;
+	UINT64 data_offset;
+	UINT64 map_size_64;
+	UINT32 map_size;
+	UINT32 input_stride;
+	UINT32 output_stride;
+	UINT32 plane_height;
+	UINT32 output_size;
+	AGC_WEIGHTED_PARAMS params;
+	int agc_status;
+	HD_RESULT unmap_ret;
+
+	if (p_stream == NULL || input_frame == NULL || output_frame == NULL ||
+	    input_frame->phy_addr[0] == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_pa == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_va == 0 ||
+	    p_stream->thermal_agc_histogram_p1_p99_out_blk == 0 ||
+	    p_stream->agc_weighted_workspace == NULL) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	if (input_frame->dim.w != RAW_SIZE_W ||
+	    input_frame->dim.h != RAW_SIZE_H) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	output_stride = RAW_SIZE_W * sizeof(uint16_t);
+	output_size = output_stride * RAW_SIZE_H;
+	input_stride = input_frame->loff[0];
+	if (input_stride < output_stride) {
+		input_stride *= sizeof(uint16_t);
+	}
+	plane_height = input_frame->ph[0] != 0 ?
+		input_frame->ph[0] : input_frame->dim.h;
+	if (input_stride < output_stride || plane_height < RAW_SIZE_H) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	block_pa = input_frame->blk != 0 ?
+		hd_common_mem_blk2pa(input_frame->blk) : 0;
+	if (block_pa != 0) {
+		if (input_frame->phy_addr[0] < block_pa) {
+			return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+		}
+		map_pa = block_pa;
+		data_offset = (UINT64)(input_frame->phy_addr[0] - block_pa);
+	} else {
+		map_pa = input_frame->phy_addr[0];
+		data_offset = 0;
+	}
+
+	map_size_64 = data_offset + (UINT64)input_stride * plane_height;
+	if (map_size_64 == 0 || map_size_64 > UINT_MAX) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+	map_size = (UINT32)map_size_64;
+	map_va = (UINTPTR)hd_common_mem_mmap(
+		HD_COMMON_MEM_MEM_TYPE_CACHE, map_pa, map_size);
+	if (map_va == 0) {
+		return AGC_HISTOGRAM_P1_P99_STATUS_INVALID_ARGUMENT;
+	}
+
+	/* Synchronize the hardware/VCAP writer before the CPU reads this frame. */
+	hd_common_mem_flush_cache((void *)map_va, map_size);
+	input_va = map_va + (UINTPTR)data_offset;
+	agc_weighted_get_params(&params);
+	agc_status = agc_weighted_apply_u14(
+        (const uint16_t *)input_va, input_stride,
+        (uint16_t *)p_stream->thermal_agc_histogram_p1_p99_out_va,
+        output_stride, RAW_SIZE_W, RAW_SIZE_H, p_stream->agc_weighted_workspace, &params);
 
 	if (agc_status >= AGC_HISTOGRAM_P1_P99_STATUS_OK) {
 		/* The CPU wrote the output; publish it before VideoProc reads it. */
@@ -3532,13 +3677,20 @@ static void liveview_apply_agc_request(VIDEO_LIVEVIEW *stream)
     AGC_MODE old_mode = agc_mode_get();
     IQT_TONE_PARAM target;
     if (requested < 0 || requested == (int)old_mode) return;
+    if ((requested == AGC_MODE_WEIGHTED_CPU && !stream->agc_weighted_workspace) ||
+        (requested == AGC_MODE_HISTOGRAM_P1_P99_CPU && !stream->agc_histogram_p1_p99_workspace) ||
+        (requested == AGC_MODE_FIELDSCALE_CPU && !stream->agc_fieldscale_horizontal_workspace)) {
+        printf("AGC switch unavailable: workspace missing; runtime unchanged\n");
+        return;
+    }
     if (!g_agc_baseline_valid) {
         printf("AGC switch unavailable: baseline ISP tone was not captured\n");
         return;
     }
     target = g_agc_baseline_tone;
     if (requested == AGC_MODE_HISTOGRAM_P1_P99_CPU ||
-        requested == AGC_MODE_FIELDSCALE_CPU) target.tone.enable = 0;
+        requested == AGC_MODE_FIELDSCALE_CPU ||
+        requested == AGC_MODE_WEIGHTED_CPU) target.tone.enable = 0;
     if (vendor_isp_set_iq(IQT_ITEM_TONE_PARAM, &target) != HD_OK) {
         printf("AGC switch failed: ISP tone update failed; runtime unchanged\n");
         return;
@@ -3546,8 +3698,80 @@ static void liveview_apply_agc_request(VIDEO_LIVEVIEW *stream)
     agc_histogram_p1_p99_state_reset(
         &stream->agc_histogram_p1_p99_state);
     agc_fieldscale_state_reset(&stream->agc_fieldscale_state);
+    agc_weighted_state_reset(stream->agc_weighted_workspace);
     agc_mode_set((AGC_MODE)requested);
     printf("AGC applied: %s\n", agc_mode_name((AGC_MODE)requested));
+}
+
+/* Each RAW input must complete before a new input or AGC/tone switch.
+ * Fixed correction/AGC buffers must remain immutable until RAWALL has
+ * produced this input's output. Register before push to avoid losing an
+ * output that arrives before the nonblocking push returns. */
+static void raw_input_begin(VIDEO_LIVEVIEW *stream, const HD_VIDEO_FRAME *input)
+{
+	pthread_mutex_lock(&g_raw_input_lock);
+	stream->raw_input_timestamp = input->timestamp;
+	stream->raw_input_count = input->count;
+	stream->raw_input_submit_us = liveview_get_time_us();
+	stream->raw_input_pending = 1;
+	pthread_mutex_unlock(&g_raw_input_lock);
+}
+
+static void raw_input_cancel(VIDEO_LIVEVIEW *stream)
+{
+	pthread_mutex_lock(&g_raw_input_lock);
+	stream->raw_input_pending = 0;
+	pthread_cond_broadcast(&g_raw_input_cond);
+	pthread_mutex_unlock(&g_raw_input_lock);
+}
+
+static void raw_input_complete(VIDEO_LIVEVIEW *stream, const HD_VIDEO_FRAME *output)
+{
+	pthread_mutex_lock(&g_raw_input_lock);
+	if (stream->raw_input_pending &&
+	    ((stream->raw_input_timestamp != 0 && output->timestamp == stream->raw_input_timestamp) ||
+	     (stream->raw_input_timestamp == 0 && stream->raw_input_count != 0 &&
+	      output->count == stream->raw_input_count))) {
+		UINT64 now = liveview_get_time_us();
+		UINT64 elapsed = now >= stream->raw_input_submit_us ? now - stream->raw_input_submit_us : 0;
+		if (elapsed > stream->raw_input_max_wait_us) stream->raw_input_max_wait_us = elapsed;
+		stream->raw_input_completed++;
+		stream->raw_input_pending = 0;
+		pthread_cond_broadcast(&g_raw_input_cond);
+	}
+	pthread_mutex_unlock(&g_raw_input_lock);
+}
+
+static HD_RESULT raw_input_wait(VIDEO_LIVEVIEW *stream)
+{
+	struct timespec deadline;
+	HD_RESULT ret = HD_OK;
+	int wait_ret = 0;
+	UINT64 completed, timeouts, max_wait, pts, count;
+	if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return HD_ERR_NG;
+	deadline.tv_nsec += 500000000L;
+	if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+	pthread_mutex_lock(&g_raw_input_lock);
+	while (stream->raw_input_pending && !stream->cap_exit && wait_ret == 0)
+		wait_ret = pthread_cond_timedwait(&g_raw_input_cond, &g_raw_input_lock, &deadline);
+	if (stream->raw_input_pending) {
+		ret = HD_ERR_NG;
+		if (!stream->cap_exit) stream->raw_input_timeouts++;
+	}
+	completed = stream->raw_input_completed;
+	timeouts = stream->raw_input_timeouts;
+	max_wait = stream->raw_input_max_wait_us;
+	pts = stream->raw_input_timestamp;
+	count = stream->raw_input_count;
+	pthread_mutex_unlock(&g_raw_input_lock);
+	if ((ret != HD_OK && !stream->cap_exit) ||
+	    (FRAME_DIAGNOSTICS_ENABLED && (completed == 1 || completed % 300U == 0)))
+		printf("RAW_INPUT_SYNC %s count=%llu pts=%llu completed=%llu wait_error=%llu max_wait_us=%llu\n",
+			ret == HD_OK ? "ok" : "incomplete",
+			(unsigned long long)count, (unsigned long long)pts,
+			(unsigned long long)completed, (unsigned long long)timeouts,
+			(unsigned long long)max_wait);
+	return ret;
 }
 
 static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
@@ -3585,8 +3809,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	HD_RESULT ret;
 	HD_RESULT push_ret;
 
-	ret = hd_videocap_pull_out_buf(
-		p_stream0->cap_path, &vcap_video_frame, 100);
+	ret = liveview_cap_pull(p_stream0, &vcap_video_frame, 100);
 	if (ret != HD_OK) {
 		if (ret != HD_ERR_UNDERRUN) {
 			printf("cap_pull error=%d !!\r\n\r\n", ret);
@@ -3793,6 +4016,28 @@ after_corrections:
 		}
 	}
 
+	if (!isp_step_test_requested && agc_weighted_is_enabled()) {
+        agc_start_ms = liveview_get_time_ms();
+        agc_status = liveview_apply_agc_weighted(p_stream0, current_frame,
+            &agc_histogram_p1_p99_video_frame);
+        agc_elapsed_ms = liveview_get_time_ms() - agc_start_ms;
+        if (agc_status == 0) {
+            p_stream0->agc_weighted_frame_count++;
+            if (FRAME_DIAGNOSTICS_ENABLED &&
+                (p_stream0->agc_weighted_frame_count == 1U || p_stream0->agc_weighted_frame_count % 300U == 0))
+                printf("Weighted Mapping AGC (CPU): frame=%u, grid=1x1, elapsed=%llu ms\n",
+                    p_stream0->agc_weighted_frame_count, (unsigned long long)agc_elapsed_ms);
+            current_frame = &agc_histogram_p1_p99_video_frame;
+            current_frame_is_vcap = 0;
+            snapshot_agc_output_frame = current_frame;
+            snapshot_has_agc_output = 1;
+        } else {
+            p_stream0->agc_weighted_error_count++;
+            if (p_stream0->agc_weighted_error_count == 1U)
+                printf("Weighted Mapping AGC bypass: error=%d\n", agc_status);
+        }
+    }
+
 	if (!isp_step_test_requested && agc_fieldscale_is_enabled()) {
 		agc_start_ms = liveview_get_time_ms();
 		agc_status = liveview_apply_agc_fieldscale(
@@ -3887,8 +4132,7 @@ after_corrections:
 
 	/* A processed frame no longer depends on the held VCAP buffer. */
 	if (!current_frame_is_vcap) {
-		ret = hd_videocap_release_out_buf(
-			p_stream0->cap_path, &vcap_video_frame);
+		ret = liveview_cap_release(p_stream0, &vcap_video_frame);
 		if (ret != HD_OK) {
 			printf("cap_release error=%d !!\r\n\r\n", ret);
 			if (isp_step_test_requested) {
@@ -3909,13 +4153,18 @@ after_corrections:
 			current_frame->timestamp,
 			current_frame->count);
 	}
+	/* Track every input, including direct VCAP, so the next AGC/tone
+	 * change cannot affect a previous RAWALL input still in flight. */
+	raw_input_begin(p_stream0, current_frame);
 	push_ret = hd_videoproc_push_in_buf(
 		p_stream0->proc_path, current_frame, NULL, 0);
+	if (push_ret == HD_OK)
+		frame_trace_sample(&p_stream0->rawall_input_trace, "RAWALL_IN",
+			current_frame->count, current_frame->timestamp);
 
 	/* Direct VCAP routing must push before releasing the source buffer. */
 	if (current_frame_is_vcap) {
-		ret = hd_videocap_release_out_buf(
-			p_stream0->cap_path, &vcap_video_frame);
+		ret = liveview_cap_release(p_stream0, &vcap_video_frame);
 		if (ret != HD_OK) {
 			printf("cap_release error=%d !!\r\n\r\n", ret);
 			return;
@@ -3923,9 +4172,18 @@ after_corrections:
 	}
 
 	if (push_ret != HD_OK) {
+		raw_input_cancel(p_stream0);
 		printf("proc_push error=%d !!\r\n\r\n", push_ret);
 		if (isp_step_test_requested) {
 			liveview_finish_isp_step_test(-1);
+		}
+		return;
+	}
+	if (raw_input_wait(p_stream0) != HD_OK) {
+		if (!p_stream0->cap_exit) {
+			printf("RAWALL input completion not confirmed; stopping before next RAW input or AGC switch\n");
+			p_stream0->cap_exit = p_stream0->proc_exit = 1;
+			liveview_request_fault_stop(p_stream0, 0);
 		}
 		return;
 	}
@@ -3940,8 +4198,7 @@ release_vcap_frame:
 	if (correction_lock_held) {
 		pthread_mutex_unlock(&g_manual_calibration_lock);
 	}
-	ret = hd_videocap_release_out_buf(
-		p_stream0->cap_path, &vcap_video_frame);
+	ret = liveview_cap_release(p_stream0, &vcap_video_frame);
 	if (ret != HD_OK) {
 		printf("cap_release error=%d !!\r\n\r\n", ret);
 	}
@@ -3956,20 +4213,20 @@ static int raw_recording_settle_bpr(VIDEO_LIVEVIEW *stream)
 	UINT32 i, tries;
 	for (i = 0; i < 64U; i++) {
 		if (stream->cap_exit) return -1;
-		ret = hd_videocap_pull_out_buf(stream->cap_path, &frame, 0);
+		ret = liveview_cap_pull(stream, &frame, 0);
 		if (ret == HD_ERR_UNDERRUN) break;
 		if (ret != HD_OK) return -1;
-		if (hd_videocap_release_out_buf(stream->cap_path, &frame) != HD_OK) return -1;
+		if (liveview_cap_release(stream, &frame) != HD_OK) return -1;
 	}
 	if (i == 64U) return -1;
 	for (i = 0; i < 4U; i++) {
 		for (tries = 0; tries < 20U; tries++) {
 			if (stream->cap_exit) return -1;
-			ret = hd_videocap_pull_out_buf(stream->cap_path, &frame, 100);
+			ret = liveview_cap_pull(stream, &frame, 100);
 			if (ret != HD_ERR_UNDERRUN) break;
 		}
 		if (ret != HD_OK) return -1;
-		if (hd_videocap_release_out_buf(stream->cap_path, &frame) != HD_OK) return -1;
+		if (liveview_cap_release(stream, &frame) != HD_OK) return -1;
 	}
 	return 0;
 }
@@ -4128,13 +4385,16 @@ static void *yuv_statistics_thread(void *arg)
 		usleep(100);
 	}
 	while (p_stream0->proc_exit == 0) {
-		ret = hd_videoproc_pull_out_buf(
-			p_stream0->proc_path, &proc_frame, 100);
+		ret = frame_lease_pull(&p_stream0->proc_lease,
+			hd_videoproc_pull_out_buf, p_stream0->proc_path, &proc_frame, 100);
 		if (ret == HD_OK) {
 			HD_VIDEO_FRAME mirrored = {0};
 			HD_VIDEO_FRAME *display = &proc_frame;
 			int have_mirror = 0;
 			int display_ok = 1;
+			raw_input_complete(p_stream0, &proc_frame);
+			frame_trace_sample(&p_stream0->rawall_output_trace, "RAWALL_OUT",
+				proc_frame.count, proc_frame.timestamp);
 
 			/* Inspect OUT_0 before display processing; no extra output path. */
 			process_requested_isp_step_test_output(p_stream0, &proc_frame);
@@ -4144,14 +4404,18 @@ static void *yuv_statistics_thread(void *arg)
 				if (ret != HD_OK) {
 					printf("VPE mirror process failed=%d; stopping display worker\n", ret);
 					if (vpe_mirror_input_pending()) {
-						p_stream0->vpe_held_input = proc_frame;
 						p_stream0->vpe_input_held = 1;
 					} else {
-						hd_videoproc_release_out_buf(p_stream0->proc_path, &proc_frame);
+						liveview_proc_release(p_stream0);
 					}
+					p_stream0->cap_exit = 1;
+					p_stream0->proc_exit = 1;
+					liveview_request_fault_stop(p_stream0, 0);
 					break;
 				}
 				display = &mirrored;
+				frame_trace_sample(&p_stream0->vpe_output_trace, "VPE_OUT",
+					mirrored.count, mirrored.timestamp);
 				have_mirror = 1;
 			}
 			if (clahe_process_frame(display) != 0) {
@@ -4168,13 +4432,21 @@ static void *yuv_statistics_thread(void *arg)
 			}
 			if (display_ok) {
 				ret = video_output_push_frame(&p_stream0->video_output, display);
-				if (ret != HD_OK) printf("videoenc push error=%d\n", ret);
+				if (ret != HD_OK) {
+					printf("videoenc push error=%d; stopping pipeline\n", ret);
+					p_stream0->cap_exit = p_stream0->proc_exit = 1;
+					liveview_request_fault_stop(p_stream0, 0);
+				}
 			}
 			if (have_mirror) {
 				ret = vpe_mirror_release(&mirrored);
-				if (ret != HD_OK) printf("VPE output release failed=%d\n", ret);
+				if (ret != HD_OK) {
+					printf("VPE output release failed=%d; retaining output\n", ret);
+					p_stream0->cap_exit = p_stream0->proc_exit = 1;
+					liveview_request_fault_stop(p_stream0, 0);
+				}
 			}
-			ret = hd_videoproc_release_out_buf(p_stream0->proc_path, &proc_frame);
+			ret = liveview_proc_release(p_stream0);
 			if (ret != HD_OK) printf("proc_release error=%d\n", ret);
 		} else if (ret != HD_ERR_UNDERRUN && ret != HD_ERR_TIMEDOUT) {
 			printf("proc_pull error=%d !!\r\n\r\n", ret);
@@ -4229,6 +4501,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	ctx->mem_inited = 1;
 
 	// init all modules
+	ctx->modules_inited = 1; /* Includes partial initialization for Stop retry. */
 	ret = init_module();
 	if (ret != HD_OK) {
 		printf("init fail=%d\n", ret);
@@ -4332,6 +4605,15 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	if (ret != 0) {
 		printf("apply CFG settings failed; check the messages above\n");
 	}
+    /* Reserve all AGC workspaces so switching never reallocates or restarts UVC. */
+    {
+        stream[0].agc_weighted_workspace = (AGC_WEIGHTED_WORKSPACE *)calloc(1, sizeof(AGC_WEIGHTED_WORKSPACE));
+        if (!stream[0].agc_weighted_workspace) {
+            printf("allocate Weighted Mapping workspace failed\n");
+            ret = HD_ERR_NG;
+            goto exit;
+        }
+    }
 	// open video_liveview modules (main)
 	stream[0].proc_max_dim.w = VDO_SIZE_W; //assign by user
 	stream[0].proc_max_dim.h = VDO_SIZE_H; //assign by user
@@ -4481,6 +4763,8 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	stream[0].proc_enter = 1;
 
 	ctx->running = 1;
+	if (FRAME_DIAGNOSTICS_ENABLED)
+		printf("RAW_INPUT_SYNC enabled: processed RAW waits for matching RAWALL output (500 ms limit)\n");
 	printf("Thermal %s liveview started.\n",
 		video_output_mode_name(g_output_mode));
 	return 0;
@@ -4502,9 +4786,13 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 	minute_raw_stop(&g_minute_raw, "Liveview stopped");
 	pthread_mutex_unlock(&g_snapshot_writer.lock);
 	g_diagnostic_video_output = NULL;
+	ctx->running = 0; /* Incomplete cleanup must block Start, not look running. */
 	/* Wake threads that may still be waiting for the pipeline to start. */
 	stream[0].cap_exit = 1;
 	stream[0].proc_exit = 1;
+	pthread_mutex_lock(&g_raw_input_lock);
+	pthread_cond_broadcast(&g_raw_input_cond);
+	pthread_mutex_unlock(&g_raw_input_lock);
 	liveview_finish_isp_step_test(-1);
 
 	if (ctx->cap_thread_created) {
@@ -4525,6 +4813,8 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		ctx->proc_thread_created = 0;
 		stream[0].proc_thread_id = 0;
 	}
+	ret = video_output_stop(&stream[0].video_output);
+	if (ret != HD_OK) { printf("video output stop failed=%d; retry Stop\n", ret); return; }
 	clahe_frame_release();
 	dde_frame_release();
 	ret = vpe_mirror_stop();
@@ -4533,13 +4823,23 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 		return;
 	}
 	if (stream[0].vpe_input_held) {
-		ret = hd_videoproc_release_out_buf(stream[0].proc_path,
-			&stream[0].vpe_held_input);
+		ret = frame_lease_release(&stream[0].proc_lease,
+			hd_videoproc_release_out_buf, stream[0].proc_path);
 		if (ret != HD_OK) {
 			printf("VPE retained source release failed=%d\n", ret);
 			return;
 		}
 		stream[0].vpe_input_held = 0;
+	}
+	ret = frame_lease_release(&stream[0].proc_lease,
+		hd_videoproc_release_out_buf, stream[0].proc_path);
+	if (ret != HD_OK) { frame_lease_report("RAWALL retained frame", &stream[0].proc_lease); return; }
+	ret = frame_lease_release(&stream[0].cap_lease,
+		hd_videocap_release_out_buf, stream[0].cap_path);
+	if (ret != HD_OK) { frame_lease_report("VCAP retained frame", &stream[0].cap_lease); return; }
+	if (FRAME_DIAGNOSTICS_ENABLED) {
+		frame_lease_report("VCAP", &stream[0].cap_lease);
+		frame_lease_report("RAWALL", &stream[0].proc_lease);
 	}
 	if (ctx->pseudo_started) {
 		ret = Pseudo_Uninit();
@@ -4554,32 +4854,30 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 	raw_recording_service_bpr(&stream[0]);
 
 
-	ret = video_output_stop(&stream[0].video_output);
-	if (ret != HD_OK) printf("video output stop failed=%d\n", ret);
 
 	if (ctx->cap_started) {
 		ret = hd_videocap_stop(stream[0].cap_path);
-		if (ret != HD_OK) printf("videocap stop failed=%d\n", ret);
+		if (ret != HD_OK) { printf("videocap cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->cap_started = 0;
 	}
 	if (ctx->proc_started) {
 		ret = hd_videoproc_stop(stream[0].proc_path);
-		if (ret != HD_OK) printf("videoproc stop failed=%d\n", ret);
+		if (ret != HD_OK) { printf("videoproc cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->proc_started = 0;
 	}
 	if (ctx->proc_3dnr_started) {
 		ret = hd_videoproc_stop(stream[0].proc_path_3dnr);
-		if (ret != HD_OK) printf("videoproc 3DNR stop failed=%d\n", ret);
+		if (ret != HD_OK) { printf("videoproc 3DNR cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->proc_3dnr_started = 0;
 	}
 	if (ctx->proc_bound) {
 		ret = hd_videoproc_unbind(HD_VIDEOPROC_0_OUT_0);
-		if (ret != HD_OK) printf("video output unbind failed=%d\n", ret);
+		if (ret != HD_OK) { printf("video output unbind cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->proc_bound = 0;
 	}
 	if (ctx->module_open_attempted) {
 		ret = close_module(&stream[0]);
-		if (ret != HD_OK) printf("close module failed=%d\n", ret);
+		if (ret != HD_OK) { printf("close module cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->module_open_attempted = 0;
 	}
 
@@ -4606,36 +4904,37 @@ static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx)
 
 	if (ctx->thermal_frame_created) {
 		ret = exit_thermal_frame(&stream[0]);
-		if (ret != HD_OK) printf("exit thermal frame fail=%d\n", ret);
+		if (ret != HD_OK) { printf("exit thermal frame cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->thermal_frame_created = 0;
 	}
 	ret = exit_TDC_mem();
 	if (ret != HD_OK) {
 		printf("exit TDC mem fail=%d\n", ret);
+		return;
 	}
 	tdc_bind_runtime(NULL);
 
 	if (ctx->modules_inited) {
 		ret = exit_module();
-		if (ret != HD_OK) printf("exit module failed=%d\n", ret);
+		if (ret != HD_OK) { printf("exit module cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->modules_inited = 0;
 	}
 
 	if (ctx->isp_inited) {
 		ret = vendor_isp_uninit();
-		if (ret != HD_OK) printf("vendor_isp_uninit failed=%d\n", ret);
+		if (ret != HD_OK) { printf("vendor_isp_uninit cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->isp_inited = 0;
 	}
 
 	if (ctx->mem_inited) {
 		ret = mem_exit();
-		if (ret != HD_OK) printf("mem exit failed=%d\n", ret);
+		if (ret != HD_OK) { printf("mem exit cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->mem_inited = 0;
 	}
 
 	if (ctx->common_inited) {
 		ret = hd_common_uninit();
-		if (ret != HD_OK) printf("common uninit failed=%d\n", ret);
+		if (ret != HD_OK) { printf("common uninit cleanup failed=%d; retry Stop\n", ret); return; }
 		ctx->common_inited = 0;
 	}
 
@@ -4684,7 +4983,7 @@ int liveview_start(void)
 		goto exit;
 	}
 
-	if (g_liveview.mem_inited) {
+	if (g_liveview.mem_inited || g_liveview.common_inited) {
 		printf("Previous pipeline cleanup incomplete; retry Stop first\n");
 		ret = -1;
 		goto exit;
@@ -4720,7 +5019,7 @@ int liveview_restart(void)
 	}
 
 	liveview_stop_pipeline(&g_liveview);
-	if (g_liveview.mem_inited) {
+	if (g_liveview.mem_inited || g_liveview.common_inited) {
 		printf("Previous pipeline cleanup incomplete; retry Stop first\n");
 		ret = -1;
 		goto exit;
@@ -4730,6 +5029,22 @@ int liveview_restart(void)
 exit:
 	pthread_mutex_unlock(&g_liveview_lifecycle_lock);
 	return ret;
+}
+
+int liveview_switch_agc(int mode)
+{
+    int ret = -1;
+    if (mode < AGC_MODE_OFF || mode > AGC_MODE_WEIGHTED_CPU) return -1;
+    pthread_mutex_lock(&g_liveview_lifecycle_lock);
+    if (!g_liveview.initialized || liveview_stop_is_requested()) goto exit;
+    if (!g_liveview.running) {
+        ret = agc_mode_set((AGC_MODE)mode);
+        goto exit;
+    }
+    ret = agc_mode_request((AGC_MODE)mode);
+exit:
+    pthread_mutex_unlock(&g_liveview_lifecycle_lock);
+    return ret;
 }
 
 int liveview_is_running(void)
@@ -5209,8 +5524,8 @@ static void raw_recording_toggle(int type, int frame_count)
 		goto done;
 	}
 	if (type < 0 || type > 3 || frame_count <= 0) goto done;
-	if (type == 2 && !agc_histogram_p1_p99_is_enabled() && !agc_fieldscale_is_enabled()) {
-		printf("AGC output RAW requires Histogram P1/P99 or Fieldscale AGC\n");
+	if (type == 2 && !agc_histogram_p1_p99_is_enabled() && !agc_fieldscale_is_enabled() && !agc_weighted_is_enabled()) {
+		printf("AGC output RAW requires Histogram P1/P99, Fieldscale or Weighted Mapping AGC\n");
 		goto done;
 	}
 #if defined(__LINUX)

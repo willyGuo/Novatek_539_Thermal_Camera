@@ -123,7 +123,7 @@ HD_RESULT video_output_close(VIDEO_OUTPUT *output)
 		break;
 	}
 
-	memset(output, 0, sizeof(*output));
+	if (ret == HD_OK) memset(output, 0, sizeof(*output));
 	return ret;
 }
 
@@ -139,6 +139,7 @@ HD_RESULT video_output_push_frame(VIDEO_OUTPUT *output,
 	switch (output->mode) {
 	case VIDEO_OUTPUT_MODE_UVC:
 		enc_path = output->backend.uvc.enc_path;
+		if (output->backend.uvc.failed) return HD_ERR_NG;
 		break;
 	case VIDEO_OUTPUT_MODE_RTSP:
 		enc_path = output->backend.rtsp.enc_path;
@@ -147,7 +148,12 @@ HD_RESULT video_output_push_frame(VIDEO_OUTPUT *output,
 		return HD_ERR_NG;
 	}
 
-	return hd_videoenc_push_in_buf(enc_path, frame, NULL, 100);
+	{
+		HD_RESULT ret = hd_videoenc_push_in_buf(enc_path, frame, NULL, 100);
+		if (ret == HD_OK)
+			frame_trace_sample(&output->encoder_input_trace, "ENC_IN", frame->count, frame->timestamp);
+		return ret;
+	}
 }
 
 HD_RESULT video_output_request_encoded_snapshot(VIDEO_OUTPUT *output,
