@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #endif
 #include "tdc.h"
+#include "../../Config/hardware_config.h"
 #include <inttypes.h>
 #include "../../Device/SensorTemp/sensor_temp.h"
 #include "vendor_gfx.h"
@@ -209,6 +210,12 @@ int tdc_menu_run(void)
 	int running = 1;
 	int ret = 0;
 
+	if (!THERMAL_HAS_TEMPERATURE) {
+		printf("TDC unavailable: %s temperature interface is not implemented\n",
+			THERMAL_SENSOR_NAME);
+		return -1;
+	}
+
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("TDC menu\n");
@@ -281,6 +288,12 @@ void tdc_bind_capture_callback(TDC_CAPTURE_RAW_CB capture_raw)
 
 void tdc_set_enabled(int enable)
 {
+	if (enable && !THERMAL_HAS_TEMPERATURE) {
+		g_tdc_enabled = 0;
+		printf("TDC unavailable: %s temperature interface is not implemented; keep TDC off\n",
+			THERMAL_SENSOR_NAME);
+		return;
+	}
 	if (enable && !tdc_table_is_loaded()) {
 		tdc_disable_for_missing_table();
 		return;
@@ -689,6 +702,12 @@ HD_RESULT init_thermal_TDC_mem(void)
 	g_tdc_enabled = 0;
 	g_tdc_sensor_table_loaded = 0;
 	g_tdc_lens_table_loaded = 0;
+
+	if (!THERMAL_HAS_TEMPERATURE) {
+		printf("Skip TDC memory/tables: %s temperature interface is not implemented\n",
+			THERMAL_SENSOR_NAME);
+		return HD_OK;
+	}
 
 	printf("TDC slope table size=%u, correction table size=%u\n",
 	       slope_table_size, correction_table_size);

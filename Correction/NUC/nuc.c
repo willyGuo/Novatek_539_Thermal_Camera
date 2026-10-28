@@ -15,6 +15,7 @@
 #endif
 
 #include "../../Config/app_config.h"
+#include "../../Config/hardware_config.h"
 #include "../../Pipeline/liveview.h"
 #include "../BPR/bpr.h"
 #include "../../Device/SensorTemp/sensor_temp.h"
@@ -691,9 +692,14 @@ static int nuc_wait_sensor_temp_point(UINT32 point)
 {
 	char buf[16];
 
-	printf("\nSensor temperature calibration point %u (capture once).\n",
-	       point + 1);
-	printf("Set and stabilize the sensor temperature, then press Enter.\n");
+	if (THERMAL_HAS_TEMPERATURE) {
+		printf("\nSensor temperature calibration point %u (capture once).\n",
+		       point + 1);
+		printf("Set and stabilize the sensor temperature, then press Enter.\n");
+	} else {
+		printf("\nFixed two-point NUC calibration for %s.\n", THERMAL_SENSOR_NAME);
+		printf("Keep the camera thermally stable, then press Enter.\n");
+	}
 	printf(">> ");
 	if (fgets(buf, sizeof(buf), stdin) == 0) {
 		return -1;
@@ -1044,14 +1050,19 @@ static int nuc_commit_staged_sensor_temp_tables(const float *temperatures)
 		nuc_sync_table_dir(NUC_SENSOR_TEMP_DIR);
 	}
 
-	if (app_config_update_sensor_temp_points(
+	/* Fixed-table profiles have no measured temperatures. Preserve existing
+	 * CFG metadata instead of storing invented values as sensor readings.
+	 */
+	if (temperatures != NULL && app_config_update_sensor_temp_points(
 		    temperatures, NUC_FIVE_POINT_COUNT) != 0) {
 		printf("save Sensor Temperature points to tiffany_thermal.cfg fail\n");
 		goto rollback;
 	}
 
-	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
-		g_nuc.sensor_temp_points[point] = temperatures[point];
+	if (temperatures != NULL) {
+		for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
+			g_nuc.sensor_temp_points[point] = temperatures[point];
+		}
 	}
 	for (i = 0; i < file_count; i++) {
 		if (files[i].had_original &&
@@ -1831,8 +1842,11 @@ int nuc_reload_table(void)
 
 	g_nuc.sensor_table_dir = source_dir;
 	g_nuc.sensor_table_shift = source_shift;
-	if (!nuc_sensor_temp_points_are_ready()) {
-		printf("NUC Sensor Temperature points are not ready, load point 1\n");
+	if (!THERMAL_HAS_TEMPERATURE || !nuc_sensor_temp_points_are_ready()) {
+		if (!THERMAL_HAS_TEMPERATURE)
+			printf("%s temperature unavailable, load fixed NUC point 1\n", THERMAL_SENSOR_NAME);
+		else
+			printf("NUC Sensor Temperature points are not ready, load point 1\n");
 		ret = nuc_load_sensor_temp_table(0, 1);
 	} else {
 		g_nuc.sensor_temp_table_point = -1;
@@ -1854,6 +1868,11 @@ static int nuc_update_sensor_temp_table_internal(int verbose)
 {
 	float temp_c;
 	UINT32 point;
+
+	/* A profile without temperature feedback keeps the explicitly loaded point 1.
+	 * Blackbody dynamic NUC selects per pixel and does not need this interface.
+	 */
+	if (!THERMAL_HAS_TEMPERATURE) return 0;
 
 	if (g_nuc.blackbody_dynamic_enabled) {
 		return 0;
@@ -1978,12 +1997,17 @@ int nuc_five_point_sensor_temp_calibration(void)
 	if (nuc_wait_sensor_temp_point(0) != 0) {
 		goto exit;
 	}
-	if (sensor_temp_read(&temperatures[0]) != 0) {
-		printf("read sensor temperature point 1 fail\n");
-		goto exit;
+	if (THERMAL_HAS_TEMPERATURE) {
+		if (sensor_temp_read(&temperatures[0]) != 0) {
+			printf("read sensor temperature point 1 fail\n");
+			goto exit;
+		}
+		printf("Sensor temperature = %.4f C (same value saved for points 1-5)\n",
+		       temperatures[0]);
+	} else {
+		printf("%s temperature unavailable: calibrate fixed K/B without temperature metadata; runtime uses point 1.\n",
+		       THERMAL_SENSOR_NAME);
 	}
-	printf("Sensor temperature = %.4f C (same value saved for points 1-5)\n",
-	       temperatures[0]);
 
 	/* Label both captures with the BPR setting at acquisition start. */
 	bpr_threshold = bpr_get_threshold();
@@ -2008,18 +2032,20 @@ int nuc_five_point_sensor_temp_calibration(void)
 	 * Equal sensor temperatures intentionally use the existing point-1 fallback.
 	 */
 	for (point = 0; point < NUC_FIVE_POINT_COUNT; point++) {
-		temperatures[point] = temperatures[0];
+		if (THERMAL_HAS_TEMPERATURE) temperatures[point] = temperatures[0];
 		if (nuc_stage_sensor_temp_table(point) != 0) {
 			goto exit;
 		}
 	}
 
-	if (nuc_commit_staged_sensor_temp_tables(temperatures) != 0) {
+	if (nuc_commit_staged_sensor_temp_tables(
+		    THERMAL_HAS_TEMPERATURE ? temperatures : NULL) != 0) {
 		printf("commit Sensor Temperature NUC tables fail\n");
 		goto exit;
 	}
 
-	printf("Sensor Temperature NUC calibration done: identical K/B saved to points 1-5\n");
+	printf("%s NUC calibration done: identical K/B saved to points 1-5\n",
+	       THERMAL_HAS_TEMPERATURE ? "Sensor Temperature" : "Fixed two-point");
 	ret = 0;
 
 exit:
@@ -2231,17 +2257,23 @@ int nuc_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("NUC menu\n");
-		printf(" 1. Sensor Temperature NUC calibration (capture once, copy to 5 points)\n");
+		if (THERMAL_HAS_TEMPERATURE)
+			printf(" 1. Sensor Temperature NUC calibration (capture once, copy to 5 points)\n");
+		else
+			printf(" 1. Two-point NUC calibration (fixed K/B, copy to 5 points)\n");
 		printf(" 2. 5 point Blackbody Temperature NUC calibration (save RAW/K/B)\n");
 		printf(" 3. Toggle per-pixel Blackbody Dynamic NUC\n");
-		printf(" 4. Reload Sensor Temperature K/B table\n");
+		printf(" 4. Reload %s K/B table\n",
+		       THERMAL_HAS_TEMPERATURE ? "Sensor Temperature" : "fixed point 1");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
-		printf("runtime: NUC=%s, table mode=%s, Sensor Temperature interval=%u sec\n",
+		printf("runtime: NUC=%s, table mode=%s",
 		       g_nuc.enabled ? "on" : "off",
-		       g_nuc.blackbody_dynamic_enabled ?
-			"Blackbody Dynamic" : "Sensor Temperature",
-		       g_nuc_sensor_temp_interval_sec);
+		       g_nuc.blackbody_dynamic_enabled ? "Blackbody Dynamic" :
+			(THERMAL_HAS_TEMPERATURE ? "Sensor Temperature" : "Fixed point 1"));
+		if (THERMAL_HAS_TEMPERATURE)
+			printf(", Sensor Temperature interval=%u sec", g_nuc_sensor_temp_interval_sec);
+		printf("\n");
 		printf("Settings: CFG Setting -> NUC setting\n");
 
 		option = nuc_read_option();

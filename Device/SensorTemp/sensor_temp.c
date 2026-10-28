@@ -1,7 +1,9 @@
 #include "sensor_temp.h"
+#include "../../Config/hardware_config.h"
 
 #include <stdint.h>
 
+#if THERMAL_HAS_TEMPERATURE
 #include "../../Driver/SPI/spi.h"
 #include "../../Driver/I2C/i2c.h"
 
@@ -70,3 +72,19 @@ int lens_temp_read(float *temp_c)
 
 	return 0;
 }
+#else
+/* No ATTO temperature protocol is supplied. Do not read TY640 peripherals or
+ * fabricate a temperature; recording callers already mark failed reads.
+ */
+int sensor_temp_read(float *temp_c)
+{
+	(void)temp_c;
+	return -1;
+}
+
+int lens_temp_read(float *temp_c)
+{
+	(void)temp_c;
+	return -1;
+}
+#endif

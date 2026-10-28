@@ -1,4 +1,5 @@
 #include "fos.h"
+#include "../../Config/hardware_config.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -221,6 +222,11 @@ int fos_adjust_once(void)
 	int calibration_active = 0;
 	int ret = -1;
 
+	if (!THERMAL_HAS_FOS) {
+		printf("FOS unavailable: %s has no TY640 FOS interface\n", THERMAL_SENSOR_NAME);
+		return -1;
+	}
+
 	g_fos.request_count++;
 	g_fos.last_result = -1;
 	g_fos.last_result_valid = 0;
@@ -336,6 +342,10 @@ int fos_menu_run(void)
 	int option;
 	int running = 1;
 
+	if (!THERMAL_HAS_FOS) {
+		printf("FOS unavailable: %s has no TY640 FOS interface\n", THERMAL_SENSOR_NAME);
+		return -1;
+	}
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("FOS menu\n");

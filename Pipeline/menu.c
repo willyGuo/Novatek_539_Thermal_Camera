@@ -9,6 +9,7 @@
 #include "../Correction/NUC/nuc.h"
 #include "../Correction/TDC/tdc.h"
 #include "../Config/app_config.h"
+#include "../Config/hardware_config.h"
 #include "../Device/FOS/fos.h"
 #include "../Enhancement/AGC/agc_mode.h"
 #include "../ISP/menu.h"
@@ -60,14 +61,16 @@ int menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("Tiffany Thermal Firmware %s\n", app_get_version());
+		printf("Sensor: %s (%ux%u)\n", THERMAL_SENSOR_NAME,
+			(unsigned int)THERMAL_SENSOR_WIDTH, (unsigned int)THERMAL_SENSOR_HEIGHT);
 		printf(" 1. Liveview\n");
 		printf(" 2. CFG Setting\n");
 		printf(" 3. BPR\n");
 		printf(" 4. NUC\n");
 		printf(" 5. FFC\n");
-		printf(" 6. TDC\n");
+		printf(" 6. TDC%s\n", THERMAL_HAS_TEMPERATURE ? "" : " (temperature interface unavailable)");
 		printf(" 7. AGC\n");
-		printf(" 8. FOS\n");
+		printf(" 8. FOS%s\n", THERMAL_HAS_FOS ? "" : " (unavailable for this sensor)");
 		printf(" 9. ISP\n");
 		printf("10. Image Pipeline Diagnostics\n");
 		printf(" q. Quit\n");

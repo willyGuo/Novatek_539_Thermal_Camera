@@ -29,8 +29,10 @@ int agc_weighted_is_enabled(void);
 int agc_weighted_menu_run(void);
 void agc_weighted_state_reset(AGC_WEIGHTED_WORKSPACE *workspace);
 /* Toolkit native-DN -> rounded uint8 LUT, then expand Gray to RAW14 for ISP.
- * No allocation or automatic ACI/THL/THH. Workspace must start zeroed; temporal
- * smoothing blends LUTs before Gain Limit, never prior-frame image pixels. */
+ * Redistribution fills only originally populated bins, up to the Clip cap;
+ * excess without capacity is discarded. No allocation or automatic ACI/THL/THH.
+ * Workspace must start zeroed. LUT smoothing blends LUTs before Gain Limit.
+ * Input is preserved unless input == output. */
 int agc_weighted_apply_u14(const uint16_t *input, size_t input_stride,
     uint16_t *output, size_t output_stride, uint32_t width, uint32_t height,
     AGC_WEIGHTED_WORKSPACE *workspace, const AGC_WEIGHTED_PARAMS *params);

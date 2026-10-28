@@ -53,6 +53,7 @@ typedef struct {
 	unsigned int bpr_threshold;
 	int ffc_correction;
 	int ffc_startup_enable;
+	int ffc_shading_enable;
 	unsigned int shutter_interval_sec;
 	unsigned int shutter_close_wait_ms;
 	int tdc_correction;
@@ -200,6 +201,7 @@ static void cfg_initialize_from_runtime(void)
 	g_app_config.bpr_threshold = bpr_get_threshold();
 	g_app_config.ffc_correction = ffc_is_enabled();
 	g_app_config.ffc_startup_enable = ffc_is_startup_enabled();
+	g_app_config.ffc_shading_enable = ffc_is_shading_enabled();
 	g_app_config.shutter_interval_sec =
 		ffc_get_shutter_interval_sec();
 	g_app_config.shutter_close_wait_ms =
@@ -271,11 +273,11 @@ typedef struct {
 } WEIGHTED_CFG_ITEM;
 static const WEIGHTED_CFG_ITEM weighted_items[] = {
     {"agc_weighted_clip_limit", "Clip Limit (0 off)", offsetof(AGC_WEIGHTED_PARAMS, clip_tenths), 10, 1000},
-    {"agc_weighted_redistribute", "Redistribution (0 off, 1 on)", offsetof(AGC_WEIGHTED_PARAMS, redistribute), 1, 1},
+    {"agc_weighted_redistribute", "Redistribution (0 off, 1 populated bins)", offsetof(AGC_WEIGHTED_PARAMS, redistribute), 1, 1},
     {"agc_weighted_bright_weight", "Bright Weight (1 / 1.05 / 1.1..2.0)", offsetof(AGC_WEIGHTED_PARAMS, bright_weight_percent), 100, 200},
     {"agc_weighted_bright_percentile", "Bright Percentile (0..100)", offsetof(AGC_WEIGHTED_PARAMS, bright_percentile_tenths), 10, 1000},
     {"agc_weighted_gain_limit", "Gain Limit (0 off; 0.1..4.0 Gray/RAW DN)", offsetof(AGC_WEIGHTED_PARAMS, gain_limit_tenths), 10, 40},
-    {"agc_weighted_temporal_previous_percent", "Smooth (previous %, 0 off)", offsetof(AGC_WEIGHTED_PARAMS, temporal_previous_percent), 1, 99}
+    {"agc_weighted_temporal_previous_percent", "LUT Smooth (previous %, 0 off)", offsetof(AGC_WEIGHTED_PARAMS, temporal_previous_percent), 1, 99}
 };
 #define WEIGHTED_CFG_COUNT (sizeof(weighted_items) / sizeof(weighted_items[0]))
 static int cfg_weighted_index(const char *key)
@@ -427,6 +429,10 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 	} else if (strcmp(key, "ffc_correction") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->ffc_correction = int_value ? 1 : 0;
+	} else if (strcmp(key, "ffc_shading_enable") == 0) {
+		if (cfg_parse_long(value, &int_value) != 0 ||
+		    (int_value != 0 && int_value != 1)) return -1;
+		config->ffc_shading_enable = (int)int_value;
 	} else if (strcmp(key, "ffc_startup_enable") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0 ||
 		    (int_value != 0 && int_value != 1)) return -1;
@@ -553,6 +559,7 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	liveview_set_shutter_close_wait_ms(config->shutter_close_wait_ms);
 	ffc_set_enabled(config->ffc_correction);
 	ffc_set_startup_enabled(config->ffc_startup_enable);
+	ffc_set_shading_enabled(config->ffc_shading_enable);
 	tdc_set_interval_sec(config->tdc_interval_sec);
 	tdc_set_enabled(config->tdc_correction);
 	if (config->agc_histogram_p1_p99_enable +
@@ -663,6 +670,13 @@ int app_config_get_int(const char *key, int *value)
 
 	cfg_initialize_from_runtime();
     {
+        int i = cfg_weighted_index(key);
+        if (i >= 0 && weighted_items[i].scale == 1) {
+            *value = (int)*cfg_weighted_value(&g_app_config.weighted, (unsigned int)i);
+            return 0;
+        }
+    }
+    {
         int i = cfg_fieldscale_index(key);
         if (i >= 0) {
             *value = (int)*cfg_fieldscale_value(&g_app_config.fieldscale, (unsigned int)i);
@@ -704,6 +718,8 @@ int app_config_get_int(const char *key, int *value)
 		*value = (int)g_app_config.bpr_threshold;
 	} else if (strcmp(key, "ffc_correction") == 0) {
 		*value = g_app_config.ffc_correction;
+	} else if (strcmp(key, "ffc_shading_enable") == 0) {
+		*value = g_app_config.ffc_shading_enable;
 	} else if (strcmp(key, "ffc_startup_enable") == 0) {
 		*value = g_app_config.ffc_startup_enable;
 	} else if (strcmp(key, "shutter_interval_sec") == 0) {
@@ -771,6 +787,7 @@ int app_config_update_int(const char *key, int value)
 	snprintf(value_text, sizeof(value_text), "%d", value);
 	ret = cfg_store_pair(&g_app_config, key, value_text);
 	if (ret != 0 ||
+	    agc_weighted_validate_params(&g_app_config.weighted) != 0 ||
 	    agc_histogram_p1_p99_validate_params(&g_app_config.histogram_p1_p99) != 0) {
 		printf("invalid CFG setting %s=%s\n", key, value_text);
 		g_app_config = old_config;
@@ -790,6 +807,9 @@ int app_config_update_int(const char *key, int value)
         if (ret == 1) app_config_print_restart_required();
         else if (ret == 2) printf("FFC CFG saved; waiting for calibration to enable compensation\n");
         else printf("FFC compensation saved and applied immediately\n");
+    } else if (strcmp(key, "ffc_shading_enable") == 0) {
+        ffc_set_shading_enabled(g_app_config.ffc_shading_enable);
+        printf("FFC shading saved; applies on next FFC output (requires valid shading table and FFC on)\n");
     } else if (strcmp(key, "shutter_close_wait_ms") == 0) {
         ret = liveview_apply_shutter_close_wait_ms(g_app_config.shutter_close_wait_ms);
         if (ret < 0) return ret;
@@ -959,6 +979,11 @@ static int app_config_show_file(void)
 	printf("  4. %-31s = %d (%s)\n", "ffc_startup_enable",
 	       g_app_config.ffc_startup_enable,
 	       g_app_config.ffc_startup_enable ? "on" : "off");
+
+	printf("  5. %-31s = %d (%s), table=%s\n", "ffc_shading_enable",
+	       g_app_config.ffc_shading_enable,
+	       ffc_is_shading_enabled() ? "on" : "off",
+	       ffc_shading_is_ready() ? "ready" : "not ready");
 
 	printf("\n[NUC]\n");
 	printf("  1. %-31s = %d (%s)\n", "nuc_correction",
@@ -1250,6 +1275,12 @@ static int app_config_shutter_ffc_menu_run(void)
 		printf(" 2. FFC interval (0 = periodic off)\n");
 		printf(" 3. Shutter close wait time (next calibration)\n");
 		printf(" 4. FFC at startup on/off\n");
+		printf(" 5. Blackbody / shutter shading on/off (requires FFC)\n");
+		printf("    Shading pending=%s, requested=%s, applied=%s, table=%s\n",
+		       g_app_config.ffc_shading_enable ? "on" : "off",
+		       ffc_is_shading_enabled() ? "on" : "off",
+		       ffc_shading_is_active() ? "yes" : "no",
+		       ffc_shading_is_ready() ? "ready" : "not ready");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: FFC=%s, shutter interval=%u sec, close wait=%u ms\n",
@@ -1287,6 +1318,10 @@ static int app_config_shutter_ffc_menu_run(void)
 		case 4:
 			ret = app_config_prompt_bool("FFC at startup", "ffc_startup_enable",
 				g_app_config.ffc_startup_enable);
+			break;
+		case 5:
+			ret = app_config_prompt_bool("FFC shading", "ffc_shading_enable",
+				g_app_config.ffc_shading_enable);
 			break;
 		case 0:
 		case -1:
@@ -1593,7 +1628,8 @@ static int app_config_weighted_menu_run(void)
             if (!fgets(text, sizeof(text), stdin)) return 0;
             text[strcspn(text, "\r\n")] = 0;
             if (strcmp(text, "q") == 0 || strcmp(text, "Q") == 0 || !text[0]) continue;
-            if (cfg_store_pair(&g_app_config, weighted_items[i].key, text) != 0 || app_config_save() != 0) {
+            if (cfg_store_pair(&g_app_config, weighted_items[i].key, text) != 0 ||
+                agc_weighted_validate_params(&g_app_config.weighted) != 0 || app_config_save() != 0) {
                 g_app_config = old;
                 printf("Invalid value or save failed; previous setting kept\n");
             } else {
@@ -2044,6 +2080,7 @@ int app_config_save(void)
 	fprintf(fp, "bpr_threshold=%u\n", g_app_config.bpr_threshold);
 	fprintf(fp, "ffc_correction=%d\n", g_app_config.ffc_correction);
 	fprintf(fp, "ffc_startup_enable=%d\n", g_app_config.ffc_startup_enable);
+	fprintf(fp, "ffc_shading_enable=%d\n", g_app_config.ffc_shading_enable);
 	fprintf(fp, "shutter_interval_sec=%u\n",
 		g_app_config.shutter_interval_sec);
 	fprintf(fp, "shutter_close_wait_ms=%u\n",

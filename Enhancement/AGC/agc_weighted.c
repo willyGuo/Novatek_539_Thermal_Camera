@@ -31,7 +31,9 @@ int agc_weighted_set_params(const AGC_WEIGHTED_PARAMS *p)
 int agc_weighted_is_enabled(void) { return agc_mode_get() == AGC_MODE_WEIGHTED_CPU; }
 void agc_weighted_state_reset(AGC_WEIGHTED_WORKSPACE *ws)
 {
-    if (ws) ws->temporal_valid = 0;
+    if (ws) {
+        ws->temporal_valid = 0;
+    }
 }
 
 static uint64_t round_even(uint64_t n, uint64_t d)
@@ -128,18 +130,17 @@ int agc_weighted_apply_u14(const uint16_t *input, size_t input_stride,
         if (!cap) cap = 1;
         for (i = 0; i < AGC_WEIGHTED_BINS; i++) {
             if (ws->work[i] > cap) { excess += ws->work[i] - cap; ws->work[i] = cap; }
-            capacity += cap - ws->work[i];
+            if (ws->histogram[i]) capacity += cap - ws->work[i];
         }
         if (p->redistribute) {
-            mapping_first = 0; mapping_last = 16383;
             if (excess > capacity) excess = capacity;
             while (excess) {
                 uint32_t available = 0, at = 0;
                 uint64_t batch, remainder, k = 0, added = 0;
-                for (i = 0; i < AGC_WEIGHTED_BINS; i++) available += ws->work[i] < cap;
+                for (i = 0; i < AGC_WEIGHTED_BINS; i++) available += ws->histogram[i] != 0 && ws->work[i] < cap;
                 if (!available) break;
                 batch = excess / available; remainder = excess % available;
-                for (i = 0; i < AGC_WEIGHTED_BINS; i++) if (ws->work[i] < cap) {
+                for (i = 0; i < AGC_WEIGHTED_BINS; i++) if (ws->histogram[i] && ws->work[i] < cap) {
                     uint64_t inc = batch, room = cap - ws->work[i];
                     if (inc > room) inc = room;
                     if (k < remainder && at == k * available / remainder) {
@@ -234,6 +235,7 @@ int agc_weighted_menu_run(void)
     printf("Clip=%.1f, Redistribution=%u, Bright Weight=%.2f, P=%.1f, Gain Limit=%.1f Gray/RAW DN\n",
         p.clip_tenths / 10.0, p.redistribute, p.bright_weight_percent / 100.0,
         p.bright_percentile_tenths / 10.0, p.gain_limit_tenths / 10.0);
+    printf("Redistribution: originally populated DN bins only; retain Clip cap; discard excess without capacity.\n");
     printf("Gain Limit: 0 off; preserve lower-median brightness; no rescaling.\n");
     printf("LUT temporal smoothing: previous %u%% / current %u%% (0 previous: off)\n",
         p.temporal_previous_percent, 100U - p.temporal_previous_percent);

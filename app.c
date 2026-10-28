@@ -1,11 +1,14 @@
 #include "app.h"
+#include "Config/hardware_config.h"
+
+#include <stdio.h>
 
 #include "Driver/SPI/spi.h"
 #include "Driver/I2C/i2c.h"
 #include "Pipeline/menu.h"
 #include "Pipeline/liveview.h"
 
-static const char g_app_version[] = "v3.7.0";
+static const char g_app_version[] = "v3.8.0";
 
 const char *app_get_version(void)
 {
@@ -14,6 +17,10 @@ const char *app_get_version(void)
 
 int app_init(void)
 {
+	printf("Thermal sensor: %s, driver=%s, RAW=%ux%u\n",
+		THERMAL_SENSOR_NAME, THERMAL_SENSOR_DRIVER,
+		(unsigned int)THERMAL_SENSOR_WIDTH, (unsigned int)THERMAL_SENSOR_HEIGHT);
+#if THERMAL_HAS_TY_PERIPHERALS
 	if (spi5_1_init() != 0) {
 		return -1;
 	}
@@ -30,17 +37,22 @@ int app_init(void)
 		spi1_3_deinit();
 		return -1;
 	}
+#endif
 
 	if (liveview_init() != 0) {
+#if THERMAL_HAS_TY_PERIPHERALS
 		I2C_0_Deinit();
 		spi1_3_deinit();
+#endif
 		return -1;
 	}
 
 	if (liveview_start() != 0) {
 		liveview_deinit();
+#if THERMAL_HAS_TY_PERIPHERALS
 		I2C_0_Deinit();
 		spi1_3_deinit();
+#endif
 		return -1;
 	}
 
@@ -55,6 +67,8 @@ int app_run(void)
 void app_deinit(void)
 {
 	liveview_deinit();
+#if THERMAL_HAS_TY_PERIPHERALS
 	I2C_0_Deinit();
 	spi1_3_deinit();
+#endif
 }

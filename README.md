@@ -47,6 +47,70 @@ make clean
 make
 ```
 
+### TY640／ATTO640 編譯切換
+
+同一份來源使用 `Config/hardware_config.h` 的 `THERMAL_SENSOR` define
+選擇感測器，預設為 `THERMAL_SENSOR_TY640`。可直接將預設定義改成
+`THERMAL_SENSOR_ATTO640`，或在 SDK build 時指定：
+
+```sh
+make clean
+make THERMAL_SENSOR=ATTO640
+# 切回 TY640
+make clean
+make THERMAL_SENSOR=TY640
+```
+
+Makefile 的參數會轉成 `-DTHERMAL_SENSOR=1`（TY640）或
+`-DTHERMAL_SENSOR=2`（ATTO640），優先於 header 的預設。
+也可由外部 build 系統直接傳入
+`-DTHERMAL_SENSOR=THERMAL_SENSOR_ATTO640`。切換後必須 clean，避免沿用
+另一個感測器編譯的 object；未知選項會在 Makefile／preprocessor 階段報錯。
+
+| 項目 | TY640 | ATTO640 |
+|---|---|---|
+| VCAP driver | `nvt_sen_ty640` | `nvt_sen_atto640` |
+| 有效 RAW／輸出尺寸 | 640×512 | 640×480 |
+| RAW16／K／B 單檔大小 | 655,360 bytes | 614,400 bytes |
+| VCAP 介面／route ID | TDIO／4 | TDIO／4 |
+| TY640 外部 SPI／I²C 初始化 | 保留 | 略過；ATTO sensor I²C 由 SDK driver 管理 |
+| 感測器／鏡頭溫度、TDC、FOS | 保留原實作 | 尚無對應協定，回報不支援 |
+| NUC 選項 1 | 原有 Low／High 校正與溫度記錄 | Low／High 固定 K/B 校正，複製至五點；載入固定 point1，略過溫度切換 |
+
+記憶體池、NUC／FFC table、CPU AGC、CLAHE／DDE、VideoProc、VPE、
+UVC／RTSP 和快照／錄製檔名均跟隨選定尺寸；UVC 開啟時仍以實際輸出尺寸
+更新描述資料。ATTO640 SDK driver 的 mode 1 宣告為 640×480、14-bit thermal，
+沿用 RAW16 LSB container 與目前 RAW14 演算法。
+
+ATTO 模式的溫度紀錄會留空並標記 `read_failed`，不填入假的溫度；
+即使 CFG 要求 TDC 開啟，也會回報不支援並保持 runtime 關閉。
+固定 NUC 載入仍要求完整 point1..point5 K/B（沿用既有檔案完整性檢查），
+Blackbody Dynamic NUC 則保留既有五點 RAW/K/B 流程。
+ATTO 的 NUC 選項 1 顯示 `Two-point NUC calibration`：先確認最新 BPR 表可載入，
+再對 Low／High 各取 4 張平均，產生 Q14 K/B 並複製至 point1..point5。
+同樣保存 Low／High 輸入 RAW，成功後自動開啟 NUC 並請求快照；
+不讀取感測器溫度，也不以假溫度覆寫 CFG 內既有五點資訊。
+校正表必須使用該感測器實際量測的資料，不可直接共用兩顆感測器的表。
+
+ATTO 取像設定取自同事的 `original_SDK_ATTO640/atto640_261012/code/hdal/samples/Tiffany_thermal`，
+沿用既有演算法與 buffer ownership 保護。
+兩個原始 sample 都使用 P_GPIO(0) shutter（低開、高關）與
+`/mnt/sd/isp_ty640_0.cfg` ISP reload 路徑，因此這兩項維持原值；
+ISP 檔案內容必須換成對應感測器的 tuning，必要時可覆寫
+`THERMAL_ISP_CONFIG_PATH`。Shutter 接線也必須符合該 GPIO／極性。
+同事版本另外加入的 USB CDC echo 不屬於 sensor 取像設定，本次未加入。
+
+define 只切換 application；板端仍需對應的 kernel sensor driver、sensor cfg、
+device tree／pinmux 和 ISP tuning。ATTO SDK 已含 `sen_atto640` driver 與
+`sen_atto640_538.cfg`（含 sensor ID 4），不能只換 application binary 就假設
+原 TY640 BSP 已具備這些內容。兩種模式皆需 SDK 編譯及上板驗證出流、
+快照尺寸、FFC 與校正表載入。
+
+主機分支與初始化測試可執行 `python tests/test_sensor_profiles.py`，需要 GCC
+或透過 `CC` 指定相容編譯器。測試涵蓋預設／兩種感測器的 driver 與尺寸、
+初始化成功／失敗路徑、ATTO 不連結 TY640 peripheral 呼叫，以及未知 define
+拒絕；不代表 SDK linking、kernel driver 或實機驗證。
+
 `Correction/BPR/bpr.c` 只提供 BPR 功能，ISP lifecycle 由 `Pipeline/liveview.c` 統一管理。
 
 目前 Windows checkout 沒有 SDK `make` 環境，最終編譯與上板測試需在 Novatek SDK Linux 環境執行。
@@ -59,16 +123,11 @@ make
 ./Tiffany_thermal
 ```
 
-目前 source 實際解析的參數順序為：
-
-```sh
-./Tiffany_thermal <sensor>
-```
-
+感測器由編譯時 define 選擇，`main(void)` 不解析 runtime sensor 參數。
 預設值：
 
 ```text
-sensor                     = SEN_SEL_TY_640
+sensor                     = THERMAL_SENSOR_TY640 (compile time)
 VCAP ID                    = 4
 fps cfg fallback           = 30
 startup skip cfg fallback  = 30 frames
@@ -299,6 +358,7 @@ videoproc_3dnr_enable=1
 | `bpr_correction` | ISP DPC/BPR runtime on/off |
 | `bpr_threshold` | BPR calibration threshold，單位為 RAW8 DN，預設 `15` |
 | `ffc_correction` | 是否套用有效 FFC 補償表，預設 `1`；CFG 選單修改立即生效。開啟時若沒有有效表格，先執行一次 FFC，成功後補償；間隔為 `0` 時仍可持續補償 |
+| `ffc_shading_enable` | 0/1; default 0; requires calibrated shading table and FFC on |
 | `ffc_startup_enable` | Liveview 啟動時是否先校正一次，預設 `1`；不受 interval 是否為 `0` 影響，也不會自動改動補償開關 |
 | `shutter_interval_sec` | 定時 FFC 間隔秒數，範圍 `0..INT_MAX`，預設 `60`；`0` 停止定時校正，CFG 選單修改後立即生效 |
 | `shutter_close_wait_ms` | 快門關閉後開始 FFC 前的等待時間，範圍 `1..INT_MAX`，預設 `200` ms；CFG 選單修改後下一次校正就使用新值 |
@@ -324,7 +384,7 @@ Histogram P1/P99 的設定選單新增 `5. Gain Limit`，CFG 為 `agc_histogram_
 |---|---|---|
 | `agc_weighted_enable` | 0 | 開啟時停用其他 AGC |
 | `agc_weighted_clip_limit` | 2.0 | 0 關閉；0.1..100.0，步進 0.1；Clip count = round(Clip × pixel count / Unique Levels)，最少 1 |
-| `agc_weighted_redistribute` | 1 | 0／1；依目前 Toolkit 原始碼向完整 RAW14 DN 範圍、含空 bin，重新分配裁切餘量，仍受 Clip count 上限限制 |
+| `agc_weighted_redistribute` | 1 | 0／1；只向原本 pixel count > 0 的 DN bin 分配裁切餘量，維持 Clip count 上限，無容量可分配的餘量捨棄 |
 | `agc_weighted_bright_weight` | 1.0 | 1.0、1.05、1.1..2.0；亮部區間權重倍率 |
 | `agc_weighted_bright_percentile` | 80.0 | 0..100，步進 0.1；從原始輸入計算亮部門檻 |
 | `agc_weighted_gain_limit` | 0.0 | 0 關閉；0.1..4.0，步進 0.1；單位為 8-bit Gray／原始 RAW DN |
@@ -332,13 +392,13 @@ Histogram P1/P99 的設定選單新增 `5. Gain Limit`，CFG 為 `agc_histogram_
 
 移植自 Toolkit `thermal_toolkit/algorithms/histogram.py` 的全域 Tone Weighted Mapping：輸入先限制於 0..16383，計算直方圖、手動 Clip、Redistribution，再依 `W(i)=H(i)+H(i+1)` 建立累積 LUT。區間中點達到 Bright Percentile 的權重乘上 Bright Weight，之後重新正規化。THL／THH 與 ACI automatic Clip 本次不加入。Smooth 關閉或尚未建立歷史 LUT 時，單一 DN 的全平影像對應零輸出，與停用 automatic Clip 時的 Toolkit 行為一致。
 
-Smooth 參考 Fieldscale 的時間權重方式，平滑整張映射 LUT，不平均前後影像像素。預設以前一幀 LUT 90%、當前 LUT 10% 混合，在 0.1 Gray 精度下累積，再套用 Gain Limit；設為 0 可停用。任何 Weighted 參數或影像尺寸變更、AGC 切換及 Liveview Restart 都會重置歷史，下一幀直接建立新的 LUT。
+Smooth 參考 Fieldscale 的時間權重方式，平滑整張映射 LUT，不平均前後影像像素。預設以前一幀 LUT 90%、當前 LUT 10% 混合，在 0.1 Gray 精度下累積，再套用 Gain Limit；設為 0 可停用。任何 Weighted 參數或影像尺寸變更、AGC 切換、FFC／手動校正及 Liveview Restart 都會重置歷史，下一幀直接建立新的 LUT。
 
 原始 0..255 LUT 先取整，再依設定執行 Smooth。Gain Limit 套用在這份 LUT，相鄰步階以 0.1 Gray 累積限制，保留 lower-median DN 在平滑後的亮度，再 half-up 取整。限制後不重新拉滿 0..255；它是斜率上限，實際灰階差可能更小。為接入既有 RAWALL，LUT 的 8-bit 結果以 `round(Gray × 16383 / 255)` 轉回 RAW14 container；Gain Limit 的單位仍沿用 Toolkit，不能解讀成 RAW14 輸出 DN／輸入 DN。ISP 與後續顯示增強仍可能改變最終畫面。
 
-沿用現有 CPU AGC 輸出 block、快照／錄製及 RAW_INPUT_SYNC。每次 Liveview Start 在 CFG 載入後預先配置一次約 176 KiB Weighted workspace（含歷史 LUT），供不中斷 UVC 的 AGC 切換使用，逐幀不配置記憶體，Stop 時釋放；Histogram 與 Fieldscale workspace 同樣預先備妥。所有 RAW 輸入（含直接 VCAP 路徑）都會等待對應 RAWALL 輸出，逾時仍依既有保護流程停止。CPU AGC 啟用時繞過 ISP Tone Curve；AGC output RAW 保存的是上述轉回 RAW14 的結果。
+沿用現有 CPU AGC 輸出 block、快照／錄製及 RAW_INPUT_SYNC。每次 Liveview Start 在 CFG 載入後預先配置一次約 176 KiB Weighted workspace（含歷史 LUT），逐幀不配置記憶體，Stop 時一起釋放。Histogram 與 Fieldscale workspace 同樣預先備妥。所有 RAW 輸入（含直接 VCAP 路徑）都會等待對應 RAWALL 輸出，逾時仍依既有保護流程停止。CPU AGC 啟用時繞過 ISP Tone Curve；AGC output RAW 保存的是上述轉回 RAW14 的結果。
 
-主機在 Smooth 關閉時，以停用 THL／THH automatic Clip 的 Toolkit 原函式完成 2,320 組完整 LUT／RAW14 像素比對，涵蓋 Clip、Redistribution、亮部權重、小數 Gain Limit、全平／稀疏／全 DN 範圍、三份板端快照與隨機參數；另外檢查 stride padding、in-place、小數 CFG、參數拒絕與 AGC 互斥。另驗證 90/10 LUT 混合、平滑後 Gain Limit、參數／尺寸／模式重置，以及當前影像使用平滑 LUT 的行為。仍需 Novatek SDK 編譯與上板量測耗時、FPS、畫質與長時間出流。
+主機測試 `python tests/test_weighted_mapping.py --toolkit <Thermal_Image_Toolkit>` 使用目前 Toolkit 的手動 Tone Weighted Mapping 原函式（停用 ACI automatic Clip），比對完整 LUT 與 RAW14 像素，涵蓋 Clip、Redistribution、亮部權重、小數 Gain Limit、全平／稀疏／全 DN 範圍與隨機參數；另檢查 stride padding、in-place、輸入不被改寫，以及 LUT Smooth 90/10 與歷史重置。測試使用 host GCC，不代表 Novatek SDK build 或板端畫質／效能驗證。
 
 ## BPR／DPC
 
@@ -504,6 +564,8 @@ FFC 選單只保留 runtime 狀態：
 
 ```text
 FFC status
+ 1. Run FFC test
+ 2. Calibrate blackbody / shutter shading (32 frames each)
  0. Back
 ```
 
@@ -538,7 +600,7 @@ interval 時間到
 有效區目前為 `640 x 512`，位於完整 RAW frame 的 active window。offset 公式：
 
 ```text
-FFC_offset(x,y) = shutter_mean - shutter_raw(x,y)
+FFC_B(x,y) = shutter_raw(x,y) - shutter_mean
 ```
 
 offset 以 signed 16-bit 二補數存放，直接寫入 `thermal_ffc_b_frame` 對應的 DDR buffer，然後呼叫 `hd_common_mem_flush_cache()`。它不會保存成檔案，也不需要 reload table。
@@ -554,17 +616,61 @@ Image B = FFC K table（固定 256，即 Q8 的 1.0）
 Image C = FFC output
 Image D = FFC offset table
 
-Image C = (Image A * Image B >> 8) + Image D
-        = Image A + Image D
+Image C = (Image B * (Image A - signed(Image D))) >> 8
+        = Image A - signed(Image D)
 ```
 
 上板驗證應包含負 offset，例如：
 
 ```text
-input          = 2000
-offset         = -10
+input           = 2000
+B               = 10
 expected output = 1990
+
+input           = 2000
+B               = -10
+expected output = 2010
 ```
+
+### 黑體／快門差異補償（Shading）
+
+補償均勻黑體與內部快門之間的固定空間差異。預設 `ffc_shading_enable=0`，關閉時使用普通 FFC。此功能合併到 FFC 的 B 表，使用原本 unity K 與 GFX，需要 FFC 開啟且有有效 FFC 表，不增加逐幀 GFX pass。
+
+使用步驟：
+
+1. 完成 BPR／NUC 校正，開啟 NUC、關閉 Blackbody Dynamic NUC，相機與鏡頭先達到熱穩定。
+2. 均勻黑體填滿整個視野，不含爐口邊緣或背景，保持相機不動。
+3. 主選單 `5. FFC` → `2. Calibrate blackbody / shutter shading (32 frames each)`，確認就緒後輸入 `1`。自動開快門取黑體 32 張平均，再關快門取 32 張平均，最後重新開快門。兩組均取 TDC（若開啟）／NUC 後、FFC 前的 RAW，期間固定 NUC／TDC 溫度表。使用 UINT32 CPU 累加，避免 16-bit 累加溢位。
+4. 顯示 `PASS` 後，進入 `CFG Setting` → `Shutter / FFC setting` → `5. Blackbody / shutter shading on/off` 開啟，開關保存為 `ffc_shading_enable=1`，下一張 FFC 輸出套用。校正成功本身不改開關。
+5. 對準均勻黑體，切換 Shading 開／關，比較 corrected RAW 的中心／邊緣差異。
+
+```text
+O = 預先拍攝的黑體平均 RAW
+S = 同次拍攝的關快門平均 RAW
+C = (O - mean(O)) - (S - mean(S))
+
+每次 FFC：
+B_base = 當次關快門平均 RAW - mean(當次關快門平均 RAW)
+B_final = B_base + C  （Shading 開啟且條件有效時）
+output = input - B_final
+```
+
+各自扣除全畫面平均，避免把黑體／快門的整體溫差寫入 C。每次由未合併的 FFC base 重建，避免重複累加 C；開關或校正改變時重置 Weighted Mapping 的 LUT 歷史。
+
+差異表保存於 `/mnt/sd/thermal_op/ffc_shading.bin`，包含 32-byte header（magic、版本、sensor profile、寬高、NUC shift、校正時 TDC 開關、checksum）及全畫面 signed INT16 C，皆為 little-endian。TY640 為 655,392 bytes，ATTO640 為 614,432 bytes。先寫 `.new`、flush/fsync，再 rename 替換；計算或存檔失敗保留前次差異表。Liveview 啟動時驗證 header、長度、checksum 後載入；一般 FFC base 仍只存在 RAM。
+
+差異表無效、NUC 關閉、Dynamic NUC 開啟、TDC 開關與校正時不同，或合併 B 超出 signed INT16 範圍時，使用普通 FFC。選單分別顯示 requested、applied 與 table。取像或快門失敗時中止校正並嘗試開回快門。
+
+此表代表當時鏡頭、NUC 校正與熱狀態的差異。重新校正或更換 NUC、BPR、鏡頭後應關閉 Shading 並重新校正；檔案不會自動辨識 NUC table 內容變更。單張固定表不保證涵蓋所有工作溫度。
+
+Host regression（實際 SDK headers、模擬 GFX，非板端驗證）：
+
+```sh
+python tests/test_ffc_shading.py --sdk <SDK/code>
+```
+
+涵蓋 TY640／ATTO640 的正負號、去平均、重複 FFC 不累加、開關、NUC／TDC mode gate、存檔重載及毀損檔案拒絕；另擷取實際 RAW-worker 校正函式，模擬 32＋32 張取像、NUC 輸出來源、寬位元累加，以及取像／map／快門失敗後的影格釋放與快門恢復。仍需 SDK 編譯與板端驗證。
+
 
 ## VideoProc / ISP
 

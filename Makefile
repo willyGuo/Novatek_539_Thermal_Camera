@@ -1,4 +1,15 @@
 MODULE_NAME = Tiffany_thermal
+# Optional build override; without it Config/hardware_config.h selects TY640.
+# Clean before switching: make clean && make THERMAL_SENSOR=ATTO640
+ifneq ($(strip $(THERMAL_SENSOR)),)
+ifeq ($(THERMAL_SENSOR),TY640)
+EXTRA_CFLAGS += -DTHERMAL_SENSOR=1
+else ifeq ($(THERMAL_SENSOR),ATTO640)
+EXTRA_CFLAGS += -DTHERMAL_SENSOR=2
+else
+$(error THERMAL_SENSOR must be TY640 or ATTO640)
+endif
+endif
 # DIRs
 VOS_DRIVER_DIR = $(NVT_VOS_DIR)/drivers
 HDAL_SAMPLE_DIR = $(NVT_HDAL_DIR)/samples

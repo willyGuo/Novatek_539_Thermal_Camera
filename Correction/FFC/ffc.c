@@ -1,9 +1,21 @@
 #include "ffc.h"
+#include "ffc_shading_math.h"
+#include "../../Config/hardware_config.h"
+#include "../NUC/nuc_gain_format.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if defined(__LINUX)
+#include <pthread.h>
+#else
+#include <FreeRTOS_POSIX.h>
+#include <FreeRTOS_POSIX/pthread.h>
+#endif
 
 #include "vendor_gfx.h"
 
@@ -25,6 +37,199 @@ static FFC_CONTEXT g_ffc = {
 	.enabled = 1,
 	.startup_enabled = 1,
 };
+
+#ifndef FFC_SHADING_DIR
+#define FFC_SHADING_DIR "/mnt/sd/thermal_op"
+#endif
+#define FFC_SHADING_PATH FFC_SHADING_DIR "/ffc_shading.bin"
+#define FFC_SHADING_NEW FFC_SHADING_PATH ".new"
+#define FFC_SHADING_PIXELS ((size_t)THERMAL_SENSOR_WIDTH * THERMAL_SENSOR_HEIGHT)
+
+static pthread_mutex_t g_shading_lock = PTHREAD_MUTEX_INITIALIZER;
+static FFC_TEST_CB g_shading_calibrate;
+static INT16 *g_shading_correction;
+static UINT16 *g_shading_base;
+static int g_shading_enabled; /* Optional, default off. */
+static int g_shading_dirty;
+static int g_shading_merged;
+static int g_shading_tdc;
+static int g_shading_input_nuc, g_shading_input_tdc, g_shading_input_dynamic;
+static UINT32 g_shading_generation;
+
+static UINT32 ffc_shading_checksum(const INT16 *table)
+{
+    size_t i;
+    UINT32 hash = 2166136261U;
+    for (i = 0; i < FFC_SHADING_PIXELS; ++i) {
+        UINT16 v = (UINT16)table[i];
+        hash = (hash ^ (v & 255U)) * 16777619U;
+        hash = (hash ^ (v >> 8)) * 16777619U;
+    }
+    return hash;
+}
+
+/* Header and payload are native little-endian on the supported target. */
+static int ffc_shading_file(INT16 *table, int save, int *tdc_enabled)
+{
+    UINT32 header[8] = {0x53434646U, 1U, THERMAL_SENSOR,
+        THERMAL_SENSOR_WIDTH, THERMAL_SENSOR_HEIGHT, NUC_GAIN_SHIFT, 0U, 0U};
+    UINT32 stored[8];
+    FILE *fp;
+    int ok;
+    if (save && mkdir(FFC_SHADING_DIR, 0777) != 0 && errno != EEXIST) return -1;
+    fp = fopen(save ? FFC_SHADING_NEW : FFC_SHADING_PATH, save ? "wb" : "rb");
+    if (!fp) return -1;
+    if (save) {
+        header[6] = *tdc_enabled ? 1U : 0U;
+        header[7] = ffc_shading_checksum(table) ^ header[6];
+        ok = fwrite(header, sizeof(header), 1, fp) == 1 &&
+            fwrite(table, sizeof(*table), FFC_SHADING_PIXELS, fp) == FFC_SHADING_PIXELS;
+        if (fflush(fp) != 0) ok = 0;
+#if defined(__LINUX)
+        if (ok && fsync(fileno(fp)) != 0) ok = 0;
+#endif
+    } else {
+        ok = fread(stored, sizeof(stored), 1, fp) == 1 &&
+            memcmp(stored, header, 6U * sizeof(UINT32)) == 0 && stored[6] <= 1U &&
+            fread(table, sizeof(*table), FFC_SHADING_PIXELS, fp) == FFC_SHADING_PIXELS &&
+            fgetc(fp) == EOF && !ferror(fp) &&
+            stored[7] == (ffc_shading_checksum(table) ^ stored[6]);
+        if (ok) *tdc_enabled = (int)stored[6];
+    }
+    if (fclose(fp) != 0) ok = 0;
+    if (save) {
+        if (ok && rename(FFC_SHADING_NEW, FFC_SHADING_PATH) != 0) ok = 0;
+        if (!ok) remove(FFC_SHADING_NEW);
+    }
+    return ok ? 0 : -1;
+}
+
+void ffc_bind_shading_callback(FFC_TEST_CB calibrate)
+{
+    g_shading_calibrate = calibrate;
+}
+
+void ffc_set_shading_enabled(int enabled)
+{
+    pthread_mutex_lock(&g_shading_lock);
+    if (g_shading_enabled != (enabled ? 1 : 0)) ++g_shading_generation;
+    g_shading_enabled = enabled ? 1 : 0;
+    g_shading_dirty = 1;
+    printf("FFC shading %s, table=%s (requires FFC on)\n",
+        g_shading_enabled ? "on" : "off", g_shading_correction ? "ready" : "not ready");
+    pthread_mutex_unlock(&g_shading_lock);
+}
+
+int ffc_is_shading_enabled(void)
+{
+    int enabled;
+    pthread_mutex_lock(&g_shading_lock);
+    enabled = g_shading_enabled;
+    pthread_mutex_unlock(&g_shading_lock);
+    return enabled;
+}
+
+int ffc_shading_is_ready(void)
+{
+    int ready;
+    pthread_mutex_lock(&g_shading_lock);
+    ready = g_shading_correction != NULL;
+    pthread_mutex_unlock(&g_shading_lock);
+    return ready;
+}
+
+int ffc_shading_is_active(void)
+{
+    int active;
+    pthread_mutex_lock(&g_shading_lock);
+    active = g_ffc.enabled && g_ffc.table_ready && g_shading_merged;
+    pthread_mutex_unlock(&g_shading_lock);
+    return active;
+}
+
+void ffc_set_shading_input_mode(int nuc_enabled, int tdc_enabled, int dynamic_nuc)
+{
+    pthread_mutex_lock(&g_shading_lock);
+    if (g_shading_input_nuc != nuc_enabled || g_shading_input_tdc != tdc_enabled ||
+        g_shading_input_dynamic != dynamic_nuc) {
+        g_shading_input_nuc = nuc_enabled;
+        g_shading_input_tdc = tdc_enabled;
+        g_shading_input_dynamic = dynamic_nuc;
+        g_shading_dirty = 1;
+        ++g_shading_generation;
+        if (g_shading_enabled && (!nuc_enabled || dynamic_nuc || tdc_enabled != g_shading_tdc))
+            printf("FFC shading suspended: NUC/TDC mode differs from calibration\n");
+    }
+    pthread_mutex_unlock(&g_shading_lock);
+}
+
+UINT32 ffc_shading_generation(void)
+{
+    UINT32 generation;
+    pthread_mutex_lock(&g_shading_lock);
+    generation = g_shading_generation;
+    pthread_mutex_unlock(&g_shading_lock);
+    return generation;
+}
+
+int ffc_shading_calibrate(const UINT16 *open_raw, const UINT16 *shutter_raw,
+    int tdc_enabled)
+{
+    INT16 *table = malloc(FFC_SHADING_PIXELS * sizeof(*table));
+    if (!table) return -1;
+    if (ffc_shading_build(open_raw, shutter_raw, table, FFC_SHADING_PIXELS) != 0 ||
+        !g_shading_base || ffc_shading_file(table, 1, &tdc_enabled) != 0) {
+        printf("FFC shading calibration/save failed; previous table retained\n");
+        free(table);
+        return -1;
+    }
+    pthread_mutex_lock(&g_shading_lock);
+    free(g_shading_correction);
+    g_shading_correction = table;
+    g_shading_tdc = tdc_enabled ? 1 : 0;
+    g_shading_dirty = 1;
+    ++g_shading_generation;
+    pthread_mutex_unlock(&g_shading_lock);
+    printf("FFC shading calibration saved: %s\n", FFC_SHADING_PATH);
+    return 0;
+}
+
+/* Only the RAW worker writes the DMA table. CFG only marks it dirty.
+ * Always rebuild from the unmodified FFC base: never add C repeatedly. */
+static void ffc_refresh_shading(void)
+{
+    size_t i;
+    int merge;
+    pthread_mutex_lock(&g_shading_lock);
+    if (!g_shading_dirty || !g_shading_base || !g_ffc.table_ready) {
+        pthread_mutex_unlock(&g_shading_lock);
+        return;
+    }
+    merge = g_shading_enabled && g_shading_correction && g_shading_input_nuc &&
+        !g_shading_input_dynamic && g_shading_input_tdc == g_shading_tdc;
+    if (merge) {
+        for (i = 0; i < FFC_SHADING_PIXELS; ++i) {
+            INT32 b = (INT16)g_shading_base[i] + (INT32)g_shading_correction[i];
+            if (b < -32768 || b > 32767) {
+                printf("FFC shading combined B out of range; using ordinary FFC\n");
+                merge = 0;
+                break;
+            }
+        }
+    }
+    memcpy((void *)g_ffc.b_va, g_shading_base, g_ffc.table_size);
+    if (merge) {
+        UINT16 *b = (UINT16 *)g_ffc.b_va;
+        for (i = 0; i < FFC_SHADING_PIXELS; ++i)
+            b[i] = (UINT16)(INT16)((INT16)g_shading_base[i] + (INT32)g_shading_correction[i]);
+    }
+    hd_common_mem_flush_cache((void *)g_ffc.b_va, g_ffc.table_size);
+    g_shading_dirty = 0;
+    if (g_shading_merged != merge)
+        printf("FFC shading compensation %s\n", merge ? "applied" : "inactive");
+    g_shading_merged = merge;
+    pthread_mutex_unlock(&g_shading_lock);
+}
 
 static int ffc_read_option(void)
 {
@@ -89,8 +294,28 @@ void ffc_bind_test_callback(FFC_TEST_CB run_test)
 
 void ffc_bind_runtime(UINTPTR b_va, UINT32 table_size)
 {
+	INT16 *loaded = NULL;
+	pthread_mutex_lock(&g_shading_lock);
+	free(g_shading_base);
+	free(g_shading_correction);
+	g_shading_base = NULL;
+	g_shading_correction = NULL;
+	g_shading_merged = 0;
+	g_shading_dirty = 1;
+	if (b_va && table_size == FFC_SHADING_PIXELS * sizeof(UINT16)) {
+		g_shading_base = calloc(1, table_size);
+		loaded = malloc(table_size);
+		if (g_shading_base && loaded && ffc_shading_file(loaded, 0, &g_shading_tdc) == 0) {
+			g_shading_correction = loaded;
+			printf("FFC shading table loaded: %s\n", FFC_SHADING_PATH);
+		} else {
+			free(loaded);
+			printf("FFC shading table missing/invalid; ordinary FFC remains available\n");
+		}
+	}
 	g_ffc.b_va = b_va;
 	g_ffc.table_size = table_size;
+	pthread_mutex_unlock(&g_shading_lock);
 }
 
 int ffc_init_table(void)
@@ -105,6 +330,9 @@ int ffc_init_table(void)
 	hd_common_mem_flush_cache((void *)g_ffc.b_va, g_ffc.table_size);
 
 	g_ffc.table_ready = 0;
+	pthread_mutex_lock(&g_shading_lock);
+	g_shading_dirty = 1;
+	pthread_mutex_unlock(&g_shading_lock);
 	return 0;
 }
 
@@ -163,6 +391,13 @@ int ffc_update_table_from_raw(UINTPTR raw_va,
 
 	hd_common_mem_flush_cache((void *)g_ffc.b_va, g_ffc.table_size);
 	g_ffc.table_ready = 1;
+	if (g_shading_base) {
+		memcpy(g_shading_base, b_tbl, g_ffc.table_size);
+		pthread_mutex_lock(&g_shading_lock);
+		g_shading_dirty = 1;
+		pthread_mutex_unlock(&g_shading_lock);
+		ffc_refresh_shading();
+	}
 	printf("FFC table updated\n");
 	return 0;
 }
@@ -363,6 +598,11 @@ int ffc_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("FFC status\n");
 		printf(" 1. Run FFC test\n");
+		printf(" 2. Calibrate blackbody / shutter shading (32 frames each)\n");
+		printf("    Shading requested=%s, applied=%s, table=%s; enable in CFG Setting -> Shutter / FFC\n",
+		       ffc_is_shading_enabled() ? "on" : "off",
+		       ffc_shading_is_active() ? "yes" : "no",
+		       ffc_shading_is_ready() ? "ready" : "not ready");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("runtime: %s, table=%s, shutter interval=%u sec\n",
@@ -373,6 +613,17 @@ int ffc_menu_run(void)
 
 		option = ffc_read_option();
 		switch (option) {
+		case 2:
+			printf("Fill the entire view with a uniform blackbody. Keep camera/NUC/TDC stable.\n");
+			printf("Capture blackbody, then automatically close shutter and capture reference.\n");
+			printf("Enter 1 to calibrate and save (0 cancels).\n");
+			if (ffc_read_option() == 1) {
+				if (!g_shading_calibrate)
+					printf("Shading calibration unavailable: start Liveview first\n");
+				else
+					printf("Shading calibration %s\n", g_shading_calibrate() == 0 ? "PASS" : "FAIL");
+			}
+			break;
 		case 1:
 			if (g_ffc.run_test == 0) {
 				printf("Run FFC test unavailable\n");
@@ -412,6 +663,7 @@ HD_RESULT ffc_apply(HD_VIDEO_FRAME *in_frame,
 	VENDOR_GFX_GRPH_TRIGGER_PARAM param = {0};
 	HD_RESULT ret;
 
+	ffc_refresh_shading();
 	memcpy(out_frame, in_frame, sizeof(HD_VIDEO_FRAME));
 
 	param.command = VENDOR_GRPH_CMD_Non_uni_correction;

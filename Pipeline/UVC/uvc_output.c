@@ -1,4 +1,5 @@
 #include "uvc_output.h"
+#include "../../Config/hardware_config.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -27,12 +28,12 @@ static int g_uvc_mjpeg_snapshot_pending;
 static char g_uvc_mjpeg_snapshot_path[UVC_DIAGNOSTIC_PATH_SIZE];
 
 static UVAC_VID_RESO g_uvc_mjpg_resolution[] = {
-	{640, 512, 1, 30, 0, 0},
+	{THERMAL_SENSOR_WIDTH, THERMAL_SENSOR_HEIGHT, 1, 30, 0, 0},
 };
 
 /* This UVAC release builds H.264 and MJPEG descriptors as one group. */
 static UVAC_VID_RESO g_uvc_h264_resolution[] = {
-	{640, 512, 1, 30, 0, 0},
+	{THERMAL_SENSOR_WIDTH, THERMAL_SENSOR_HEIGHT, 1, 30, 0, 0},
 };
 
 static UINT32 g_uvc_audio_sample_rates[] = {

@@ -11,6 +11,16 @@ typedef int (*FFC_TEST_CB)(void);
 
 int ffc_menu_run(void);
 void ffc_bind_test_callback(FFC_TEST_CB run_test);
+void ffc_bind_shading_callback(FFC_TEST_CB calibrate);
+void ffc_set_shading_enabled(int enabled);
+int ffc_is_shading_enabled(void);
+int ffc_shading_is_ready(void);
+int ffc_shading_is_active(void);
+void ffc_set_shading_input_mode(int nuc_enabled, int tdc_enabled, int dynamic_nuc);
+UINT32 ffc_shading_generation(void);
+/* Packed active-area, NUC-corrected and pre-FFC averaged RAWs. */
+int ffc_shading_calibrate(const UINT16 *open_raw, const UINT16 *shutter_raw,
+    int tdc_enabled);
 void ffc_bind_runtime(UINTPTR b_va, UINT32 table_size);
 int ffc_init_table(void);
 int ffc_update_table_from_raw(UINTPTR raw_va,

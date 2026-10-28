@@ -96,10 +96,6 @@
 #define LA_WIN_NUM_W    32
 #define LA_WIN_NUM_H    32
 
-#define TY_640          0
-#define OS05A10         1
-#define RESOLUTION_SET  TY_640
-
 #define DEFAULT_STARTUP_SKIP_FRAMES   30
 #define DEFAULT_RUNTIME_SKIP_FRAMES   0
 #define DEFAULT_SHUTTER_CLOSE_WAIT_MS 200
@@ -138,24 +134,21 @@
 #error "Four-frame FFC averaging requires shift 2"
 #endif
 
-/* BSP-verified TY640 active resolution used to select the sensor mode. */
-#define SENSOR_MODE_W           640
-#define SENSOR_MODE_H           512
+/* Capture mode and all derived buffers use the selected sensor profile. */
+#define SENSOR_MODE_W           THERMAL_SENSOR_WIDTH
+#define SENSOR_MODE_H           THERMAL_SENSOR_HEIGHT
 
 /*
- * The TY640 VCAP driver returns the active image directly.  Board metadata
- * reports dim=640x512 and loff=1280 bytes, so there are no dummy columns or
- * rows in the frame handed to this pipeline.
+ * Both supplied VCAP samples return active-only RAW16: TY640 640x512,
+ * ATTO640 640x480. No dummy columns or rows are added by this application.
  */
 #define RAW_SIZE_W              SENSOR_MODE_W
 #define RAW_SIZE_H              SENSOR_MODE_H
 
-#if (RESOLUTION_SET == TY_640)
 #define VDO_SIZE_W      RAW_SIZE_W
 #define VDO_SIZE_H      RAW_SIZE_H
-#endif
 
-/* The complete VCAP frame is also the 640x512 active image. */
+/* The complete VCAP frame is the active image for either profile. */
 #define RAW_ACTIVE_X            0
 #define RAW_ACTIVE_Y            0
 #define RAW_ACTIVE_W            RAW_SIZE_W
@@ -190,6 +183,8 @@ static VIDEO_OUTPUT *g_diagnostic_video_output = NULL;
 static int g_proc_input_format_logged = 0;
 static UINT64 g_shutter_next_calibration_ms = 0;
 static int g_manual_calibration_active = 0;
+/* Protected by g_manual_calibration_lock; only RAW worker resets the workspace. */
+static UINT32 g_weighted_calibration_generation = 0;
 /* Protected by g_manual_calibration_lock; consumed only after successful NUC. */
 static int g_nuc_snapshot_pending = 0;
 static int g_shutter_reschedule_after_manual_calibration = 0;
@@ -446,13 +441,10 @@ static HD_RESULT set_cap_cfg(HD_PATH_ID *p_video_cap_ctrl)
 	HD_PATH_ID video_cap_ctrl = 0;
 	HD_VIDEOCAP_CTRL iq_ctl = {0};
 
-    #if (RESOLUTION_SET == TY_640)
-	snprintf(cap_cfg.sen_cfg.sen_dev.driver_name, HD_VIDEOCAP_SEN_NAME_LEN-1, "nvt_sen_ty640");
-	printf("Using nvt_sen_ty640\n");
-	#elif (RESOLUTION_SET == OS05A10)
-	snprintf(cap_cfg.sen_cfg.sen_dev.driver_name, HD_VIDEOCAP_SEN_NAME_LEN-1, "nvt_sen_os05a10");
-	printf("Using nvt_sen_os05a10\n");
-	#endif
+	snprintf(cap_cfg.sen_cfg.sen_dev.driver_name, HD_VIDEOCAP_SEN_NAME_LEN-1,
+		 "%s", THERMAL_SENSOR_DRIVER);
+	printf("Using %s (%ux%u)\n", THERMAL_SENSOR_DRIVER,
+		(unsigned int)SENSOR_MODE_W, (unsigned int)SENSOR_MODE_H);
 
 	cap_cfg.sen_cfg.sen_dev.if_type = HD_COMMON_VIDEO_IN_TDIO;
     cap_cfg.sen_cfg.sen_dev.pin_cfg.pinmux.sensor_pinmux =  0;  //use @0 in peri-dev.dtsi
@@ -604,7 +596,7 @@ static HD_RESULT set_proc_param(HD_PATH_ID video_proc_path, HD_DIM* p_dim,
 	{
 		HD_VIDEOPROC_CROP  video_in_param = {0};
 
-		/* VCAP already provides the 640x512 active image to VideoProc. */
+		/* VCAP already provides the selected active image to VideoProc. */
 		video_in_param.mode = HD_CROP_OFF;
 		ret = hd_videoproc_set(video_proc_path, HD_VIDEOPROC_PARAM_IN_CROP, &video_in_param);
 	}
@@ -773,6 +765,8 @@ typedef struct _VIDEO_LIVEVIEW {
 	UINTPTR thermal_agc_histogram_p1_p99_out_va;
 	AGC_WEIGHTED_WORKSPACE *agc_weighted_workspace;
 	UINT32 agc_weighted_frame_count, agc_weighted_error_count;
+	UINT32 agc_weighted_calibration_generation;
+	UINT32 agc_weighted_shading_generation;
 	uint32_t *agc_histogram_p1_p99_workspace;
 	AGC_HISTOGRAM_P1_P99_STATE agc_histogram_p1_p99_state;
 	uint32_t *agc_fieldscale_horizontal_workspace;
@@ -865,6 +859,7 @@ static int g_ffc_test_pending = 0;
 static int g_ffc_test_running = 0;
 static int g_ffc_test_worker_active = 0;
 static int g_ffc_test_result = -1;
+static int g_ffc_test_kind = 1; /* 1: existing FFC test, 2: shading calibration. */
 /* Protected by g_ffc_test_lock; only CFG enable requests auto-apply a test. */
 static int g_ffc_enable_after_test = 0;
 static pthread_mutex_t g_isp_step_test_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -881,7 +876,7 @@ static UINT64 g_isp_step_test_expected_count = 0;
 
 static void liveview_stop_pipeline(LIVEVIEW_CONTEXT *ctx);
 
-static int liveview_request_ffc_test(void)
+static int liveview_request_ffc_operation(int kind)
 {
 	int result;
 
@@ -898,6 +893,7 @@ static int liveview_request_ffc_test(void)
 	}
 
 	g_ffc_test_result = -1;
+	g_ffc_test_kind = kind;
 	g_ffc_test_pending = 1;
 	while (g_ffc_test_pending || g_ffc_test_running) {
 		pthread_cond_wait(&g_ffc_test_cond, &g_ffc_test_lock);
@@ -908,6 +904,16 @@ static int liveview_request_ffc_test(void)
 	return result;
 }
 
+static int liveview_request_ffc_test(void)
+{
+	return liveview_request_ffc_operation(1);
+}
+
+static int liveview_request_shading_calibration(void)
+{
+	return liveview_request_ffc_operation(2);
+}
+
 static int liveview_take_ffc_test_request(void)
 {
 	int requested = 0;
@@ -916,7 +922,7 @@ static int liveview_take_ffc_test_request(void)
 	if (g_ffc_test_pending) {
 		g_ffc_test_pending = 0;
 		g_ffc_test_running = 1;
-		requested = 1;
+		requested = g_ffc_test_kind;
 	}
 	pthread_mutex_unlock(&g_ffc_test_lock);
 
@@ -943,6 +949,7 @@ static void liveview_finish_ffc_test(int result)
 				       "FFC calibration complete; compensation remains off as requested\n");
 		}
 		g_ffc_enable_after_test = 0;
+		g_ffc_test_kind = 1;
 		g_ffc_test_pending = 0;
 		g_ffc_test_running = 0;
 		g_ffc_test_result = result;
@@ -963,6 +970,7 @@ static void liveview_set_ffc_test_worker_active(int active)
 		g_ffc_test_running = 0;
 		g_ffc_test_result = -1;
 		g_ffc_enable_after_test = 0;
+		g_ffc_test_kind = 1;
 		pthread_cond_broadcast(&g_ffc_test_cond);
 	}
 	pthread_mutex_unlock(&g_ffc_test_lock);
@@ -1297,6 +1305,7 @@ static void liveview_on_manual_calibration_state(const char *name, int active)
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	shutter_calibration_enabled =
 		ffc_is_enabled() && ffc_get_shutter_interval_sec() > 0;
+	g_weighted_calibration_generation++;
 	if (active) {
 		g_shutter_reschedule_after_manual_calibration = 0;
 		g_manual_calibration_active = 1;
@@ -2377,6 +2386,8 @@ static int liveview_update_ffc_table_from_average(VIDEO_LIVEVIEW *p_stream,
 	blk_size = VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
 	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_out_va, blk_size);
 
+	ffc_set_shading_input_mode(nuc_is_enabled(), tdc_is_enabled(),
+	    nuc_is_blackbody_dynamic_enabled());
 	return ffc_update_table_from_raw(p_stream->thermal_ffc_out_va,
 					lineoffset,
 					RAW_ACTIVE_X,
@@ -2998,12 +3009,13 @@ static void liveview_update_temperature_tables_if_needed(
 	pthread_mutex_unlock(&g_manual_calibration_lock);
 }
 
-static int liveview_run_ffc_calibration(
+static int liveview_capture_ffc_average(
 	VIDEO_LIVEVIEW *p_stream0,
 	UINT64 *nuc_next_update_ms,
 	UINT64 *tdc_next_update_ms,
 	int test_mode,
-	int startup_ffc)
+	int startup_ffc,
+	UINT16 *packed_average)
 {
 	HD_VIDEO_FRAME vcap_video_frame = {0};
 	HD_VIDEO_FRAME tdc_video_frame = {0};
@@ -3013,13 +3025,16 @@ static int liveview_run_ffc_calibration(
 	UINT32 lineoffset = 0;
 	UINT32 frame;
 	int final_release_failed = 0;
+	UINT32 frame_count = packed_average ? 32U : FFC_AVERAGE_FRAME_COUNT;
+	UINT32 *cpu_sum = packed_average ? calloc((size_t)RAW_ACTIVE_W * RAW_ACTIVE_H, sizeof(UINT32)) : NULL;
+	if (packed_average && !cpu_sum) return -1;
 
 	memset((void *)p_stream0->thermal_ffc_out_va, 0, raw_buffer_size);
 	hd_common_mem_flush_cache((void *)p_stream0->thermal_ffc_out_va,
 				  raw_buffer_size);
-	printf("FFC average %u frame start\n", FFC_AVERAGE_FRAME_COUNT);
+	printf("FFC reference average %u frame start\n", frame_count);
 
-	for (frame = 0; frame < FFC_AVERAGE_FRAME_COUNT; frame++) {
+	for (frame = 0; frame < frame_count; frame++) {
 		HD_VIDEO_FRAME *calibration_frame = &vcap_video_frame;
 		HD_RESULT process_ret = HD_OK;
 		HD_RESULT release_ret;
@@ -3029,17 +3044,17 @@ static int liveview_run_ffc_calibration(
 
 		if (p_stream0->cap_exit) {
 			printf("FFC calibration stopped\n");
-			return -1;
+			goto capture_failed;
 		}
 
 		/* The old outer loop refreshed these tables between FFC frames. */
-		if (frame > 0) {
+		if (frame > 0 && !packed_average) {
 			liveview_update_temperature_tables_if_needed(
 				nuc_next_update_ms, tdc_next_update_ms);
 			if (!test_mode && !startup_ffc &&
 			    (!ffc_is_enabled() || ffc_get_shutter_interval_sec() == 0)) {
 				printf("Shutter calibration disabled during FFC\n");
-				return -1;
+				goto capture_failed;
 			}
 		}
 
@@ -3049,7 +3064,7 @@ static int liveview_run_ffc_calibration(
 				printf("FFC cap_pull error=%d !!\r\n\r\n",
 				       process_ret);
 			}
-			return -1;
+			goto capture_failed;
 		}
 
 		lineoffset = vcap_video_frame.loff[0];
@@ -3099,11 +3114,28 @@ static int liveview_run_ffc_calibration(
 			sum_pa = p_stream0->thermal_ffc_out_pa;
 			out_pa = p_stream0->thermal_ffc_sum_pa;
 		}
-		if (frame == FFC_AVERAGE_FRAME_COUNT - 1U) {
+		if (frame == frame_count - 1U) {
 			shift = FFC_AVERAGE_SHIFT;
 		}
 
-		if (process_ret == HD_OK) {
+		if (process_ret == HD_OK && packed_average) {
+			UINT32 y, x;
+			UINTPTR va = (UINTPTR)hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE_CACHE,
+			    calibration_frame->phy_addr[0], raw_buffer_size);
+			if (!va || lineoffset < RAW_SIZE_W * sizeof(UINT16) ||
+			    (UINT64)lineoffset * RAW_SIZE_H > raw_buffer_size) {
+				process_ret = HD_ERR_NG;
+			} else {
+				hd_common_mem_flush_cache((void *)va, raw_buffer_size);
+				for (y = 0; y < RAW_ACTIVE_H; ++y) {
+					const UINT16 *row = (const UINT16 *)(va +
+					    (y + RAW_ACTIVE_Y) * lineoffset) + RAW_ACTIVE_X;
+					for (x = 0; x < RAW_ACTIVE_W; ++x)
+						cpu_sum[(size_t)y * RAW_ACTIVE_W + x] += row[x];
+				}
+			}
+			if (va) hd_common_mem_munmap((void *)va, raw_buffer_size);
+		} else if (process_ret == HD_OK) {
 			process_ret = ffc_accumulate_frame(
 				calibration_frame->phy_addr[0],
 				sum_pa, out_pa, p_stream0->thermal_ffc_zero_pa,
@@ -3124,28 +3156,137 @@ static int liveview_run_ffc_calibration(
 		}
 
 		if (process_ret != HD_OK) {
-			return -1;
+			goto capture_failed;
 		}
 		if (release_ret != HD_OK) {
-			if (frame != FFC_AVERAGE_FRAME_COUNT - 1U) {
-				return -1;
+			if (frame != frame_count - 1U) {
+				goto capture_failed;
 			}
 			final_release_failed = 1;
 		}
-		if (frame != FFC_AVERAGE_FRAME_COUNT - 1U) {
+		if (frame != frame_count - 1U) {
 			usleep(100);
 		}
 	}
 
+	if (packed_average) {
+		size_t i;
+		if (final_release_failed) goto capture_failed;
+		for (i = 0; i < (size_t)RAW_ACTIVE_W * RAW_ACTIVE_H; ++i)
+			packed_average[i] = (UINT16)((cpu_sum[i] + frame_count / 2) / frame_count);
+		free(cpu_sum);
+		return 0;
+	}
+
 	if (liveview_update_ffc_table_from_average(p_stream0, lineoffset) != 0) {
 		printf("FFC update table fail\n");
-		return -1;
-	} else if (test_mode &&
+		goto capture_failed;
+	}
+	/* FFC changes corrected RAW; never mix it with pre-calibration history. */
+	if (p_stream0->agc_weighted_workspace)
+		agc_weighted_state_reset(p_stream0->agc_weighted_workspace);
+	if (test_mode &&
 		   liveview_run_ffc_gfx_test(p_stream0, lineoffset) != 0) {
-		return -1;
+		goto capture_failed;
 	}
 
 	return final_release_failed ? -1 : 0;
+
+capture_failed:
+	free(cpu_sum);
+	return -1;
+}
+
+static int liveview_run_ffc_calibration(VIDEO_LIVEVIEW *stream,
+    UINT64 *nuc_next, UINT64 *tdc_next, int test_mode, int startup_ffc)
+{
+    return liveview_capture_ffc_average(stream, nuc_next, tdc_next,
+        test_mode, startup_ffc, NULL);
+}
+
+/* Discard queued images after a shutter transition, then four fresh frames.
+ * Never use the old scene as the shutter reference. Only RAW worker pulls. */
+static int liveview_shading_discard_frames(VIDEO_LIVEVIEW *stream)
+{
+	UINT32 i;
+	HD_VIDEO_FRAME frame = {0};
+	HD_RESULT ret;
+	for (i = 0; i < 64U && !stream->cap_exit; ++i) {
+		ret = liveview_cap_pull(stream, &frame, 0);
+		if (ret == HD_ERR_UNDERRUN) break;
+		if (ret != HD_OK || liveview_cap_release(stream, &frame) != HD_OK) return -1;
+	}
+	if (i == 64U || stream->cap_exit) return -1;
+	for (i = 0; i < 4U && !stream->cap_exit; ++i) {
+		ret = liveview_cap_pull(stream, &frame, 1000);
+		if (ret != HD_OK || liveview_cap_release(stream, &frame) != HD_OK) return -1;
+	}
+	return stream->cap_exit ? -1 : 0;
+}
+
+static int liveview_run_shading_calibration(VIDEO_LIVEVIEW *stream,
+	UINT64 *nuc_next, UINT64 *tdc_next)
+{
+	UINT16 *open_raw = NULL, *shutter_raw = NULL;
+	size_t bytes = (size_t)RAW_ACTIVE_W * RAW_ACTIVE_H * sizeof(UINT16);
+	int result = -1;
+	int shutter_touched = 0;
+
+	pthread_mutex_lock(&g_shutter_calibration_lock);
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	if (g_manual_calibration_active) {
+		pthread_mutex_unlock(&g_manual_calibration_lock);
+		goto done;
+	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	if (!nuc_is_enabled() || nuc_is_blackbody_dynamic_enabled()) {
+		printf("Shading calibration requires NUC on and blackbody dynamic NUC off\n");
+		goto done;
+	}
+	if (RAW_ACTIVE_W != THERMAL_SENSOR_WIDTH || RAW_ACTIVE_H != THERMAL_SENSOR_HEIGHT) {
+		printf("Shading calibration geometry does not match sensor profile\n");
+		goto done;
+	}
+	open_raw = malloc(bytes);
+	shutter_raw = malloc(bytes);
+	if (!open_raw || !shutter_raw) goto done;
+	/* Update once, then keep exactly the same upstream tables for both sets. */
+	liveview_update_temperature_tables_if_needed(nuc_next, tdc_next);
+	if (!nuc_is_enabled() || nuc_is_blackbody_dynamic_enabled()) goto done;
+	shutter_touched = 1;
+	if (gpio_shutter_open() != 0) goto done;
+	liveview_sleep_ms(g_shutter_close_wait_ms);
+	if (liveview_shading_discard_frames(stream) != 0) goto done;
+	printf("Shading: capture uniform blackbody, 32 frames (NUC on, FFC bypassed)\n");
+	if (liveview_capture_ffc_average(stream, nuc_next, tdc_next, 1, 0, open_raw) != 0)
+		goto done;
+	if (gpio_shutter_close() != 0) goto done;
+	liveview_sleep_ms(g_shutter_close_wait_ms);
+	if (liveview_shading_discard_frames(stream) != 0) goto done;
+	printf("Shading: capture closed shutter, 32 frames (same NUC/TDC)\n");
+	if (liveview_capture_ffc_average(stream, nuc_next, tdc_next, 1, 0, shutter_raw) != 0)
+		goto done;
+	/* Reopen successfully before publishing a new calibration. */
+	if (gpio_shutter_open() != 0) goto done;
+	shutter_touched = 0;
+	if (stream->cap_exit || ffc_shading_calibrate(open_raw, shutter_raw,
+	        tdc_is_enabled()) != 0) goto done;
+	/* Establish a fresh base from the SAME shutter set; compensation is merged
+	 * by FFC, with unity K, on every later startup/manual/periodic update. */
+	ffc_set_shading_input_mode(nuc_is_enabled(), tdc_is_enabled(),
+	    nuc_is_blackbody_dynamic_enabled());
+	if (ffc_update_table_from_raw((UINTPTR)shutter_raw, RAW_ACTIVE_W * sizeof(UINT16),
+	        0, 0, RAW_ACTIVE_W, RAW_ACTIVE_H) != 0) goto done;
+	if (stream->agc_weighted_workspace)
+		agc_weighted_state_reset(stream->agc_weighted_workspace);
+	printf("Shading calibration complete. Enable ffc_shading_enable in Shutter / FFC setting.\n");
+	result = 0;
+done:
+	if (shutter_touched && gpio_shutter_open() != 0) result = -1;
+	free(open_raw);
+	free(shutter_raw);
+	pthread_mutex_unlock(&g_shutter_calibration_lock);
+	return result;
 }
 
 static int liveview_run_shutter_calibration_cycle(
@@ -3389,6 +3530,16 @@ static int liveview_apply_agc_weighted(
 	hd_common_mem_flush_cache((void *)map_va, map_size);
 	input_va = map_va + (UINTPTR)data_offset;
 	agc_weighted_get_params(&params);
+	if (p_stream->agc_weighted_shading_generation != ffc_shading_generation()) {
+		agc_weighted_state_reset(p_stream->agc_weighted_workspace);
+		p_stream->agc_weighted_shading_generation = ffc_shading_generation();
+	}
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	if (p_stream->agc_weighted_calibration_generation != g_weighted_calibration_generation) {
+		agc_weighted_state_reset(p_stream->agc_weighted_workspace);
+		p_stream->agc_weighted_calibration_generation = g_weighted_calibration_generation;
+	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 	agc_status = agc_weighted_apply_u14(
         (const uint16_t *)input_va, input_stride,
         (uint16_t *)p_stream->thermal_agc_histogram_p1_p99_out_va,
@@ -3922,6 +4073,8 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 
 	if (!g_manual_calibration_active &&
 	    ffc_is_enabled() && ffc_table_is_ready()) {
+		ffc_set_shading_input_mode(nuc_applied, tdc_is_enabled(),
+		    nuc_is_blackbody_dynamic_enabled());
 		ret = ffc_apply(current_frame,
 				&ffc_video_frame,
 				p_stream0->thermal_ffc_k_frame_pa,
@@ -4283,6 +4436,7 @@ static void *raw_pipeline_thread(void *arg)
 	int shutter_calibration_result;
 	int shutter_calibration_paused;
 	int startup_ffc_pending;
+	int ffc_operation;
 
 	//------ wait flow_start ------
 	while (p_stream0->cap_enter == 0 && p_stream0->cap_exit == 0) usleep(100);
@@ -4317,9 +4471,11 @@ static void *raw_pipeline_thread(void *arg)
 			liveview_prepare_shutter_interval(
 				&shutter_calibration_enabled);
 
-		if (!shutter_calibration_paused &&
-		    liveview_take_ffc_test_request()) {
-			shutter_calibration_result =
+		ffc_operation = shutter_calibration_paused ? 0 : liveview_take_ffc_test_request();
+		if (ffc_operation) {
+			shutter_calibration_result = ffc_operation == 2 ?
+				liveview_run_shading_calibration(p_stream0,
+					&nuc_sensor_temp_next_update_ms, &tdc_next_update_ms) :
 				liveview_run_shutter_calibration_cycle(
 					p_stream0,
 					&nuc_sensor_temp_next_update_ms,
@@ -4607,7 +4763,8 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	}
     /* Reserve all AGC workspaces so switching never reallocates or restarts UVC. */
     {
-        stream[0].agc_weighted_workspace = (AGC_WEIGHTED_WORKSPACE *)calloc(1, sizeof(AGC_WEIGHTED_WORKSPACE));
+        stream[0].agc_weighted_workspace = (AGC_WEIGHTED_WORKSPACE *)calloc(1,
+            sizeof(AGC_WEIGHTED_WORKSPACE));
         if (!stream[0].agc_weighted_workspace) {
             printf("allocate Weighted Mapping workspace failed\n");
             ret = HD_ERR_NG;
@@ -4952,6 +5109,7 @@ int liveview_init(void)
 	g_liveview.result = 0;
 	g_liveview.initialized = 1;
 	ffc_bind_test_callback(liveview_request_ffc_test);
+	ffc_bind_shading_callback(liveview_request_shading_calibration);
 	gpio_shutter_set_failure_callback(
 		liveview_on_shutter_failure);
 	pthread_mutex_lock(&g_liveview_fault_lock);
@@ -5117,6 +5275,7 @@ int liveview_set_ffc_enabled(int enabled)
 			g_ffc_enable_after_test = 1;
 			if (!g_ffc_test_pending && !g_ffc_test_running) {
 				g_ffc_test_result = -1;
+				g_ffc_test_kind = 1;
 				g_ffc_test_pending = 1;
 			}
 			printf("FFC enable requested; calibrating before applying compensation\n");
@@ -5845,6 +6004,7 @@ void liveview_deinit(void)
 
 	liveview_stop_pipeline(&g_liveview);
 	ffc_bind_test_callback(NULL);
+	ffc_bind_shading_callback(NULL);
 	gpio_shutter_set_failure_callback(NULL);
 	g_liveview.initialized = 0;
 
