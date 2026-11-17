@@ -1,6 +1,8 @@
 #include "app_config.h"
+#include "../Enhancement/RAW/raw_temporal_denoise.h"
 #include "../Enhancement/CLAHE/clahe.h"
 #include "../Enhancement/DDE/dde.h"
+#include "../Enhancement/DDE/dde_dt_opt.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -23,7 +25,6 @@
 #include "../Correction/TDC/tdc.h"
 #include "../Enhancement/AGC/agc_fieldscale.h"
 #include "../Enhancement/AGC/agc_histogram_p1_p99.h"
-#include "../Enhancement/AGC/agc_min_max_tone_curve.h"
 #include "../Enhancement/AGC/agc_mode.h"
 #include "../Enhancement/AGC/agc_weighted.h"
 #include "../ISP/videoproc/videoproc_isp.h"
@@ -60,11 +61,12 @@ typedef struct {
 	unsigned int tdc_interval_sec;
 	int agc_histogram_p1_p99_enable;
 	AGC_HISTOGRAM_P1_P99_PARAMS histogram_p1_p99;
-	int agc_min_max_tone_curve_enable;
 	int agc_fieldscale_enable;
 	AGC_FIELDSCALE_PARAMS fieldscale;
 	int agc_weighted_enable;
+	RAW_TEMPORAL_DENOISE_PARAMS raw_temporal;
 	AGC_WEIGHTED_PARAMS weighted;
+    int weighted_reset_defaults;
 	CLAHE_PARAMS clahe;
     DDE_PARAMS dde;
 	int videoproc_af_enable;
@@ -74,6 +76,25 @@ typedef struct {
 } APP_CONFIG_VALUES;
 
 static APP_CONFIG_VALUES g_app_config;
+
+static int cfg_raw_temporal_key(const char *key)
+{
+    if (!strcmp(key, "raw_temporal_denoise_enable")) return 0;
+    if (!strcmp(key, "raw_temporal_denoise_threshold_dn")) return 1;
+    if (!strcmp(key, "raw_temporal_denoise_history_shift")) return 2;
+    return -1;
+}
+
+static AGC_MODE cfg_agc_selection(const APP_CONFIG_VALUES *c)
+{
+    if (c->agc_histogram_p1_p99_enable +
+        c->agc_fieldscale_enable + c->agc_weighted_enable > 1)
+        return AGC_MODE_OFF;
+    if (c->agc_histogram_p1_p99_enable) return AGC_MODE_HISTOGRAM_P1_P99_CPU;
+    if (c->agc_fieldscale_enable) return AGC_MODE_FIELDSCALE_CPU;
+    if (c->agc_weighted_enable) return AGC_MODE_WEIGHTED_CPU;
+    return AGC_MODE_OFF;
+}
 
 typedef struct {
     const char *key;
@@ -211,11 +232,10 @@ static void cfg_initialize_from_runtime(void)
 	g_app_config.agc_histogram_p1_p99_enable =
 		agc_histogram_p1_p99_is_enabled();
 	agc_histogram_p1_p99_get_params(&g_app_config.histogram_p1_p99);
-	g_app_config.agc_min_max_tone_curve_enable =
-		agc_min_max_tone_curve_is_enabled();
 	g_app_config.agc_fieldscale_enable = agc_fieldscale_is_enabled();
 	agc_fieldscale_get_params(&g_app_config.fieldscale);
 	g_app_config.agc_weighted_enable = agc_weighted_is_enabled();
+	raw_temporal_denoise_get_params(&g_app_config.raw_temporal);
 	agc_weighted_get_params(&g_app_config.weighted);
 	g_app_config.videoproc_af_enable = videoproc_isp_is_af_enabled();
 	g_app_config.videoproc_wdr_enable = videoproc_isp_is_wdr_enabled();
@@ -274,10 +294,11 @@ typedef struct {
 static const WEIGHTED_CFG_ITEM weighted_items[] = {
     {"agc_weighted_clip_limit", "Clip Limit (0 off)", offsetof(AGC_WEIGHTED_PARAMS, clip_tenths), 10, 1000},
     {"agc_weighted_redistribute", "Redistribution (0 off, 1 populated bins)", offsetof(AGC_WEIGHTED_PARAMS, redistribute), 1, 1},
-    {"agc_weighted_bright_weight", "Bright Weight (1 / 1.05 / 1.1..2.0)", offsetof(AGC_WEIGHTED_PARAMS, bright_weight_percent), 100, 200},
-    {"agc_weighted_bright_percentile", "Bright Percentile (0..100)", offsetof(AGC_WEIGHTED_PARAMS, bright_percentile_tenths), 10, 1000},
+    {"agc_weighted_bright_weight", "Bright Weight (finite >= 1; no fixed upper limit)", offsetof(AGC_WEIGHTED_PARAMS, bright_weight), 0, 0},
+    {"agc_weighted_bright_percentile", "Bright Percentile (0..100, after Clip/Redistribution)", offsetof(AGC_WEIGHTED_PARAMS, bright_percentile_tenths), 10, 1000},
     {"agc_weighted_gain_limit", "Gain Limit (0 off; 0.1..4.0 Gray/RAW DN)", offsetof(AGC_WEIGHTED_PARAMS, gain_limit_tenths), 10, 40},
-    {"agc_weighted_temporal_previous_percent", "LUT Smooth (previous %, 0 off)", offsetof(AGC_WEIGHTED_PARAMS, temporal_previous_percent), 1, 99}
+    {"agc_weighted_temporal_previous_percent", "LUT / Background / Gain Smooth (previous %, 0 disables tracking)", offsetof(AGC_WEIGHTED_PARAMS, temporal_previous_percent), 1, 99},
+    {"agc_weighted_balanced_background", "Balanced Background Otsu (0 off, 1 on; no DDE)", offsetof(AGC_WEIGHTED_PARAMS, balanced_background), 1, 1}
 };
 #define WEIGHTED_CFG_COUNT (sizeof(weighted_items) / sizeof(weighted_items[0]))
 static int cfg_weighted_index(const char *key)
@@ -289,6 +310,19 @@ static int cfg_weighted_index(const char *key)
 static uint32_t *cfg_weighted_value(AGC_WEIGHTED_PARAMS *p, unsigned int i)
 {
     return (uint32_t *)((unsigned char *)p + weighted_items[i].offset);
+}
+
+/* scale=0 denotes the floating Bright Weight, not a uint32 fixed-point field. */
+static double cfg_weighted_number(AGC_WEIGHTED_PARAMS *p, unsigned int i)
+{
+    return weighted_items[i].scale ?
+        *cfg_weighted_value(p, i) / (double)weighted_items[i].scale : p->bright_weight;
+}
+
+static void cfg_weighted_finish_reset(APP_CONFIG_VALUES *config)
+{
+    if (config->weighted_reset_defaults) agc_weighted_default_params(&config->weighted);
+    config->weighted_reset_defaults = 0;
 }
 
 static int cfg_store_pair(APP_CONFIG_VALUES *config,
@@ -306,16 +340,45 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
         config->histogram_p1_p99.gain_limit_tenths = (uint32_t)roundf(scaled);
         return 0;
     }
+    if (strcmp(key, "agc_weighted_reset_defaults") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || (int_value != 0 && int_value != 1)) return -1;
+        config->weighted_reset_defaults = (int)int_value;
+        return 0;
+    }
     if (weighted_index >= 0) {
         const WEIGHTED_CFG_ITEM *item = &weighted_items[weighted_index];
         AGC_WEIGHTED_PARAMS params = config->weighted;
+        if (!item->scale) {
+            char *end;
+            double number;
+            errno = 0;
+            number = strtod(value, &end);
+            if (end == value || errno || !isfinite(number) || number < 1.0) return -1;
+            while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+            if (*end) return -1;
+            params.bright_weight = number;
+            if (agc_weighted_validate_params(&params)) return -1;
+            config->weighted = params;
+            return 0;
+        }
         float scaled;
         if (cfg_parse_float(value, &float_value) != 0 || !isfinite(float_value)) return -1;
         scaled = float_value * item->scale;
-        if (scaled < 0 || scaled > item->maximum || fabsf(scaled - roundf(scaled)) > 0.001f) return -1;
+        if (scaled < 0 || scaled > item->maximum || (item->scale != 256 && fabsf(scaled - roundf(scaled)) > 0.001f)) return -1;
         *cfg_weighted_value(&params, (unsigned int)weighted_index) = (uint32_t)roundf(scaled);
         if (agc_weighted_validate_params(&params) != 0) return -1;
         config->weighted = params;
+        return 0;
+    }
+    if (cfg_raw_temporal_key(key) >= 0) {
+        RAW_TEMPORAL_DENOISE_PARAMS p = config->raw_temporal;
+        int index = cfg_raw_temporal_key(key);
+        if (cfg_parse_long(value, &int_value) || int_value < 0 || int_value > 16383) return -1;
+        if (index == 0) p.enable = (uint32_t)int_value;
+        if (index == 1) p.threshold_dn = (uint32_t)int_value;
+        if (index == 2) p.history_shift = (uint32_t)int_value;
+        if (raw_temporal_denoise_validate(&p)) return -1;
+        config->raw_temporal = p;
         return 0;
     }
     if (strcmp(key, "agc_weighted_enable") == 0) {
@@ -323,7 +386,6 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
         config->agc_weighted_enable = (int)int_value;
         if (int_value) {
             config->agc_histogram_p1_p99_enable = 0;
-            config->agc_min_max_tone_curve_enable = 0;
             config->agc_fieldscale_enable = 0;
         }
         return 0;
@@ -364,6 +426,11 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
     if (strcmp(key, "dde_num_iters") == 0) {
         if (cfg_parse_long(value, &int_value) != 0 || int_value < 1 || int_value > 8) return -1;
         config->dde.num_iters = (int)int_value;
+        return 0;
+    }
+    if (strcmp(key, "dde_base_scale") == 0) {
+        if (cfg_parse_long(value, &int_value) != 0 || (int_value != 1 && int_value != 2)) return -1;
+        config->dde.base_scale = (int)int_value;
         return 0;
     }
 	if (strcmp(key, "cfg_boot_load") == 0) {
@@ -456,10 +523,6 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 		if (config->agc_histogram_p1_p99_enable) {
 			config->agc_weighted_enable = 0;
 			config->agc_fieldscale_enable = 0;
-			if (config->agc_min_max_tone_curve_enable) {
-				printf("AGC mutual exclusion: disable Min/Max Tone Curve AGC (ISP)\n");
-			}
-			config->agc_min_max_tone_curve_enable = 0;
 		}
 	} else if (strcmp(key,
 			   "agc_histogram_p1_p99_temporal_previous_percent") == 0) {
@@ -478,28 +541,15 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
 		if (cfg_parse_long(value, &int_value) != 0 ||
 		    int_value < 1 || int_value > 100) return -1;
 		config->histogram_p1_p99.percentile_high = (uint32_t)int_value;
-	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
-		if (cfg_parse_long(value, &int_value) != 0) return -1;
-		config->agc_min_max_tone_curve_enable = int_value ? 1 : 0;
-		if (config->agc_min_max_tone_curve_enable) {
-			config->agc_weighted_enable = 0;
-			config->agc_fieldscale_enable = 0;
-			if (config->agc_histogram_p1_p99_enable) {
-				printf("AGC mutual exclusion: disable Histogram P1/P99 AGC (CPU)\n");
-			}
-			config->agc_histogram_p1_p99_enable = 0;
-		}
 	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
 		config->agc_fieldscale_enable = int_value ? 1 : 0;
 		if (config->agc_fieldscale_enable) {
 			config->agc_weighted_enable = 0;
-			if (config->agc_histogram_p1_p99_enable ||
-			    config->agc_min_max_tone_curve_enable) {
+			if (config->agc_histogram_p1_p99_enable) {
 				printf("AGC mutual exclusion: disable other AGC modes\n");
 			}
 			config->agc_histogram_p1_p99_enable = 0;
-			config->agc_min_max_tone_curve_enable = 0;
 		}
 	} else if (strcmp(key, "videoproc_af_enable") == 0) {
 		if (cfg_parse_long(value, &int_value) != 0) return -1;
@@ -549,6 +599,7 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 			point, config->nuc_sensor_temp_points[point]);
 	}
 	nuc_set_enabled(config->nuc_correction);
+	if (raw_temporal_denoise_set_params(&config->raw_temporal)) apply_result = -1;
 
 	bpr_set_threshold(config->bpr_threshold);
 	if (bpr_set_enabled(config->bpr_correction) < 0) {
@@ -562,23 +613,12 @@ static int cfg_apply_runtime(const APP_CONFIG_VALUES *config)
 	ffc_set_shading_enabled(config->ffc_shading_enable);
 	tdc_set_interval_sec(config->tdc_interval_sec);
 	tdc_set_enabled(config->tdc_correction);
-	if (config->agc_histogram_p1_p99_enable +
-	    config->agc_min_max_tone_curve_enable +
-	    config->agc_fieldscale_enable + config->agc_weighted_enable > 1) {
-		printf("invalid AGC CFG: multiple AGCs are enabled; keep all off\n");
-		agc_mode_set(AGC_MODE_OFF);
-		apply_result = -1;
-	} else if (config->agc_histogram_p1_p99_enable) {
-		agc_mode_set(AGC_MODE_HISTOGRAM_P1_P99_CPU);
-	} else if (config->agc_min_max_tone_curve_enable) {
-		agc_mode_set(AGC_MODE_MIN_MAX_TONE_CURVE_ISP);
-	} else if (config->agc_fieldscale_enable) {
-		agc_mode_set(AGC_MODE_FIELDSCALE_CPU);
-	} else if (config->agc_weighted_enable) {
-		agc_mode_set(AGC_MODE_WEIGHTED_CPU);
-	} else {
-		agc_mode_set(AGC_MODE_OFF);
-	}
+    if (config->agc_histogram_p1_p99_enable +
+        config->agc_fieldscale_enable + config->agc_weighted_enable > 1) {
+        printf("invalid AGC CFG: multiple AGCs are enabled; keep all off\n");
+        agc_mode_set(AGC_MODE_OFF);
+        apply_result = -1;
+    } else agc_mode_set(cfg_agc_selection(config));
 	if (clahe_set_params(&config->clahe) != 0) apply_result = -1;
     if (dde_set_params(&config->dde) != 0) apply_result = -1;
 	videoproc_isp_set_runtime(config->videoproc_af_enable,
@@ -593,9 +633,12 @@ int app_config_load(void)
 	FILE *fp;
 	char line[128];
 	APP_CONFIG_VALUES loaded_config;
+    APP_CONFIG_VALUES previous_config;
+    int reset_requested;
 
 	cfg_initialize_from_runtime();
 	loaded_config = g_app_config;
+    previous_config = g_app_config;
 
 	fp = fopen(APP_CONFIG_PATH, "r");
 	if (fp == 0) {
@@ -633,6 +676,9 @@ int app_config_load(void)
 	}
 	fclose(fp);
 
+    /* One-shot reset overrides all Weighted values, independent of key order. */
+    reset_requested = loaded_config.weighted_reset_defaults;
+    cfg_weighted_finish_reset(&loaded_config);
 	/* Validate the pair after parsing so CFG key order does not matter. */
 	if (agc_histogram_p1_p99_validate_params(&loaded_config.histogram_p1_p99) != 0) {
 		printf("Invalid Histogram percentiles: require 0 <= low < high <= 100; keep previous Histogram settings\n");
@@ -640,6 +686,10 @@ int app_config_load(void)
 	}
 	loaded_config.initialized = 1;
 	g_app_config = loaded_config;
+    if (reset_requested && app_config_save() != 0) {
+        g_app_config = previous_config;
+        return -1;
+    }
 	if (!g_app_config.boot_load) {
 		printf("config boot load disabled, keep current runtime settings\n");
 		return 0;
@@ -669,6 +719,8 @@ int app_config_get_int(const char *key, int *value)
 	}
 
 	cfg_initialize_from_runtime();
+
+
     {
         int i = cfg_weighted_index(key);
         if (i >= 0 && weighted_items[i].scale == 1) {
@@ -688,6 +740,7 @@ int app_config_get_int(const char *key, int *value)
     if (strcmp(key, "dde_sigma_r") == 0) { *value = g_app_config.dde.sigma_r; return 0; }
     if (strcmp(key, "dde_gain_percent") == 0) { *value = g_app_config.dde.gain_percent; return 0; }
     if (strcmp(key, "dde_num_iters") == 0) { *value = g_app_config.dde.num_iters; return 0; }
+    if (strcmp(key, "dde_base_scale") == 0) { *value = g_app_config.dde.base_scale; return 0; }
 	if (strcmp(key, "cfg_boot_load") == 0) {
 		*value = g_app_config.boot_load;
 	} else if (strcmp(key, "fps") == 0) {
@@ -739,10 +792,13 @@ int app_config_get_int(const char *key, int *value)
 		*value = (int)g_app_config.histogram_p1_p99.percentile_low;
 	} else if (strcmp(key, "agc_histogram_p1_p99_percentile_high") == 0) {
 		*value = (int)g_app_config.histogram_p1_p99.percentile_high;
-	} else if (strcmp(key, "agc_min_max_tone_curve_enable") == 0) {
-		*value = g_app_config.agc_min_max_tone_curve_enable;
 	} else if (strcmp(key, "agc_weighted_enable") == 0) {
 		*value = g_app_config.agc_weighted_enable;
+
+	} else if (cfg_raw_temporal_key(key) >= 0) {
+        int index = cfg_raw_temporal_key(key);
+        *value = (int)(index == 0 ? g_app_config.raw_temporal.enable :
+            index == 1 ? g_app_config.raw_temporal.threshold_dn : g_app_config.raw_temporal.history_shift);
 	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
 		*value = g_app_config.agc_fieldscale_enable;
 	} else if (strcmp(key, "videoproc_af_enable") == 0) {
@@ -761,11 +817,7 @@ int app_config_get_int(const char *key, int *value)
 
 static void app_config_request_agc(void)
 {
-    AGC_MODE mode = AGC_MODE_OFF;
-    if (g_app_config.agc_histogram_p1_p99_enable) mode = AGC_MODE_HISTOGRAM_P1_P99_CPU;
-    else if (g_app_config.agc_min_max_tone_curve_enable) mode = AGC_MODE_MIN_MAX_TONE_CURVE_ISP;
-    else if (g_app_config.agc_fieldscale_enable) mode = AGC_MODE_FIELDSCALE_CPU;
-    else if (g_app_config.agc_weighted_enable) mode = AGC_MODE_WEIGHTED_CPU;
+    AGC_MODE mode = cfg_agc_selection(&g_app_config);
     if (liveview_switch_agc((int)mode) == 0)
         printf("AGC saved; next RAW frame uses selection, UVC stays open\n");
     else
@@ -786,6 +838,9 @@ int app_config_update_int(const char *key, int value)
 	old_config = g_app_config;
 	snprintf(value_text, sizeof(value_text), "%d", value);
 	ret = cfg_store_pair(&g_app_config, key, value_text);
+    if (ret == 0) {
+        cfg_weighted_finish_reset(&g_app_config);
+    }
 	if (ret != 0 ||
 	    agc_weighted_validate_params(&g_app_config.weighted) != 0 ||
 	    agc_histogram_p1_p99_validate_params(&g_app_config.histogram_p1_p99) != 0) {
@@ -798,7 +853,10 @@ int app_config_update_int(const char *key, int value)
 		return -1;
 	}
 
-    if (strcmp(key, "ffc_correction") == 0) {
+    if (cfg_raw_temporal_key(key) >= 0) {
+        ret = raw_temporal_denoise_set_params(&g_app_config.raw_temporal);
+        printf("RAW temporal denoise saved; next live frame applies parameters and resets history (no restart)\n");
+    } else if (strcmp(key, "ffc_correction") == 0) {
         ret = liveview_set_ffc_enabled(g_app_config.ffc_correction);
         if (ret < 0) {
             printf("FFC CFG saved, but runtime apply failed\n");
@@ -857,11 +915,10 @@ int app_config_update_int(const char *key, int value)
 		if (ret != 0) return ret;
 		printf("Histogram P1/P99 parameters saved and applied; next Histogram frame resets temporal history (no restart)\n");
 	} else if (strcmp(key, "agc_histogram_p1_p99_enable") == 0 ||
-        strcmp(key, "agc_min_max_tone_curve_enable") == 0 ||
         strcmp(key, "agc_fieldscale_enable") == 0 ||
         strcmp(key, "agc_weighted_enable") == 0) {
         app_config_request_agc();
-    } else if (cfg_weighted_index(key) >= 0) {
+    } else if (cfg_weighted_index(key) >= 0 || strcmp(key, "agc_weighted_reset_defaults") == 0) {
         return agc_weighted_set_params(&g_app_config.weighted);
     } else if (strcmp(key, "pseudo_color_mode") == 0) {
         ret = pseudo_request_mode(g_app_config.pseudo_color_mode);
@@ -1005,6 +1062,10 @@ static int app_config_show_file(void)
 	printf("  2. %-31s = %u sec\n", "tdc_interval_sec",
 	       g_app_config.tdc_interval_sec);
 
+    printf("\n[RAW Preprocessing]\n");
+    printf("raw_temporal_denoise_enable=%u (CPU, native RAW DN, before AGC; next frame)\n", g_app_config.raw_temporal.enable);
+    printf("raw_temporal_denoise_threshold_dn=%u\n", g_app_config.raw_temporal.threshold_dn);
+    printf("raw_temporal_denoise_history_shift=%u (1=50%%, 2=75%%, 3=87.5%% previous)\n", g_app_config.raw_temporal.history_shift);
 	printf("\n[AGC]\n");
     printf("       * agc_histogram_p1_p99_gain_limit = %.1f\n",
         g_app_config.histogram_p1_p99.gain_limit_tenths / 10.0);
@@ -1022,11 +1083,6 @@ static int app_config_show_file(void)
 	       "agc_histogram_p1_p99_percentile_high",
 	       g_app_config.histogram_p1_p99.percentile_high);
 
-	printf("  2. %-31s = %d (%s)\n",
-	       "agc_min_max_tone_curve_enable",
-	       g_app_config.agc_min_max_tone_curve_enable,
-	       g_app_config.agc_min_max_tone_curve_enable ? "on" : "off");
-
 	printf("  3. %-31s = %d (%s)\n",
 	       "agc_fieldscale_enable",
 	       g_app_config.agc_fieldscale_enable,
@@ -1039,11 +1095,13 @@ static int app_config_show_file(void)
 	}
 
     printf("Weighted Mapping: pending=%s (global 1x1)\n", g_app_config.agc_weighted_enable ? "on" : "off");
+    if (g_app_config.weighted.balanced_background)
+        printf("  Balanced Otsu Weighted: background96 Gray; Clip/Redistribution/Bright Weight/P adjust hot detail.\n");
     {
         unsigned int i;
         for (i = 0; i < WEIGHTED_CFG_COUNT; i++)
-            printf("  %s = %.2f\n", weighted_items[i].key,
-                *cfg_weighted_value(&g_app_config.weighted, i) / (double)weighted_items[i].scale);
+            printf("  %s = %.17g\n", weighted_items[i].key,
+                cfg_weighted_number(&g_app_config.weighted, i));
     }
 	printf("  4. %-31s = %s\n",
 	       "selected_runtime_agc",
@@ -1055,6 +1113,7 @@ static int app_config_show_file(void)
     printf("  dde_sigma_r=%d\n", g_app_config.dde.sigma_r);
     printf("  dde_gain_percent=%d\n", g_app_config.dde.gain_percent);
     printf("  dde_num_iters=%d\n", g_app_config.dde.num_iters);
+    printf("  dde_base_scale=%d\n", g_app_config.dde.base_scale);
 	printf("\n[CLAHE]\n");
 	printf("  1. %-31s = %d (%s)\n", "clahe_enable",
 		g_app_config.clahe.enable,
@@ -1164,7 +1223,7 @@ static int app_config_liveview_menu_run(void)
 	while (running) {
 		printf("----------------------------------------\n");
 		printf("Liveview setting\n");
-		printf(" 1. FPS\n");
+		printf(" 1. FPS (UVC supports up to 60; applies after restart)\n");
 		printf(" 2. Startup skip frames\n");
 		printf(" 3. Runtime skip frames\n");
 		printf(" 4. Output mode (UVC / RTSP)\n");
@@ -1610,16 +1669,24 @@ static int app_config_weighted_menu_run(void)
         unsigned int i;
         int option;
         printf("Weighted Mapping AGC (CPU), global 1x1\n");
+        printf(" Native RAW14 mapping/output; Gray parameters retain their existing units.\n");
+        if (g_app_config.weighted.balanced_background)
+            printf(" Balanced Otsu Weighted: fixed background96 Gray; Clip/Redistribution/Bright Weight/P adjust hot detail.\n");
         printf(" 1. Weighted Mapping on/off (pending=%s, runtime=%s)\n",
             g_app_config.agc_weighted_enable ? "on" : "off", agc_weighted_is_enabled() ? "on" : "off");
         for (i = 0; i < WEIGHTED_CFG_COUNT; i++)
-            printf(" %u. %s = %.2f\n", i + 2, weighted_items[i].label,
-                *cfg_weighted_value(&g_app_config.weighted, i) / (double)weighted_items[i].scale);
+            printf(" %u. %s = %.17g\n", i + 2, weighted_items[i].label,
+                cfg_weighted_number(&g_app_config.weighted, i));
+        printf(" %u. Reset all Weighted Mapping parameters to defaults\n", (unsigned int)WEIGHTED_CFG_COUNT + 2);
         printf(" 0. Back\nParameters apply on next Weighted frame. AGC switching keeps UVC open.\n");
         option = app_config_read_option();
         if (option == 0 || option == -1) return 0;
         if (option == 1) {
             app_config_prompt_bool("Weighted Mapping", "agc_weighted_enable", g_app_config.agc_weighted_enable);
+        } else if (option == (int)WEIGHTED_CFG_COUNT + 2) {
+            if (app_config_update_int("agc_weighted_reset_defaults", 1) == 0)
+                printf("Weighted Mapping defaults saved; apply on next Weighted frame\n");
+            else printf("Reset/save failed; previous settings kept\n");
         } else if (option >= 2 && option < (int)WEIGHTED_CFG_COUNT + 2) {
             char text[64];
             APP_CONFIG_VALUES old = g_app_config;
@@ -1640,6 +1707,46 @@ static int app_config_weighted_menu_run(void)
     }
 }
 
+static int app_config_raw_preprocessing_menu_run(void)
+{
+    int option, ret = 0;
+    while (1) {
+        printf("----------------------------------------\n");
+        printf("RAW Preprocessing\n");
+        printf("TDC/NUC/FFC -> RAW temporal denoise -> corrected snapshot/AGC\n");
+        printf(" 1. RAW temporal denoise (CPU) = %u; next frame, no restart\n", g_app_config.raw_temporal.enable);
+        printf(" 2. Temporal difference threshold = %u RAW DN\n", g_app_config.raw_temporal.threshold_dn);
+        printf(" 3. Average strength = %u (1: previous50%%, 2:75%%, 3:87.5%%)\n", g_app_config.raw_temporal.history_shift);
+        printf(" 4. Reset temporal denoise defaults (off, 12 DN, strength 2)\n");
+        printf("Small changes are averaged; large changes pass through. Small real motion may still leave trails.\n");
+        printf(" 0. Back\n");
+        option = app_config_read_option();
+        switch (option) {
+        case 1:
+            ret = app_config_prompt_bool("RAW temporal denoise", "raw_temporal_denoise_enable", g_app_config.raw_temporal.enable);
+            break;
+        case 2:
+            ret = app_config_prompt_int("Temporal difference threshold", "raw_temporal_denoise_threshold_dn", (int)g_app_config.raw_temporal.threshold_dn, 1, 16383, " RAW DN");
+            break;
+        case 3:
+            ret = app_config_prompt_int("Average strength (1=50%, 2=75%, 3=87.5% previous)", "raw_temporal_denoise_history_shift", (int)g_app_config.raw_temporal.history_shift, 1, 3, "");
+            break;
+        case 4: {
+            RAW_TEMPORAL_DENOISE_PARAMS old = g_app_config.raw_temporal;
+            RAW_TEMPORAL_DENOISE_PARAMS defaults = RAW_TEMPORAL_DENOISE_DEFAULTS;
+            g_app_config.raw_temporal = defaults;
+            ret = app_config_save();
+            if (ret) g_app_config.raw_temporal = old;
+            else ret = raw_temporal_denoise_set_params(&defaults);
+            break;
+        }
+        case 0: case -1: return ret;
+        case MENU_OPTION_REFRESH: break;
+        default: printf("Invalid option\n"); break;
+        }
+    }
+}
+
 static int app_config_agc_menu_run(void)
 {
 	int option;
@@ -1651,7 +1758,6 @@ static int app_config_agc_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("AGC setting (mutually exclusive)\n");
 		printf(" 1. Histogram P1/P99 AGC (CPU) setting\n");
-		printf(" 2. Min/Max Tone Curve AGC (ISP) on/off\n");
 		printf(" 3. Fieldscale Local Adaptive AGC (CPU) setting\n");
 		printf(" 4. Disable all AGC\n");
 		printf(" 5. Weighted Mapping AGC (CPU, 1x1) setting\n");
@@ -1660,11 +1766,11 @@ static int app_config_agc_menu_run(void)
 		printf("selected runtime AGC: %s\n",
 		       agc_mode_name(agc_mode_get()));
 		printf("pending CFG: Histogram P1/P99=%s, "
-		       "Min/Max Tone Curve=%s, Fieldscale=%s\n",
+		       "Fieldscale=%s\n",
 		       g_app_config.agc_histogram_p1_p99_enable ? "on" : "off",
-		       g_app_config.agc_min_max_tone_curve_enable ? "on" : "off",
 		       g_app_config.agc_fieldscale_enable ? "on" : "off");
-		printf("pending CFG: Weighted Mapping=%s\n", g_app_config.agc_weighted_enable ? "on" : "off");
+		printf("pending CFG: Weighted Mapping=%s\n",
+            g_app_config.agc_weighted_enable ? "on" : "off");
 		printf("enabling one AGC automatically disables the other AGCs\n");
 		printf("AGC selection: next RAW frame; UVC stays open.\n");
 		printf("pipeline: after RAW snapshot, before VideoProc\n");
@@ -1673,12 +1779,6 @@ static int app_config_agc_menu_run(void)
 		switch (option) {
 		case 1:
 			ret = app_config_histogram_p1_p99_menu_run();
-			break;
-		case 2:
-			ret = app_config_prompt_bool(
-				"Min/Max Tone Curve AGC (ISP)",
-				"agc_min_max_tone_curve_enable",
-				g_app_config.agc_min_max_tone_curve_enable);
 			break;
 		case 3:
 			ret = app_config_fieldscale_menu_run();
@@ -1689,7 +1789,6 @@ static int app_config_agc_menu_run(void)
 		case 4:
 			old_config = g_app_config;
 			g_app_config.agc_histogram_p1_p99_enable = 0;
-			g_app_config.agc_min_max_tone_curve_enable = 0;
 			g_app_config.agc_fieldscale_enable = 0;
 			g_app_config.agc_weighted_enable = 0;
 			ret = app_config_save();
@@ -1719,7 +1818,7 @@ static void app_config_set_dde_preset(DDE_PARAMS *params, int fast)
     params->sigma_s = 21;
     params->sigma_r = 51;
     params->gain_percent = 200;
-    params->num_iters = fast ? 1 : 3;
+    params->num_iters = fast ? 1 : 2;
 }
 
 static int app_config_apply_dde_preset(int fast)
@@ -1746,15 +1845,18 @@ static int app_config_dde_menu_run(void)
     for (;;) {
         DDE_PARAMS runtime;
         dde_get_params(&runtime);
-        printf("----------------------------------------\nDDE setting (CPU, Y8)\n");
+        printf("----------------------------------------\nDDE setting (DDE_1106, CPU, Y8)\n");
+        printf("Core implementation: %s\n", dde_dt_backend_name());
         printf(" 1. On/off: CFG=%s, runtime=%s\n",
             g_app_config.dde.enable ? "on" : "off", runtime.enable ? "on" : "off");
-        printf(" 2. Standard preset: Sigma S=21, Sigma R=51, Detail gain=200%%, Iterations=3\n");
-        printf(" 3. Fast preset: Sigma S=21, Sigma R=51, Detail gain=200%%, Iterations=1\n");
+        printf(" 2. Standard preset: Sigma S=21, Sigma R=51, Detail gain=200%%, Directional passes=2\n");
+        printf(" 3. Fast preset: Sigma S=21, Sigma R=51, Detail gain=200%%, Directional passes=1\n");
         printf(" 4. Sigma S (pixels): CFG=%d, runtime=%d\n", g_app_config.dde.sigma_s, runtime.sigma_s);
         printf(" 5. Sigma R (Y8 DN): CFG=%d, runtime=%d\n", g_app_config.dde.sigma_r, runtime.sigma_r);
         printf(" 6. Detail gain (%%): CFG=%d, runtime=%d\n", g_app_config.dde.gain_percent, runtime.gain_percent);
-        printf(" 7. Iterations: CFG=%d, runtime=%d\n", g_app_config.dde.num_iters, runtime.num_iters);
+        printf(" 7. Directional passes (paired sigma): CFG=%d, runtime=%d\n", g_app_config.dde.num_iters, runtime.num_iters);
+        printf(" 8. Base resolution (1 full, 2 half width/height): CFG=%d, runtime=%d\n",
+            g_app_config.dde.base_scale, runtime.base_scale);
         printf(" 0. Back\nPresets change Sigma S, Sigma R, Detail gain and Iterations. Parameters apply on next display frame.\n");
         option = app_config_read_option();
         switch (option) {
@@ -1773,7 +1875,10 @@ static int app_config_dde_menu_run(void)
             ret = app_config_prompt_int("Detail gain (%)", "dde_gain_percent", g_app_config.dde.gain_percent, 0, 1000, "");
             break;
         case 7:
-            ret = app_config_prompt_int("Iterations", "dde_num_iters", g_app_config.dde.num_iters, 1, 8, "");
+            ret = app_config_prompt_int("Directional passes", "dde_num_iters", g_app_config.dde.num_iters, 1, 8, "");
+            break;
+        case 8:
+            ret = app_config_prompt_int("Base resolution (1 full, 2 half)", "dde_base_scale", g_app_config.dde.base_scale, 1, 2, "");
             break;
         case 0: case -1: return ret;
         case MENU_OPTION_REFRESH: break;
@@ -1849,60 +1954,52 @@ static int app_config_clahe_menu_run(void)
     }
 }
 
-static int app_config_apply_simple_display_mode(int mode)
+/* Standard snapshot from 01_Report/20261111/tiffany_thermal.cfg.
+ * This preset changes only AGC, CLAHE and DDE. It never reads a PC path on board. */
+static int app_config_apply_standard_display_mode(void)
 {
-	APP_CONFIG_VALUES old_config;
-	const char *name;
-	int ret;
+    static const AGC_WEIGHTED_PARAMS weighted = {20, 1, 2.0, 800, 5, 50, 0};
+    static const AGC_HISTOGRAM_P1_P99_PARAMS histogram = {90, 1, 99, 10};
+    static const AGC_FIELDSCALE_PARAMS fieldscale = {8, 2, 800, 1, 1, 90};
+    static const CLAHE_PARAMS clahe = {0, 32, 4};
+    static const DDE_PARAMS dde = {1, 21, 51, 200, 2, 1};
+    APP_CONFIG_VALUES old_config;
+    int ret;
 
-	cfg_initialize_from_runtime();
-	old_config = g_app_config;
-	g_app_config.agc_histogram_p1_p99_enable = 0;
-	g_app_config.agc_min_max_tone_curve_enable = 0;
-	g_app_config.agc_fieldscale_enable = 1;
-	g_app_config.agc_weighted_enable = 0;
+    cfg_initialize_from_runtime();
+    old_config = g_app_config;
+    g_app_config.agc_histogram_p1_p99_enable = 0;
+    g_app_config.agc_fieldscale_enable = 0;
+    g_app_config.agc_weighted_enable = 1;
+    g_app_config.weighted = weighted;
+    g_app_config.histogram_p1_p99 = histogram;
+    g_app_config.fieldscale = fieldscale;
+    g_app_config.clahe = clahe;
+    g_app_config.dde = dde;
 
-	if (mode == 1 || mode == 2) {
-		g_app_config.fieldscale.grid_size = 8U;
-		g_app_config.fieldscale.les_distance = 2U;
-		g_app_config.fieldscale.les_threshold = mode == 1 ? 400U : 800U;
-		g_app_config.fieldscale.message_distance = 1U;
-		g_app_config.fieldscale.message_iterations = mode == 1 ? 7U : 1U;
-		g_app_config.fieldscale.temporal_previous_percent = 90U;
-		g_app_config.clahe.enable = 1;
-		g_app_config.clahe.tile_size = mode == 1 ? 16 : 32;
-		g_app_config.clahe.clip_limit = mode == 1 ? 8 : 16;
-		g_app_config.dde.enable = 1;
-		app_config_set_dde_preset(&g_app_config.dde, mode == 2);
-		name = mode == 1 ? "Standard" : "Fast";
-	} else if (mode == 3) {
-		g_app_config.clahe.enable = 0;
-		g_app_config.dde.enable = 0;
-		name = "AGC only";
-	} else {
-		return -1;
-	}
-
-	if (agc_fieldscale_validate_params(&g_app_config.fieldscale) != 0 ||
-	    dde_validate_params(&g_app_config.dde) != 0) {
-		g_app_config = old_config;
-		return -1;
-	}
-	ret = app_config_save();
-	if (ret != 0) {
-		g_app_config = old_config;
-		return ret;
-	}
-	if (agc_fieldscale_set_params(&g_app_config.fieldscale) != 0 ||
-	    clahe_set_params(&g_app_config.clahe) != 0 ||
-	    dde_set_params(&g_app_config.dde) != 0) {
-		printf("%s display mode saved, but runtime apply failed\n", name);
-		return -1;
-	}
-	app_config_request_agc();
-	printf("%s display mode saved; CLAHE/DDE apply on next display frame\n",
-	       name);
-	return 0;
+    if (agc_weighted_validate_params(&g_app_config.weighted) != 0 ||
+        agc_histogram_p1_p99_validate_params(&g_app_config.histogram_p1_p99) != 0 ||
+        agc_fieldscale_validate_params(&g_app_config.fieldscale) != 0 ||
+        dde_validate_params(&g_app_config.dde) != 0) {
+        g_app_config = old_config;
+        return -1;
+    }
+    ret = app_config_save();
+    if (ret != 0) {
+        g_app_config = old_config;
+        return ret;
+    }
+    if (agc_weighted_set_params(&g_app_config.weighted) != 0 ||
+        agc_histogram_p1_p99_set_params(&g_app_config.histogram_p1_p99) != 0 ||
+        agc_fieldscale_set_params(&g_app_config.fieldscale) != 0 ||
+        clahe_set_params(&g_app_config.clahe) != 0 ||
+        dde_set_params(&g_app_config.dde) != 0) {
+        printf("Standard display mode saved, but runtime apply failed\n");
+        return -1;
+    }
+    app_config_request_agc();
+    printf("Standard display mode saved: Weighted Mapping on, CLAHE off, DDE on; next display frame\n");
+    return 0;
 }
 
 static int app_config_simple_display_menu_run(void)
@@ -1913,17 +2010,16 @@ static int app_config_simple_display_menu_run(void)
 	for (;;) {
 		printf("----------------------------------------\n");
 		printf("Simple display setting\n");
-		printf(" 1. Standard mode: Fieldscale AGC, CLAHE and DDE on; standard presets\n");
-		printf(" 2. Fast mode: Fieldscale AGC, CLAHE and DDE on; fast presets\n");
-		printf(" 3. AGC only: Fieldscale AGC on; CLAHE and DDE off\n");
+		printf(" 1. Standard mode: Weighted Mapping on, CLAHE off, DDE on\n");
+        printf("    AGC: Clip 2, Redistribution on, Bright Weight 2, P80, Gain Limit 0.5, Smooth 50%%\n");
+        printf("    CLAHE: off, Tile 32x32 pixels, Clip 4\n");
+        printf("    DDE: on, Sigma S 21, Sigma R 51, Gain 200%%, Directional passes 2, full base\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		option = app_config_read_option();
 		switch (option) {
 		case 1:
-		case 2:
-		case 3:
-			ret = app_config_apply_simple_display_mode(option);
+			ret = app_config_apply_standard_display_mode();
 			break;
 		case 0:
 		case -1:
@@ -1960,6 +2056,7 @@ int app_config_menu_run(void)
 		printf("11. Show current tiffany_thermal.cfg\n");
 		printf("12. Generate tiffany_thermal.cfg\n");
 		printf("13. Use CFG on next boot/restart on/off\n");
+        printf("14. RAW Preprocessing setting\n");
 		printf(" 0. Back\n");
 		printf("----------------------------------------\n");
 		printf("pending CFG: boot load %s\n",
@@ -2003,6 +2100,9 @@ int app_config_menu_run(void)
 		case 12:
 			ret = app_config_save();
 			break;
+        case 14:
+            ret = app_config_raw_preprocessing_menu_run();
+            break;
 		case 13:
 			ret = app_config_prompt_bool(
 				"Use CFG on next boot/restart",
@@ -2062,6 +2162,7 @@ int app_config_save(void)
     fprintf(fp, "dde_sigma_r=%d\n", g_app_config.dde.sigma_r);
     fprintf(fp, "dde_gain_percent=%d\n", g_app_config.dde.gain_percent);
     fprintf(fp, "dde_num_iters=%d\n", g_app_config.dde.num_iters);
+    fprintf(fp, "dde_base_scale=%d\n", g_app_config.dde.base_scale);
 	fprintf(fp, "clahe_enable=%d\nclahe_tile_size=%d\nclahe_clip_limit=%d\n",
 	    g_app_config.clahe.enable, g_app_config.clahe.tile_size, g_app_config.clahe.clip_limit);
 	fprintf(fp, "startup_skip_frames=%u\n",
@@ -2088,12 +2189,20 @@ int app_config_save(void)
 	fprintf(fp, "tdc_correction=%d\n", g_app_config.tdc_correction);
 	fprintf(fp, "tdc_interval_sec=%u\n",
 		g_app_config.tdc_interval_sec);
+    fprintf(fp, "# RAW Preprocessing: after corrections, before AGC\n");
+    fprintf(fp, "# Hardware PRE RAW-to-RAW BNR before CPU AGC; restart Liveview to apply\n");
+    fprintf(fp, "# CPU temporal denoise: after corrections, before corrected snapshot and AGC; next frame applies\n");
+    fprintf(fp, "raw_temporal_denoise_enable=%u\n", g_app_config.raw_temporal.enable);
+    fprintf(fp, "raw_temporal_denoise_threshold_dn=%u\n", g_app_config.raw_temporal.threshold_dn);
+    fprintf(fp, "raw_temporal_denoise_history_shift=%u\n", g_app_config.raw_temporal.history_shift);
     fprintf(fp, "agc_weighted_enable=%d\n", g_app_config.agc_weighted_enable);
+    fprintf(fp, "# One-shot reset of Weighted Mapping parameters; 1 overrides values on load. Saved as 0.\n");
+    fprintf(fp, "agc_weighted_reset_defaults=0\n");
     {
         unsigned int i;
         for (i = 0; i < WEIGHTED_CFG_COUNT; i++)
-            fprintf(fp, "%s=%.2f\n", weighted_items[i].key,
-                *cfg_weighted_value(&g_app_config.weighted, i) / (double)weighted_items[i].scale);
+            fprintf(fp, !weighted_items[i].scale ? "%s=%.17g\n" : weighted_items[i].scale == 256 ? "%s=%.8f\n" : "%s=%.2f\n", weighted_items[i].key,
+                cfg_weighted_number(&g_app_config.weighted, i));
     }
     fprintf(fp, "agc_histogram_p1_p99_gain_limit=%.1f\n",
         g_app_config.histogram_p1_p99.gain_limit_tenths / 10.0);
@@ -2105,8 +2214,6 @@ int app_config_save(void)
 		g_app_config.histogram_p1_p99.percentile_low);
 	fprintf(fp, "agc_histogram_p1_p99_percentile_high=%u\n",
 		g_app_config.histogram_p1_p99.percentile_high);
-	fprintf(fp, "agc_min_max_tone_curve_enable=%d\n",
-		g_app_config.agc_min_max_tone_curve_enable);
 	fprintf(fp, "agc_fieldscale_enable=%d\n",
 		g_app_config.agc_fieldscale_enable);
     for (point = 0; point < FIELDSCALE_CFG_COUNT; point++) {

@@ -17,7 +17,7 @@
 #define UVC_AUDIO_SAMPLE_RATE       48000U
 #define UVC_MJPEG_BITRATE_BPS       (12U * 1024U * 1024U)
 #define UVC_MJPEG_ENCODER_BUF_MS    3000U
-#define UVC_MJPEG_QUALITY           75U
+#define UVC_MJPEG_QUALITY           100U
 #define UVC_MJPEG_MAX_FRAME_SIZE    (2U * 1024U * 1024U)
 #define UVC_DIAGNOSTIC_PATH_SIZE    192U
 
@@ -459,7 +459,7 @@ HD_RESULT uvc_output_open(UVC_OUTPUT *output, UINT32 width, UINT32 height,
 	HD_RESULT ret;
 
 	if (output == NULL || width == 0 || height == 0 ||
-	    fps == 0 || fps > 30U) {
+	    fps == 0 || fps > UVC_OUTPUT_MAX_FPS) {
 		printf("Invalid UVC configuration: %ux%u %u fps\n",
 			width, height, fps);
 		return HD_ERR_NG;

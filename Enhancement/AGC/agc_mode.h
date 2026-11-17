@@ -4,9 +4,9 @@
 typedef enum {
 	AGC_MODE_OFF = 0,
 	AGC_MODE_HISTOGRAM_P1_P99_CPU,
-	AGC_MODE_MIN_MAX_TONE_CURVE_ISP,
-	AGC_MODE_FIELDSCALE_CPU,
-	AGC_MODE_WEIGHTED_CPU
+	/* Keep surviving mode IDs stable; value 2 is retired and rejected. */
+	AGC_MODE_FIELDSCALE_CPU = 3,
+	AGC_MODE_WEIGHTED_CPU = 4
 } AGC_MODE;
 
 void agc_mode_begin_session(void);

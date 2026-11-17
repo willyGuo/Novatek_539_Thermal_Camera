@@ -1,5 +1,6 @@
 #include "vpe_mirror.h"
 #include "../../Pipeline/frame_lease.h"
+#include "../../Pipeline/videoproc_devices.h"
 #include "vendor_vpe.h"
 #include <stdio.h>
 #include <string.h>
@@ -68,8 +69,8 @@ HD_RESULT vpe_mirror_start(UINT32 width, UINT32 height, UINT32 buffer_size)
  ret = vendor_vpe_init();
  if (ret != HD_OK) goto fail;
  vendor_ready = 1;
- step = "open device 1 control";
- ret = hd_videoproc_open(0, HD_VIDEOPROC_1_CTRL, &control);
+ step = "open mirror device control";
+ ret = hd_videoproc_open(0, THERMAL_MIRROR_CTRL, &control);
  if (ret != HD_OK) goto fail;
  cfg.pipe = HD_VIDEOPROC_PIPE_VPE;
  cfg.isp_id = MIRROR_VPE_ID;
@@ -83,7 +84,7 @@ HD_RESULT vpe_mirror_start(UINT32 width, UINT32 height, UINT32 buffer_size)
  ret = hd_videoproc_set(control, HD_VIDEOPROC_PARAM_CTRL, &ctrl);
  if (ret != HD_OK) goto fail;
  step = "open VPE output";
- ret = hd_videoproc_open(HD_VIDEOPROC_1_IN_0, HD_VIDEOPROC_1_OUT_0, &path);
+ ret = hd_videoproc_open(THERMAL_MIRROR_IN, THERMAL_MIRROR_OUT, &path);
  if (ret != HD_OK) goto fail;
  out.dim.w = width;
  out.dim.h = height;
@@ -112,8 +113,8 @@ HD_RESULT vpe_mirror_start(UINT32 width, UINT32 height, UINT32 buffer_size)
  ret = hd_videoproc_start(path);
  if (ret != HD_OK) goto fail;
  started = 1;
- printf("VPE mirror started: device=1, isp_id=%u, %ux%u, horizontal flip\n",
-  MIRROR_VPE_ID, width, height);
+ printf("VPE mirror started: device=%u, isp_id=%u, %ux%u, horizontal flip\n",
+  THERMAL_MIRROR_DEVICE, MIRROR_VPE_ID, width, height);
  return HD_OK;
 fail:
  printf("VPE mirror %s failed=%d\n", step, ret);

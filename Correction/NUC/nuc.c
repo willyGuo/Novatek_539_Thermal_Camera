@@ -24,10 +24,8 @@
 #ifndef NUC_DIR
 #define NUC_DIR "/mnt/sd/thermal_op"
 #endif
-#define NUC_SENSOR_TEMP_Q8_DIR NUC_DIR "/sensor_temp"
-#define NUC_BLACKBODY_TEMP_Q8_DIR NUC_DIR "/blackbody_temp"
-#define NUC_SENSOR_TEMP_DIR NUC_DIR "/sensor_temp_q14"
-#define NUC_BLACKBODY_TEMP_DIR NUC_DIR "/blackbody_temp_q14"
+#define NUC_SENSOR_TEMP_DIR NUC_DIR "/sensor_temp"
+#define NUC_BLACKBODY_TEMP_DIR NUC_DIR "/blackbody_temp"
 #define NUC_FIVE_POINT_COUNT 5
 #define NUC_CALIBRATION_FRAME_COUNT 4U
 #define NUC_SENSOR_TEMP_DEFAULT_INTERVAL_SEC 60U
@@ -55,7 +53,6 @@ typedef struct {
 	int table_loaded;
 	int sensor_temp_table_point;
 	const char *sensor_table_dir;
-	unsigned int sensor_table_shift;
 	float sensor_temp_points[NUC_FIVE_POINT_COUNT];
 	int blackbody_dynamic_enabled;
 	UINT16 *blackbody_source_tables;
@@ -89,6 +86,9 @@ typedef struct {
 } NUC_TABLE_TRANSACTION_FILE;
 
 static NUC_CONTEXT g_nuc;
+/* Changes to a fixed table/mode invalidate downstream shutter references.
+ * Per-frame dynamic table selection deliberately does not change this epoch. */
+static UINT32 g_nuc_correction_generation;
 static UINT32 g_nuc_sensor_temp_interval_sec =
 	NUC_SENSOR_TEMP_DEFAULT_INTERVAL_SEC;
 
@@ -486,65 +486,31 @@ static int nuc_recover_blackbody_temp_tables(void)
 				  "NUC blackbody temperature", 1);
 }
 
-/* Directory identifies the on-disk format; never infer Q from pixel values.
- * A partial native set is an error, not a reason to mix/fall back to Q8. */
-static int nuc_select_table_source(const char *native_dir, const char *legacy_dir,
-	int include_raw, const char **selected_dir, unsigned int *source_shift)
-{
-	NUC_TABLE_TRANSACTION_FILE files[NUC_BLACKBODY_TABLE_FILE_COUNT];
-	UINT32 count = nuc_prepare_table_transaction(files, native_dir, include_raw);
-	UINT32 i;
-	int native_found = 0;
-	for (i = 0; i < count; i++) {
-		if (access(files[i].final_path, F_OK) == 0) native_found = 1;
-		else if (errno != ENOENT) return -1;
-	}
-	if (native_found) {
-		*selected_dir = native_dir;
-		*source_shift = NUC_GAIN_SHIFT;
-	} else {
-		/* Do not read a legacy set interrupted during an old calibration. */
-		count = nuc_prepare_table_transaction(files, legacy_dir, include_raw);
-		for (i = 0; i < count; i++) {
-			if (access(files[i].stage_path, F_OK) == 0 || errno != ENOENT ||
-			    access(files[i].backup_path, F_OK) == 0 || errno != ENOENT) {
-				printf("Legacy Q8 NUC transaction is incomplete: %s\n", legacy_dir);
-				return -1;
-			}
-		}
-		*selected_dir = legacy_dir;
-		*source_shift = NUC_LEGACY_GAIN_SHIFT;
-	}
-	printf("NUC source: %s (Q%u -> runtime Q%u%s)\n", *selected_dir,
-		*source_shift, NUC_GAIN_SHIFT,
-		*source_shift == NUC_LEGACY_GAIN_SHIFT ? ", RAM conversion only" : "");
-	return 0;
-}
-
+/* Q8 tables use the original directories; never interpret Q14 files as Q8. */
 static int nuc_read_gain_table(const char *path, UINT16 *table,
-	unsigned int source_shift, int verbose)
+	int verbose)
 {
 	if (nuc_read_file_to_mem_internal(path, table, g_nuc.table_size, verbose) != 0)
 		return -1;
-	if (nuc_gain_table_to_q14(table, g_nuc.table_size / sizeof(*table), source_shift) != 0) {
-		printf("NUC invalid K table: %s; Q%u gain must convert to 1..%u in Q%u\n",
-			path, source_shift, NUC_GAIN_MAX, NUC_GAIN_SHIFT);
+	if (nuc_gain_table_validate_q8(table, g_nuc.table_size / sizeof(*table)) != 0) {
+		printf("NUC invalid K table: %s; Q%u gain must be 1..%u in Q%u\n",
+			path, NUC_GAIN_SHIFT, NUC_GAIN_MAX, NUC_GAIN_SHIFT);
 		return -1;
 	}
 	return 0;
 }
 
-static int nuc_validate_gain_file(const char *path, unsigned int source_shift)
+static int nuc_validate_gain_file(const char *path)
 {
 	UINT16 *table = (UINT16 *)malloc(g_nuc.table_size);
 	int ret;
 	if (table == NULL) return -1;
-	ret = nuc_read_gain_table(path, table, source_shift, 1);
+	ret = nuc_read_gain_table(path, table, 1);
 	free(table);
 	return ret;
 }
 
-static int nuc_validate_all_sensor_temp_tables(const char *dir, unsigned int source_shift)
+static int nuc_validate_all_sensor_temp_tables(const char *dir)
 {
 	char k_path[128];
 	char b_path[128];
@@ -563,7 +529,7 @@ static int nuc_validate_all_sensor_temp_tables(const char *dir, unsigned int sou
 
 		if (nuc_validate_table_file(k_path) != 0 ||
 		    nuc_validate_table_file(b_path) != 0 ||
-		    nuc_validate_gain_file(k_path, source_shift) != 0) {
+		    nuc_validate_gain_file(k_path) != 0) {
 			printf("NUC Sensor Temperature point %u table is incomplete\n",
 			       point + 1);
 			return -1;
@@ -575,7 +541,7 @@ static int nuc_validate_all_sensor_temp_tables(const char *dir, unsigned int sou
 	return 0;
 }
 
-static int nuc_validate_all_blackbody_temp_tables(const char *dir, unsigned int source_shift)
+static int nuc_validate_all_blackbody_temp_tables(const char *dir)
 {
 	char path[128];
 	static const char *types[] = {"RAW", "K", "B"};
@@ -592,7 +558,7 @@ static int nuc_validate_all_blackbody_temp_tables(const char *dir, unsigned int 
 			nuc_format_table_path(path, sizeof(path),
 				dir, point, types[type], "");
 			if (nuc_validate_table_file(path) != 0 ||
-			    (type == 1U && nuc_validate_gain_file(path, source_shift) != 0)) {
+			    (type == 1U && nuc_validate_gain_file(path) != 0)) {
 				printf("Blackbody temperature point %u %s table is incomplete\n",
 				       point + 1, types[type]);
 				return -1;
@@ -791,6 +757,17 @@ static int nuc_build_table(const UINT16 *low_raw,
 						NUC_GAIN_SHIFT, g_nuc.active_x + x, g_nuc.active_y + y,
 						gain, NUC_GAIN_MAX);
 					return -1;
+				}
+				{
+					long long add_b = (long long)low_avg -
+						((gain * low_raw[pixel]) >> NUC_GAIN_SHIFT);
+					long long gfx_b = nuc_div_round_nearest(
+						-add_b * NUC_GAIN_ONE, gain);
+					if (gfx_b < -32768 || gfx_b > 32767) {
+						printf("NUC B out of range at (%u,%u): %lld; calibration rejected\n",
+							g_nuc.active_x + x, g_nuc.active_y + y, gfx_b);
+						return -1;
+					}
 				}
 			}
 		}
@@ -1359,16 +1336,13 @@ static int nuc_load_blackbody_dynamic_sources(void)
 	char path[128];
 	int reference_order_valid = 1;
 	int ret = -1;
-	const char *source_dir;
-	unsigned int source_shift;
+	const char *source_dir = NUC_BLACKBODY_TEMP_DIR;
 
 	if (nuc_validate_image_layout() != 0) {
 		return -1;
 	}
 	if (nuc_recover_blackbody_temp_tables() != 0 ||
-	    nuc_select_table_source(NUC_BLACKBODY_TEMP_DIR, NUC_BLACKBODY_TEMP_Q8_DIR,
-		1, &source_dir, &source_shift) != 0 ||
-	    nuc_validate_all_blackbody_temp_tables(source_dir, source_shift) != 0) {
+	    nuc_validate_all_blackbody_temp_tables(source_dir) != 0) {
 		return -1;
 	}
 
@@ -1398,7 +1372,7 @@ static int nuc_load_blackbody_dynamic_sources(void)
 
 		nuc_format_table_path(path, sizeof(path),
 				      source_dir, point, "K", "");
-		if (nuc_read_gain_table(path, k_tables[point], source_shift, 1) != 0) {
+		if (nuc_read_gain_table(path, k_tables[point], 1) != 0) {
 			goto exit;
 		}
 		nuc_format_table_path(path, sizeof(path),
@@ -1684,6 +1658,7 @@ int nuc_set_blackbody_dynamic_enabled(int enable)
 		g_nuc.blackbody_dynamic_enabled = 1;
 		g_nuc.table_loaded = 1;
 		g_nuc.enabled = 1;
+		++g_nuc_correction_generation;
 		nuc_reset_dynamic_performance();
 		if (calibration_state != NULL) {
 			calibration_state("NUC dynamic mode", 0);
@@ -1784,7 +1759,7 @@ static int nuc_load_sensor_temp_table(UINT32 point, int verbose)
 		goto exit;
 	}
 
-	if (nuc_read_gain_table(k_path, k_table, g_nuc.sensor_table_shift, verbose) != 0 ||
+	if (nuc_read_gain_table(k_path, k_table, verbose) != 0 ||
 	    nuc_read_file_to_mem_internal(
 		    b_path, b_table, g_nuc.table_size, verbose) != 0) {
 		goto exit;
@@ -1797,6 +1772,7 @@ static int nuc_load_sensor_temp_table(UINT32 point, int verbose)
 
 	g_nuc.table_loaded = 1;
 	g_nuc.sensor_temp_table_point = (int)point;
+	++g_nuc_correction_generation;
 	if (verbose) {
 		printf("NUC Sensor Temperature point %u K/B table loaded\n",
 		       point + 1);
@@ -1826,22 +1802,18 @@ static int nuc_sensor_temp_points_are_ready(void)
 int nuc_reload_table(void)
 {
 	int ret;
-	const char *source_dir;
-	unsigned int source_shift;
+	const char *source_dir = NUC_SENSOR_TEMP_DIR;
 
 	if (g_nuc.blackbody_dynamic_enabled) {
 		printf("Sensor Temperature reload skipped while blackbody dynamic NUC is on\n");
 		return -1;
 	}
 
-	if (nuc_select_table_source(NUC_SENSOR_TEMP_DIR, NUC_SENSOR_TEMP_Q8_DIR,
-		0, &source_dir, &source_shift) != 0 ||
-	    nuc_validate_all_sensor_temp_tables(source_dir, source_shift) != 0) {
+	if (nuc_validate_all_sensor_temp_tables(source_dir) != 0) {
 		goto fail;
 	}
 
 	g_nuc.sensor_table_dir = source_dir;
-	g_nuc.sensor_table_shift = source_shift;
 	if (!THERMAL_HAS_TEMPERATURE || !nuc_sensor_temp_points_are_ready()) {
 		if (!THERMAL_HAS_TEMPERATURE)
 			printf("%s temperature unavailable, load fixed NUC point 1\n", THERMAL_SENSOR_NAME);
@@ -2199,15 +2171,23 @@ int nuc_init_table(void)
 
 void nuc_set_enabled(int enable)
 {
+	int previous = g_nuc.enabled;
 	if (enable && !g_nuc.table_loaded) {
 		printf("NUC table not loaded, keep NUC off\n");
 		g_nuc.enabled = 0;
+		if (previous) ++g_nuc_correction_generation;
 		printf("NUC off\n");
 		return;
 	}
 
 	g_nuc.enabled = enable ? 1 : 0;
+	if (previous != g_nuc.enabled) ++g_nuc_correction_generation;
 	printf("NUC %s\n", g_nuc.enabled ? "on" : "off");
+}
+
+UINT32 nuc_correction_generation(void)
+{
+	return g_nuc_correction_generation;
 }
 
 int nuc_is_enabled(void)

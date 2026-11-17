@@ -1,4 +1,5 @@
 #include "agc_mode.h"
+#include "../../Config/app_config.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -8,7 +9,6 @@
 #include "agc_fieldscale.h"
 #include "agc_weighted.h"
 #include "agc_histogram_p1_p99.h"
-#include "agc_min_max_tone_curve.h"
 
 #define MENU_OPTION_REFRESH (-2)
 
@@ -26,7 +26,8 @@ void agc_mode_begin_session(void)
 /* The RAW worker consumes the latest selection at a frame boundary. */
 int agc_mode_request(AGC_MODE mode)
 {
-    if (mode < AGC_MODE_OFF || mode > AGC_MODE_WEIGHTED_CPU) return -1;
+    if (mode != AGC_MODE_OFF && mode != AGC_MODE_HISTOGRAM_P1_P99_CPU &&
+        mode != AGC_MODE_FIELDSCALE_CPU && mode != AGC_MODE_WEIGHTED_CPU) return -1;
     pthread_mutex_lock(&g_mode_lock);
     g_requested_mode = (int)mode;
     pthread_mutex_unlock(&g_mode_lock);
@@ -48,7 +49,6 @@ int agc_mode_set(AGC_MODE mode)
 {
 	if (mode != AGC_MODE_OFF &&
 	    mode != AGC_MODE_HISTOGRAM_P1_P99_CPU &&
-	    mode != AGC_MODE_MIN_MAX_TONE_CURVE_ISP &&
 	    mode != AGC_MODE_FIELDSCALE_CPU &&
 	    mode != AGC_MODE_WEIGHTED_CPU) {
 		return -1;
@@ -74,8 +74,6 @@ const char *agc_mode_name(AGC_MODE mode)
 	switch (mode) {
 	case AGC_MODE_HISTOGRAM_P1_P99_CPU:
 		return "Histogram P1/P99 AGC (CPU)";
-	case AGC_MODE_MIN_MAX_TONE_CURVE_ISP:
-		return "Min/Max Tone Curve AGC (ISP)";
 	case AGC_MODE_FIELDSCALE_CPU:
 		return "Fieldscale Local Adaptive AGC (CPU)";
 	case AGC_MODE_WEIGHTED_CPU:
@@ -128,7 +126,6 @@ int agc_menu_run(void)
 		printf("----------------------------------------\n");
 		printf("AGC menu (mutually exclusive)\n");
 		printf(" 1. Histogram P1/P99 (CPU)\n");
-		printf(" 2. Min/Max Tone Curve (ISP)\n");
 		printf(" 3. Fieldscale Local Adaptive AGC (CPU)\n");
 		printf(" 4. Disable all AGC\n");
 		printf(" 5. Weighted Mapping AGC (CPU, 1x1)\n");
@@ -142,10 +139,6 @@ int agc_menu_run(void)
 		switch (option) {
 		case 1:
 			ret = agc_histogram_p1_p99_menu_run();
-			break;
-
-		case 2:
-			ret = agc_min_max_tone_curve_menu_run();
 			break;
 
 		case 3:

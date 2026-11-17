@@ -37,6 +37,7 @@
 #include "vendor_videocapture.h"
 #include "vendor_videoprocess.h"
 #include "../Config/app_config.h"
+#include "../Enhancement/RAW/raw_temporal_denoise.h"
 #include "../Config/hardware_config.h"
 #include "../Device/FOS/fos.h"
 #include "../Device/SensorTemp/sensor_temp.h"
@@ -47,7 +48,6 @@
 #include "../Correction/TDC/tdc.h"
 #include "../Enhancement/AGC/agc_fieldscale.h"
 #include "../Enhancement/AGC/agc_histogram_p1_p99.h"
-#include "../Enhancement/AGC/agc_min_max_tone_curve.h"
 #include "../Enhancement/AGC/agc_mode.h"
 #include "../Enhancement/AGC/agc_weighted.h"
 #include "../Enhancement/Gamma/gamma.h"
@@ -115,24 +115,14 @@
 	((size_t)RAW_ACTIVE_W * RAW_ACTIVE_H * sizeof(UINT16))
 
 #define FFC_AVERAGE_FRAME_COUNT 4U
-#define FFC_AVERAGE_SHIFT       2U
 #define FFC_TEST_SAMPLE_COUNT   10U
 
-#if (AGC_MIN_MAX_TONE_CURVE_LEFT_LUT_COUNT != IQ_TONE_LEFT_NUM)
-#error "Min/Max Tone Curve AGC left LUT size does not match the ISP SDK"
-#endif
 
-#if (AGC_MIN_MAX_TONE_CURVE_RIGHT_LUT_COUNT != IQ_TONE_RIGHT_NUM)
-#error "Min/Max Tone Curve AGC right LUT size does not match the ISP SDK"
-#endif
 
 #if (FFC_AVERAGE_FRAME_COUNT != 4U)
 #error "FFC averaging currently supports exactly 4 frames"
 #endif
 
-#if (FFC_AVERAGE_SHIFT != 2U)
-#error "Four-frame FFC averaging requires shift 2"
-#endif
 
 /* Capture mode and all derived buffers use the selected sensor profile. */
 #define SENSOR_MODE_W           THERMAL_SENSOR_WIDTH
@@ -160,7 +150,7 @@
 #define VIDEO_OUTPUT_HEIGHT      RAW_ACTIVE_H
 #define RTSP_OUTPUT_BITRATE_BPS  (4U * 1024U * 1024U)
 
-#define VIDEOCAP_ALG_FUNC 0//HD_VIDEOCAP_FUNC_AE | HD_VIDEOCAP_FUNC_AWB
+#define VIDEOCAP_ALG_FUNC 0 // HD_VIDEOCAP_FUNC_AE | HD_VIDEOCAP_FUNC_AWB
 
 static UINT32 g_fps = 30;
 static VIDEO_OUTPUT_MODE g_output_mode = VIDEO_OUTPUT_MODE_UVC;
@@ -185,6 +175,8 @@ static UINT64 g_shutter_next_calibration_ms = 0;
 static int g_manual_calibration_active = 0;
 /* Protected by g_manual_calibration_lock; only RAW worker resets the workspace. */
 static UINT32 g_weighted_calibration_generation = 0;
+/* Manual open only: does not invalidate FFC tables or trigger calibration. */
+static UINT32 g_manual_shutter_open_generation = 0;
 /* Protected by g_manual_calibration_lock; consumed only after successful NUC. */
 static int g_nuc_snapshot_pending = 0;
 static int g_shutter_reschedule_after_manual_calibration = 0;
@@ -385,8 +377,8 @@ static HD_RESULT mem_init(void)
     													+VDO_LA_BUF_SIZE(LA_WIN_NUM_W, LA_WIN_NUM_H);
 
 	mem_cfg.pool_info[id].blk_size += VDO_RAW_BUFSIZE(RAW_SIZE_W, RAW_SIZE_H, CAP_OUT_FMT);
-	mem_cfg.pool_info[id].blk_cnt = 2 + 11;
-	// 11 => TDC out + NUC k + NUC b + NUC out + FFC k + FFC b + FFC out + FFC sum + FFC zero + shared CPU AGC out + ISP step test
+	mem_cfg.pool_info[id].blk_cnt = 2 + 12;
+	// 11 active + 1 spare: RAW temporal + TDC + NUC K/B/output + FFC K/B/output/test scratch + shared AGC + ISP step test
 	mem_cfg.pool_info[id].ddr_id = DDR_ID0;
 
 	// config common pool (main)
@@ -516,6 +508,7 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 	HD_PATH_ID video_proc_ctrl = 0;
 	UINT32 alg_func = liveview_get_videoproc_alg_func();
 
+	*p_video_proc_ctrl = 0;
 	ret = hd_videoproc_open(0, _out_id, &video_proc_ctrl); //open this for device control
 	if (ret != HD_OK)
 		return ret;
@@ -531,7 +524,7 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 		video_cfg_param.in_max.frc = HD_VIDEO_FRC_RATIO(1,1);
 		ret = hd_videoproc_set(video_proc_ctrl, HD_VIDEOPROC_PARAM_DEV_CONFIG, &video_cfg_param);
 		if (ret != HD_OK) {
-			return HD_ERR_NG;
+			goto fail;
 		}
 	}
 	{
@@ -539,6 +532,9 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 
 		video_path_param.in_func = 0;
 		ret = hd_videoproc_set(video_proc_ctrl, HD_VIDEOPROC_PARAM_FUNC_CONFIG, &video_path_param);
+		if (ret != HD_OK) {
+			goto fail;
+		}
 	}
 	{
 		VENDOR_VIDEOPROC_THERMAL_INFO thermal_info = {0};
@@ -546,7 +542,8 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 		thermal_info.enable = TRUE;
 		ret = vendor_videoproc_set(video_proc_ctrl, VENDOR_VIDEOPROC_PARAM_THERMAL_INFO, (VOID *)&thermal_info);
 		if (ret != HD_OK) {
-			printf("enable VideoProc thermal mode failed=%d\n", ret);
+			printf("enable VideoProc thermal mode failed=%d; stop RAWALL initialization\n", ret);
+			goto fail;
 		} else {
 			printf("VideoProc thermal mode enabled\n");
 		}
@@ -558,9 +555,15 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 		video_ctrl_param.ref_path_3dnr = HD_VIDEOPROC_0_OUT_4;
 	}
 	ret = hd_videoproc_set(video_proc_ctrl, HD_VIDEOPROC_PARAM_CTRL, &video_ctrl_param);
+	if (ret != HD_OK) {
+		goto fail;
+	}
 
 	video_ll_param.delay_trig_lowlatency = 0;
 	ret = hd_videoproc_set(video_proc_ctrl, HD_VIDEOPROC_PARAM_LL_CONFIG, &video_ll_param);
+	if (ret != HD_OK) {
+		goto fail;
+	}
 	printf("VideoProc / ISP runtime: AF=%s, WDR=%s, DEFOG=%s, 3DNR=%s, func=0x%x\n",
 	       videoproc_isp_is_af_enabled() ? "on" : "off",
 	       videoproc_isp_is_wdr_enabled() ? "on" : "off",
@@ -570,6 +573,13 @@ static HD_RESULT set_proc_cfg(HD_PATH_ID *p_video_proc_ctrl, HD_DIM* p_max_dim, 
 
 	*p_video_proc_ctrl = video_proc_ctrl;
 
+	return HD_OK;
+
+fail:
+	printf("VideoProc thermal configuration aborted=%d\n", ret);
+	if (hd_videoproc_close(video_proc_ctrl) != HD_OK) {
+		printf("close VideoProc control after configuration failure failed\n");
+	}
 	return ret;
 }
 
@@ -712,6 +722,10 @@ typedef struct _VIDEO_LIVEVIEW {
 
 	// (2)
 	HD_DIM  proc_max_dim;
+	RAW_TEMPORAL_DENOISE_STATE raw_temporal;
+	UINT32 raw_temporal_tag, raw_temporal_calibration, raw_temporal_shading, raw_temporal_ffc_generation;
+	UINT32 raw_temporal_shutter_generation;
+	int raw_temporal_input_reported;
 	HD_PATH_ID proc_ctrl;
 	HD_PATH_ID proc_path;
 	HD_PATH_ID proc_path_3dnr;
@@ -726,6 +740,8 @@ typedef struct _VIDEO_LIVEVIEW {
 	VIDEO_OUTPUT video_output;
 
 
+	HD_COMMON_MEM_VB_BLK thermal_raw_temporal_blk;
+	UINTPTR thermal_raw_temporal_pa, thermal_raw_temporal_va;
 	HD_COMMON_MEM_VB_BLK thermal_nuc_out_blk;
 	UINTPTR thermal_nuc_out_pa;
 	UINTPTR thermal_nuc_out_va;
@@ -748,9 +764,6 @@ typedef struct _VIDEO_LIVEVIEW {
 	HD_COMMON_MEM_VB_BLK thermal_ffc_sum_blk;
 	UINTPTR thermal_ffc_sum_pa;
 	UINTPTR thermal_ffc_sum_va;
-	HD_COMMON_MEM_VB_BLK thermal_ffc_zero_blk;
-	UINTPTR thermal_ffc_zero_pa;
-	UINTPTR thermal_ffc_zero_va;
 
 	HD_COMMON_MEM_VB_BLK thermal_ffc_k_frame_blk;
 	UINTPTR thermal_ffc_k_frame_pa;
@@ -767,6 +780,7 @@ typedef struct _VIDEO_LIVEVIEW {
 	UINT32 agc_weighted_frame_count, agc_weighted_error_count;
 	UINT32 agc_weighted_calibration_generation;
 	UINT32 agc_weighted_shading_generation;
+	UINT32 agc_weighted_shutter_generation;
 	uint32_t *agc_histogram_p1_p99_workspace;
 	AGC_HISTOGRAM_P1_P99_STATE agc_histogram_p1_p99_state;
 	uint32_t *agc_fieldscale_horizontal_workspace;
@@ -775,8 +789,6 @@ typedef struct _VIDEO_LIVEVIEW {
 	UINT32 agc_histogram_p1_p99_error_count;
 	UINT32 agc_fieldscale_frame_count;
 	UINT32 agc_fieldscale_error_count;
-	UINT32 agc_min_max_tone_curve_frame_count;
-	UINT32 agc_min_max_tone_curve_error_count;
 
 	HD_COMMON_MEM_VB_BLK thermal_isp_step_test_blk;
 	UINTPTR thermal_isp_step_test_pa;
@@ -1283,14 +1295,18 @@ static int liveview_manual_shutter_command(int open)
 		return -1;
 	}
 
+	pthread_mutex_lock(&g_manual_calibration_lock);
 	if (open) {
 		ret = gpio_shutter_open();
 		if (ret == 0) {
 			liveview_set_shutter_fault(0);
+			/* RAW worker consumes this; UI must not mutate its workspace. */
+			g_manual_shutter_open_generation++;
 		}
 	} else {
 		ret = gpio_shutter_close();
 	}
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
 	return ret;
@@ -2373,6 +2389,80 @@ static int copy_videoframe_raw(HD_VIDEO_FRAME *p_video_frame, UINTPTR dst_va, UI
 	return 0;
 }
 
+static int liveview_apply_raw_temporal(VIDEO_LIVEVIEW *s, HD_VIDEO_FRAME *in,
+    HD_VIDEO_FRAME *out, const RAW_TEMPORAL_DENOISE_PARAMS *params)
+{
+    UINT32 size = RAW_SIZE_W * RAW_SIZE_H * sizeof(UINT16);
+    UINT32 storage_mask = HD_VIDEO_PXLFMT_CLASS_MASK | HD_VIDEO_PXLFMT_PLANE_MASK | HD_VIDEO_PXLFMT_BPP_MASK;
+    int result;
+    HD_RESULT cache_ret;
+    if (!s || !in || !out || !params) {
+        printf("RAW temporal: null state/frame/parameters\n");
+        return -1;
+    }
+    if (!s->thermal_raw_temporal_va || !s->thermal_raw_temporal_pa ||
+        !s->thermal_raw_temporal_blk ||
+        s->thermal_raw_temporal_blk == HD_COMMON_MEM_VB_INVALID_BLK) {
+        printf("RAW temporal: output buffer unavailable, va=%p pa=0x%llx block=0x%llx\n",
+            (void *)s->thermal_raw_temporal_va,
+            (unsigned long long)s->thermal_raw_temporal_pa,
+            (unsigned long long)s->thermal_raw_temporal_blk);
+        return -1;
+    }
+    if ((in->pxlfmt & storage_mask) != HD_VIDEO_PXLFMT_RAW16 ||
+        !(in->pxlfmt & HD_VIDEO_PIX_PACK_LSB) ||
+        in->dim.w != RAW_SIZE_W || in->dim.h != RAW_SIZE_H) {
+        printf("RAW temporal: input format/layout rejected, fmt=0x%08x LSB=%u size=%ux%u stride=%u plane_h=%u; expected RAW16 LSB %ux%u\n",
+            (unsigned)in->pxlfmt, !!(in->pxlfmt & HD_VIDEO_PIX_PACK_LSB),
+            (unsigned)in->dim.w, (unsigned)in->dim.h,
+            (unsigned)in->loff[0], (unsigned)in->ph[0], RAW_SIZE_W, RAW_SIZE_H);
+        return -1;
+    }
+    if (copy_videoframe_raw(in, s->thermal_raw_temporal_va, size)) {
+        printf("RAW temporal: input staging copy failed, size=%u block=0x%llx pa=0x%llx stride=%u plane_h=%u\n",
+            size, (unsigned long long)in->blk, (unsigned long long)in->phy_addr[0],
+            (unsigned)in->loff[0], (unsigned)in->ph[0]);
+        return -1;
+    }
+    if (!s->raw_temporal_input_reported) {
+        const uint16_t *raw = (const uint16_t *)s->thermal_raw_temporal_va;
+        UINT32 i, count = RAW_SIZE_W * RAW_SIZE_H, above_raw14 = 0;
+        UINT32 min_dn = UINT16_MAX, max_dn = 0;
+        for (i = 0; i < count; ++i) {
+            if (raw[i] < min_dn) min_dn = raw[i];
+            if (raw[i] > max_dn) max_dn = raw[i];
+            if (raw[i] > 16383U) ++above_raw14;
+        }
+        printf("RAW temporal first input: fmt=0x%08x size=%ux%u source_stride=%u DN=%u..%u above16383=%u (preserved)\n",
+            (unsigned)in->pxlfmt, RAW_SIZE_W, RAW_SIZE_H,
+            (unsigned)in->loff[0], min_dn, max_dn, above_raw14);
+    }
+    result = raw_temporal_denoise_process(&s->raw_temporal,
+        (uint16_t *)s->thermal_raw_temporal_va, RAW_SIZE_W * sizeof(UINT16),
+        RAW_SIZE_W, RAW_SIZE_H, in->timestamp, params);
+    if (result < 0) {
+        printf("RAW temporal: filter failed=%d (%s), threshold=%u DN strength=%u history=%p capacity=%llu need=%llu bytes\n",
+            result, result == RAW_TEMPORAL_ERROR_MEMORY ? "history allocation" :
+                result == RAW_TEMPORAL_ERROR_LAYOUT ? "buffer layout" : "state/parameters",
+            params->threshold_dn, params->history_shift, (void *)s->raw_temporal.history_q8,
+            (unsigned long long)s->raw_temporal.capacity,
+            (unsigned long long)RAW_SIZE_W * RAW_SIZE_H * sizeof(uint32_t));
+        return -1;
+    }
+    cache_ret = hd_common_mem_flush_cache((void *)s->thermal_raw_temporal_va, size);
+    if (cache_ret != HD_OK) {
+        printf("RAW temporal: output cache flush failed=%d size=%u\n", cache_ret, size);
+        return -1;
+    }
+    *out = *in;
+    out->blk = s->thermal_raw_temporal_blk;
+    out->phy_addr[0] = s->thermal_raw_temporal_pa;
+    out->loff[0] = RAW_SIZE_W * sizeof(UINT16);
+    out->ph[0] = RAW_SIZE_H;
+    s->raw_temporal_input_reported = 1;
+    return result;
+}
+
 static int liveview_update_ffc_table_from_average(VIDEO_LIVEVIEW *p_stream,
 						   UINT32 lineoffset)
 {
@@ -2408,8 +2498,6 @@ static int liveview_run_ffc_gfx_test(VIDEO_LIVEVIEW *p_stream,
 	if (p_stream == NULL || lineoffset == 0 ||
 	    p_stream->thermal_ffc_out_pa == 0 ||
 	    p_stream->thermal_ffc_out_va == 0 ||
-	    p_stream->thermal_ffc_zero_pa == 0 ||			// Tim FFC
-	    p_stream->thermal_ffc_zero_va == 0 ||
 	    p_stream->thermal_ffc_k_frame_pa == 0 ||
 	    p_stream->thermal_ffc_k_frame_va == 0 ||
 	    p_stream->thermal_ffc_b_frame_pa == 0 ||
@@ -2517,7 +2605,7 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		return HD_ERR_NG;
 	}
 
-	/* Initialize NUC unity gain in the selected fixed-point format (Q14). */
+	/* Initialize NUC unity gain in the selected fixed-point format (Q8). */
 	for (i = 0; i < blk_size; i += 4) {
 		*(UINT32 *)(p_stream->thermal_k_frame_va + i) =
 			(NUC_GAIN_ONE << 16) | NUC_GAIN_ONE;
@@ -2653,25 +2741,7 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_sum_va, blk_size);
 
 	// init FFC zero frame (read-only GFX source)
-	p_stream->thermal_ffc_zero_blk = hd_common_mem_get_block(HD_COMMON_MEM_COMMON_POOL, blk_size, DDR_ID0);
-	if (p_stream->thermal_ffc_zero_blk == 0) {
-		printf("get ffc zero block fail (0x%" PRIu64 ")\r\n", (uint64_t)p_stream->thermal_ffc_zero_blk);
-		return HD_ERR_NG;
-	}
 
-	p_stream->thermal_ffc_zero_pa = hd_common_mem_blk2pa(p_stream->thermal_ffc_zero_blk);
-	if (p_stream->thermal_ffc_zero_pa == 0) {
-		printf("blk2pa fail, thermal_ffc_zero_blk = 0x%" PRIu64 "\r\n", (uint64_t)p_stream->thermal_ffc_zero_blk);
-		return HD_ERR_NG;
-	}
-
-	p_stream->thermal_ffc_zero_va = (UINTPTR)hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE_CACHE, p_stream->thermal_ffc_zero_pa, blk_size);
-	if (p_stream->thermal_ffc_zero_va == 0) {
-		printf("Error: mmap ffc zero pa fail !\r\n");
-		return HD_ERR_NG;
-	}
-	memset((void *)p_stream->thermal_ffc_zero_va, 0, blk_size);
-	hd_common_mem_flush_cache((void *)p_stream->thermal_ffc_zero_va, blk_size);
 
 	// init shared CPU AGC output frame
 	p_stream->thermal_agc_histogram_p1_p99_out_blk =
@@ -2725,6 +2795,17 @@ static HD_RESULT init_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		return HD_ERR_NG;
 	}
 	agc_fieldscale_state_reset(&p_stream->agc_fieldscale_state);
+
+    /* Separate output preserves VCAP/correction and any pending snapshots. */
+    p_stream->thermal_raw_temporal_blk = hd_common_mem_get_block(
+        HD_COMMON_MEM_COMMON_POOL, blk_size, DDR_ID0);
+    if (!p_stream->thermal_raw_temporal_blk ||
+        p_stream->thermal_raw_temporal_blk == HD_COMMON_MEM_VB_INVALID_BLK) return HD_ERR_NG;
+    p_stream->thermal_raw_temporal_pa = hd_common_mem_blk2pa(p_stream->thermal_raw_temporal_blk);
+    if (!p_stream->thermal_raw_temporal_pa) return HD_ERR_NG;
+    p_stream->thermal_raw_temporal_va = (UINTPTR)hd_common_mem_mmap(
+        HD_COMMON_MEM_MEM_TYPE_CACHE, p_stream->thermal_raw_temporal_pa, blk_size);
+    if (!p_stream->thermal_raw_temporal_va) return HD_ERR_NG;
 
 	// init ISP RAW14-to-Y8 step-test input frame
 	p_stream->thermal_isp_step_test_blk = hd_common_mem_get_block(
@@ -2810,11 +2891,13 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 		p_stream->thermal_ffc_out_blk, "FFC output");
 	RELEASE_THERMAL_BUFFER(p_stream->thermal_ffc_sum_va,
 		p_stream->thermal_ffc_sum_blk, "FFC sum");
-	RELEASE_THERMAL_BUFFER(p_stream->thermal_ffc_zero_va,
-		p_stream->thermal_ffc_zero_blk, "FFC zero");
 	RELEASE_THERMAL_BUFFER(p_stream->thermal_agc_histogram_p1_p99_out_va,
 		p_stream->thermal_agc_histogram_p1_p99_out_blk,
 		"shared CPU AGC output");
+    RELEASE_THERMAL_BUFFER(p_stream->thermal_raw_temporal_va,
+        p_stream->thermal_raw_temporal_blk, "RAW temporal output");
+    raw_temporal_denoise_destroy(&p_stream->raw_temporal);
+    p_stream->thermal_raw_temporal_pa = 0;
 	RELEASE_THERMAL_BUFFER(p_stream->thermal_isp_step_test_va,
 		p_stream->thermal_isp_step_test_blk,
 		"ISP RAW-to-Y Step Test input");
@@ -2829,7 +2912,6 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	p_stream->thermal_ffc_b_frame_pa = 0;
 	p_stream->thermal_ffc_out_pa = 0;
 	p_stream->thermal_ffc_sum_pa = 0;
-	p_stream->thermal_ffc_zero_pa = 0;
 	p_stream->thermal_agc_histogram_p1_p99_out_pa = 0;
 	p_stream->thermal_isp_step_test_pa = 0;
 	free(p_stream->agc_weighted_workspace);
@@ -2845,8 +2927,6 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	agc_fieldscale_state_reset(&p_stream->agc_fieldscale_state);
 	p_stream->agc_fieldscale_frame_count = 0;
 	p_stream->agc_fieldscale_error_count = 0;
-	p_stream->agc_min_max_tone_curve_frame_count = 0;
-	p_stream->agc_min_max_tone_curve_error_count = 0;
 
 	return ret;
 }
@@ -3009,6 +3089,27 @@ static void liveview_update_temperature_tables_if_needed(
 	pthread_mutex_unlock(&g_manual_calibration_lock);
 }
 
+/* Call under g_manual_calibration_lock, before consuming/publishing FFC. */
+static void liveview_sync_ffc_upstream(void)
+{
+	/* Manual calibration replaces its tables outside this mutex while the
+	 * worker bypasses corrections. Read the epoch only after it completes. */
+	if (g_manual_calibration_active) return;
+	ffc_set_upstream_state(nuc_is_enabled(), tdc_is_enabled(),
+		nuc_correction_generation(), tdc_correction_generation(),
+		g_weighted_calibration_generation);
+}
+
+static int liveview_ffc_needs_refresh(void)
+{
+	int pending;
+	pthread_mutex_lock(&g_manual_calibration_lock);
+	liveview_sync_ffc_upstream();
+	pending = ffc_is_enabled() && ffc_refresh_is_required();
+	pthread_mutex_unlock(&g_manual_calibration_lock);
+	return pending;
+}
+
 static int liveview_capture_ffc_average(
 	VIDEO_LIVEVIEW *p_stream0,
 	UINT64 *nuc_next_update_ms,
@@ -3026,36 +3127,24 @@ static int liveview_capture_ffc_average(
 	UINT32 frame;
 	int final_release_failed = 0;
 	UINT32 frame_count = packed_average ? 32U : FFC_AVERAGE_FRAME_COUNT;
-	UINT32 *cpu_sum = packed_average ? calloc((size_t)RAW_ACTIVE_W * RAW_ACTIVE_H, sizeof(UINT32)) : NULL;
-	if (packed_average && !cpu_sum) return -1;
-
-	memset((void *)p_stream0->thermal_ffc_out_va, 0, raw_buffer_size);
-	hd_common_mem_flush_cache((void *)p_stream0->thermal_ffc_out_va,
-				  raw_buffer_size);
+	UINT32 *cpu_sum = calloc((size_t)RAW_ACTIVE_W * RAW_ACTIVE_H, sizeof(UINT32));
+	if (!cpu_sum) return -1;
+	/* The caller freezes upstream tables for the entire acquisition. A
+	 * corrected sample can span UINT16, so even four frames need UINT32. */
+	(void)nuc_next_update_ms;
+	(void)tdc_next_update_ms;
+	(void)startup_ffc;
+	liveview_sync_ffc_upstream();
 	printf("FFC reference average %u frame start\n", frame_count);
 
 	for (frame = 0; frame < frame_count; frame++) {
 		HD_VIDEO_FRAME *calibration_frame = &vcap_video_frame;
 		HD_RESULT process_ret = HD_OK;
 		HD_RESULT release_ret;
-		UINTPTR sum_pa;
-		UINTPTR out_pa;
-		UINT32 shift = 0;
 
 		if (p_stream0->cap_exit) {
 			printf("FFC calibration stopped\n");
 			goto capture_failed;
-		}
-
-		/* The old outer loop refreshed these tables between FFC frames. */
-		if (frame > 0 && !packed_average) {
-			liveview_update_temperature_tables_if_needed(
-				nuc_next_update_ms, tdc_next_update_ms);
-			if (!test_mode && !startup_ffc &&
-			    (!ffc_is_enabled() || ffc_get_shutter_interval_sec() == 0)) {
-				printf("Shutter calibration disabled during FFC\n");
-				goto capture_failed;
-			}
 		}
 
 		process_ret = liveview_cap_pull(p_stream0, &vcap_video_frame, 100);
@@ -3107,19 +3196,11 @@ static int liveview_capture_ffc_average(
 			}
 		}
 
-		if ((frame & 1U) == 0) {
-			sum_pa = p_stream0->thermal_ffc_out_pa;
-			out_pa = p_stream0->thermal_ffc_sum_pa;
-		} else {
-			sum_pa = p_stream0->thermal_ffc_out_pa;
-			out_pa = p_stream0->thermal_ffc_sum_pa;
-		}
-		if (frame == frame_count - 1U) {
-			shift = FFC_AVERAGE_SHIFT;
-		}
-
-		if (process_ret == HD_OK && packed_average) {
+		if (process_ret == HD_OK) {
 			UINT32 y, x;
+			/* GFX correction output is tightly packed; VCAP may be padded. */
+			lineoffset = calibration_frame == &vcap_video_frame ?
+				vcap_video_frame.loff[0] : RAW_SIZE_W * sizeof(UINT16);
 			UINTPTR va = (UINTPTR)hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE_CACHE,
 			    calibration_frame->phy_addr[0], raw_buffer_size);
 			if (!va || lineoffset < RAW_SIZE_W * sizeof(UINT16) ||
@@ -3134,19 +3215,8 @@ static int liveview_capture_ffc_average(
 						cpu_sum[(size_t)y * RAW_ACTIVE_W + x] += row[x];
 				}
 			}
-			if (va) hd_common_mem_munmap((void *)va, raw_buffer_size);
-		} else if (process_ret == HD_OK) {
-			process_ret = ffc_accumulate_frame(
-				calibration_frame->phy_addr[0],
-				sum_pa, out_pa, p_stream0->thermal_ffc_zero_pa,
-				RAW_SIZE_W, RAW_SIZE_H, shift);
-			if (process_ret == HD_OK) {
-				printf("FFC average frame %u/%u, shift=%u\n",
-				       frame + 1U, FFC_AVERAGE_FRAME_COUNT,
-				       shift);
-			} else {
-				printf("FFC accumulate error=%d\n", process_ret);
-			}
+			if (va && hd_common_mem_munmap((void *)va, raw_buffer_size) != HD_OK)
+				process_ret = HD_ERR_NG;
 		}
 
 		release_ret = liveview_cap_release(p_stream0, &vcap_video_frame);
@@ -3169,13 +3239,25 @@ static int liveview_capture_ffc_average(
 		}
 	}
 
+	if (final_release_failed) goto capture_failed;
 	if (packed_average) {
 		size_t i;
-		if (final_release_failed) goto capture_failed;
 		for (i = 0; i < (size_t)RAW_ACTIVE_W * RAW_ACTIVE_H; ++i)
 			packed_average[i] = (UINT16)((cpu_sum[i] + frame_count / 2) / frame_count);
 		free(cpu_sum);
 		return 0;
+	}
+	{
+		UINT32 x, y;
+		UINT16 *output = (UINT16 *)p_stream0->thermal_ffc_out_va;
+		memset(output, 0, raw_buffer_size);
+		for (y = 0; y < RAW_ACTIVE_H; ++y)
+			for (x = 0; x < RAW_ACTIVE_W; ++x)
+				output[(y + RAW_ACTIVE_Y) * RAW_SIZE_W + x + RAW_ACTIVE_X] =
+					(UINT16)(cpu_sum[(size_t)y * RAW_ACTIVE_W + x] / frame_count);
+		free(cpu_sum);
+		cpu_sum = NULL;
+		lineoffset = RAW_SIZE_W * sizeof(UINT16);
 	}
 
 	if (liveview_update_ffc_table_from_average(p_stream0, lineoffset) != 0) {
@@ -3233,12 +3315,12 @@ static int liveview_run_shading_calibration(VIDEO_LIVEVIEW *stream,
 	int shutter_touched = 0;
 
 	pthread_mutex_lock(&g_shutter_calibration_lock);
+	/* Refresh once, before taking exclusive ownership of correction tables. */
+	liveview_update_temperature_tables_if_needed(nuc_next, tdc_next);
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	if (g_manual_calibration_active) {
-		pthread_mutex_unlock(&g_manual_calibration_lock);
 		goto done;
 	}
-	pthread_mutex_unlock(&g_manual_calibration_lock);
 	if (!nuc_is_enabled() || nuc_is_blackbody_dynamic_enabled()) {
 		printf("Shading calibration requires NUC on and blackbody dynamic NUC off\n");
 		goto done;
@@ -3251,7 +3333,6 @@ static int liveview_run_shading_calibration(VIDEO_LIVEVIEW *stream,
 	shutter_raw = malloc(bytes);
 	if (!open_raw || !shutter_raw) goto done;
 	/* Update once, then keep exactly the same upstream tables for both sets. */
-	liveview_update_temperature_tables_if_needed(nuc_next, tdc_next);
 	if (!nuc_is_enabled() || nuc_is_blackbody_dynamic_enabled()) goto done;
 	shutter_touched = 1;
 	if (gpio_shutter_open() != 0) goto done;
@@ -3269,6 +3350,8 @@ static int liveview_run_shading_calibration(VIDEO_LIVEVIEW *stream,
 	/* Reopen successfully before publishing a new calibration. */
 	if (gpio_shutter_open() != 0) goto done;
 	shutter_touched = 0;
+	liveview_sleep_ms(g_shutter_close_wait_ms);
+	if (liveview_shading_discard_frames(stream) != 0) goto done;
 	if (stream->cap_exit || ffc_shading_calibrate(open_raw, shutter_raw,
 	        tdc_is_enabled()) != 0) goto done;
 	/* Establish a fresh base from the SAME shutter set; compensation is merged
@@ -3282,9 +3365,16 @@ static int liveview_run_shading_calibration(VIDEO_LIVEVIEW *stream,
 	printf("Shading calibration complete. Enable ffc_shading_enable in Shutter / FFC setting.\n");
 	result = 0;
 done:
-	if (shutter_touched && gpio_shutter_open() != 0) result = -1;
+	if (shutter_touched) {
+		if (gpio_shutter_open() != 0) result = -1;
+		else {
+			liveview_sleep_ms(g_shutter_close_wait_ms);
+			if (liveview_shading_discard_frames(stream) != 0) result = -1;
+		}
+	}
 	free(open_raw);
 	free(shutter_raw);
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
 	return result;
 }
@@ -3307,23 +3397,27 @@ static int liveview_run_shutter_calibration_cycle(
 		pthread_mutex_unlock(&g_shutter_calibration_lock);
 		return SHUTTER_CALIBRATION_PAUSED;
 	}
+	liveview_update_temperature_tables_if_needed(nuc_next_update_ms,
+		tdc_next_update_ms);
 	pthread_mutex_lock(&g_manual_calibration_lock);
 	if (g_manual_calibration_active) {
 		pthread_mutex_unlock(&g_manual_calibration_lock);
 		pthread_mutex_unlock(&g_shutter_calibration_lock);
 		return SHUTTER_CALIBRATION_PAUSED;
 	}
-	pthread_mutex_unlock(&g_manual_calibration_lock);
 
 	if (gpio_shutter_close() != 0) {
 		printf("Shutter calibration close shutter fail\n");
+		pthread_mutex_unlock(&g_manual_calibration_lock);
 		pthread_mutex_unlock(&g_shutter_calibration_lock);
 		return -1;
 	}
 
 	liveview_sleep_ms(g_shutter_close_wait_ms);
 
-	if (test_mode || startup_ffc || ffc_is_enabled()) {
+	if (liveview_shading_discard_frames(p_stream0) != 0) {
+		calibration_ok = 0;
+	} else if (test_mode || startup_ffc || ffc_is_enabled()) {
 		if (liveview_run_ffc_calibration(p_stream0,
 						 nuc_next_update_ms,
 						 tdc_next_update_ms,
@@ -3337,9 +3431,17 @@ static int liveview_run_shutter_calibration_cycle(
 		printf("Shutter calibration open shutter fail\n");
 		shutter_result = -1;
 	}
+	if (shutter_result == 0) {
+		liveview_sleep_ms(g_shutter_close_wait_ms);
+		if (liveview_shading_discard_frames(p_stream0) != 0) calibration_ok = 0;
+		/* Clear closed-shutter LUT history after reopening and queue drain. */
+		if (calibration_ok && p_stream0->agc_weighted_workspace)
+			agc_weighted_state_reset(p_stream0->agc_weighted_workspace);
+	}
 
+	pthread_mutex_unlock(&g_manual_calibration_lock);
 	pthread_mutex_unlock(&g_shutter_calibration_lock);
-	if ((test_mode || startup_ffc) && !calibration_ok) {
+	if (!calibration_ok) {
 		return -1;
 	}
 	return shutter_result;
@@ -3539,6 +3641,10 @@ static int liveview_apply_agc_weighted(
 		agc_weighted_state_reset(p_stream->agc_weighted_workspace);
 		p_stream->agc_weighted_calibration_generation = g_weighted_calibration_generation;
 	}
+	if (p_stream->agc_weighted_shutter_generation != g_manual_shutter_open_generation) {
+		agc_weighted_state_reset(p_stream->agc_weighted_workspace);
+		p_stream->agc_weighted_shutter_generation = g_manual_shutter_open_generation;
+	}
 	pthread_mutex_unlock(&g_manual_calibration_lock);
 	agc_status = agc_weighted_apply_u14(
         (const uint16_t *)input_va, input_stride,
@@ -3711,117 +3817,6 @@ static int liveview_apply_agc_fieldscale(
 	return agc_status;
 }
 
-static int liveview_apply_agc_min_max_tone_curve(
-	const HD_VIDEO_FRAME *input_frame,
-	AGC_MIN_MAX_TONE_CURVE_LUT *lut)
-{
-	IQT_TONE_PARAM tone = {0};
-	UINTPTR block_pa;
-	UINTPTR map_pa;
-	UINTPTR map_va;
-	UINTPTR input_va;
-	UINT64 data_offset;
-	UINT64 map_size_64;
-	UINT32 map_size;
-	UINT32 input_stride;
-	UINT32 minimum_stride;
-	UINT32 plane_height;
-	UINT32 i;
-	int agc_status;
-	HD_RESULT iq_ret;
-	HD_RESULT unmap_ret;
-
-	if (input_frame == NULL || lut == NULL ||
-	    input_frame->phy_addr[0] == 0) {
-		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-	}
-	if (input_frame->dim.w != RAW_SIZE_W ||
-	    input_frame->dim.h != RAW_SIZE_H) {
-		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-	}
-
-	minimum_stride = RAW_SIZE_W * sizeof(uint16_t);
-	input_stride = input_frame->loff[0];
-	if (input_stride < minimum_stride) {
-		input_stride *= sizeof(uint16_t);
-	}
-	plane_height = input_frame->ph[0] != 0 ?
-		input_frame->ph[0] : input_frame->dim.h;
-	if (input_stride < minimum_stride || plane_height < RAW_SIZE_H) {
-		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-	}
-
-	block_pa = input_frame->blk != 0 ?
-		hd_common_mem_blk2pa(input_frame->blk) : 0;
-	if (block_pa != 0) {
-		if (input_frame->phy_addr[0] < block_pa) {
-			return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-		}
-		map_pa = block_pa;
-		data_offset = (UINT64)(input_frame->phy_addr[0] - block_pa);
-	} else {
-		map_pa = input_frame->phy_addr[0];
-		data_offset = 0;
-	}
-
-	map_size_64 = data_offset + (UINT64)input_stride * plane_height;
-	if (map_size_64 == 0 || map_size_64 > UINT_MAX) {
-		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-	}
-	map_size = (UINT32)map_size_64;
-	map_va = (UINTPTR)hd_common_mem_mmap(
-		HD_COMMON_MEM_MEM_TYPE_CACHE, map_pa, map_size);
-	if (map_va == 0) {
-		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-	}
-
-	/* Synchronize the hardware/VCAP writer before the CPU scans this frame. */
-	hd_common_mem_flush_cache((void *)map_va, map_size);
-	input_va = map_va + (UINTPTR)data_offset;
-	agc_status = agc_min_max_tone_curve_build_u14(
-		(const uint16_t *)input_va,
-		input_stride,
-		RAW_SIZE_W,
-		RAW_SIZE_H,
-		lut);
-
-	if (agc_status >= AGC_MIN_MAX_TONE_CURVE_STATUS_OK) {
-		tone.id = g_thermal_pipeline_id;
-		iq_ret = vendor_isp_get_iq(IQT_ITEM_TONE_PARAM, &tone);
-		if (iq_ret != HD_OK) {
-			agc_status = AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-		} else {
-			tone.tone.enable = 1;
-			tone.tone.mode = 1;
-			tone.tone.auto_sel = 2;
-			for (i = 0;
-			     i < AGC_MIN_MAX_TONE_CURVE_LEFT_LUT_COUNT;
-			     i++) {
-				tone.tone.manual_lut_left[i] = lut->left[i];
-			}
-			for (i = 0;
-			     i < AGC_MIN_MAX_TONE_CURVE_RIGHT_LUT_COUNT;
-			     i++) {
-				tone.tone.manual_lut_right[i] = lut->right[i];
-			}
-
-			iq_ret = vendor_isp_set_iq(IQT_ITEM_TONE_PARAM, &tone);
-			if (iq_ret != HD_OK) {
-				agc_status =
-					AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-			}
-		}
-	}
-
-	unmap_ret = hd_common_mem_munmap((void *)map_va, map_size);
-	if (unmap_ret != HD_OK) {
-		return AGC_MIN_MAX_TONE_CURVE_STATUS_INVALID_ARGUMENT;
-	}
-
-	return agc_status;
-}
-
-/* Only the RAW worker changes active AGC and ISP tone state. */
 static void liveview_apply_agc_request(VIDEO_LIVEVIEW *stream)
 {
     int requested = agc_mode_take_request();
@@ -3931,6 +3926,7 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	HD_VIDEO_FRAME tdc_video_frame = {0};
 	HD_VIDEO_FRAME nuc_video_frame = {0};
 	HD_VIDEO_FRAME ffc_video_frame = {0};
+	HD_VIDEO_FRAME raw_temporal_video_frame = {0};
 	HD_VIDEO_FRAME agc_histogram_p1_p99_video_frame = {0};
 	HD_VIDEO_FRAME isp_step_test_video_frame = {0};
 	HD_VIDEO_FRAME *current_frame = &vcap_video_frame;
@@ -3953,7 +3949,6 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	int agc_status;
 	uint16_t agc_p1 = 0;
 	uint16_t agc_p99 = 0;
-	AGC_MIN_MAX_TONE_CURVE_LUT agc_tone_curve_lut = {0};
 	UINT64 agc_start_ms;
 	UINT64 agc_end_ms;
 	UINT64 agc_elapsed_ms;
@@ -4071,7 +4066,9 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		}
 	}
 
+	liveview_sync_ffc_upstream();
 	if (!g_manual_calibration_active &&
+	    (!nuc_is_enabled() || nuc_applied) &&
 	    ffc_is_enabled() && ffc_table_is_ready()) {
 		ffc_set_shading_input_mode(nuc_applied, tdc_is_enabled(),
 		    nuc_is_blackbody_dynamic_enabled());
@@ -4113,13 +4110,51 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	correction_lock_held = 0;
 
 after_corrections:
-	snapshot_final_frame = current_frame;
 	if (!isp_step_test_requested && p_stream0->cap_snap) {
 		p_stream0->cap_snap = 0;
 		snapshot_requested = 1;
-		snapshot_final_frame = current_frame;
-		snapshot_final_is_input = current_frame_is_vcap;
 	}
+
+    /* Software RAW temporal denoise: correction/calibration inputs stay unfiltered. */
+    {
+        RAW_TEMPORAL_DENOISE_PARAMS params;
+        raw_temporal_denoise_get_params(&params);
+        pthread_mutex_lock(&g_manual_calibration_lock);
+        if (!params.enable || isp_step_test_requested || g_manual_calibration_active) {
+            raw_temporal_denoise_reset(&p_stream0->raw_temporal);
+        } else {
+            UINT32 tag = (nuc_applied ? 1U : 0U) | (tdc_is_enabled() ? 2U : 0U) |
+                ((ffc_is_enabled() && ffc_table_is_ready()) ? 4U : 0U) |
+                (bpr_is_enabled() ? 8U : 0U);
+            UINT32 shading = ffc_shading_generation(), generation = ffc_table_generation();
+            if (tag != p_stream0->raw_temporal_tag || shading != p_stream0->raw_temporal_shading ||
+                generation != p_stream0->raw_temporal_ffc_generation ||
+                g_manual_shutter_open_generation != p_stream0->raw_temporal_shutter_generation ||
+                g_weighted_calibration_generation != p_stream0->raw_temporal_calibration)
+                raw_temporal_denoise_reset(&p_stream0->raw_temporal);
+            p_stream0->raw_temporal_tag = tag;
+            p_stream0->raw_temporal_shading = shading;
+            p_stream0->raw_temporal_ffc_generation = generation;
+            p_stream0->raw_temporal_shutter_generation = g_manual_shutter_open_generation;
+            p_stream0->raw_temporal_calibration = g_weighted_calibration_generation;
+            if (liveview_apply_raw_temporal(p_stream0, current_frame, &raw_temporal_video_frame, &params) < 0) {
+                pthread_mutex_unlock(&g_manual_calibration_lock);
+                if (snapshot_requested) snapshot_writer_cancel_request();
+                printf("RAW temporal denoise failed; stopping before AGC\n");
+                p_stream0->cap_exit = p_stream0->proc_exit = 1;
+                liveview_request_fault_stop(p_stream0, 0);
+                goto release_vcap_frame;
+            }
+            current_frame = &raw_temporal_video_frame;
+            current_frame_is_vcap = 0;
+        }
+        pthread_mutex_unlock(&g_manual_calibration_lock);
+    }
+
+	/* Corrected RAW snapshots/recordings use post-BNR/post-temporal, pre-AGC data.
+	 * VCAP input RAW remains the original captured frame. */
+	snapshot_final_frame = current_frame;
+	snapshot_final_is_input = current_frame_is_vcap;
 
 	/*
 	 * Display enhancement runs after the correction snapshot point.  A
@@ -4170,24 +4205,26 @@ after_corrections:
 	}
 
 	if (!isp_step_test_requested && agc_weighted_is_enabled()) {
+        UINT32 *frames = &p_stream0->agc_weighted_frame_count;
+        UINT32 *errors = &p_stream0->agc_weighted_error_count;
         agc_start_ms = liveview_get_time_ms();
         agc_status = liveview_apply_agc_weighted(p_stream0, current_frame,
             &agc_histogram_p1_p99_video_frame);
         agc_elapsed_ms = liveview_get_time_ms() - agc_start_ms;
         if (agc_status == 0) {
-            p_stream0->agc_weighted_frame_count++;
+            (*frames)++;
             if (FRAME_DIAGNOSTICS_ENABLED &&
-                (p_stream0->agc_weighted_frame_count == 1U || p_stream0->agc_weighted_frame_count % 300U == 0))
-                printf("Weighted Mapping AGC (CPU): frame=%u, grid=1x1, elapsed=%llu ms\n",
-                    p_stream0->agc_weighted_frame_count, (unsigned long long)agc_elapsed_ms);
+                (*frames == 1U || *frames % 300U == 0))
+                printf("%s: frame=%u, elapsed=%llu ms\n", agc_mode_name(agc_mode_get()),
+                    *frames, (unsigned long long)agc_elapsed_ms);
             current_frame = &agc_histogram_p1_p99_video_frame;
             current_frame_is_vcap = 0;
             snapshot_agc_output_frame = current_frame;
             snapshot_has_agc_output = 1;
         } else {
-            p_stream0->agc_weighted_error_count++;
-            if (p_stream0->agc_weighted_error_count == 1U)
-                printf("Weighted Mapping AGC bypass: error=%d\n", agc_status);
+            (*errors)++;
+            if (*errors == 1U)
+                printf("%s bypass: error=%d\n", agc_mode_name(agc_mode_get()), agc_status);
         }
     }
 
@@ -4225,42 +4262,6 @@ after_corrections:
 				       "error=%d, count=%u\n",
 				       agc_status,
 				       p_stream0->agc_fieldscale_error_count);
-			}
-		}
-	}
-
-	if (!isp_step_test_requested &&
-	    agc_min_max_tone_curve_is_enabled()) {
-		agc_start_ms = liveview_get_time_ms();
-		agc_status = liveview_apply_agc_min_max_tone_curve(
-			current_frame, &agc_tone_curve_lut);
-		agc_end_ms = liveview_get_time_ms();
-		agc_elapsed_ms = agc_end_ms >= agc_start_ms ?
-			agc_end_ms - agc_start_ms : 0;
-
-		if (agc_status >= AGC_MIN_MAX_TONE_CURVE_STATUS_OK) {
-			p_stream0->agc_min_max_tone_curve_frame_count++;
-			if (p_stream0->agc_min_max_tone_curve_frame_count == 1U) {
-				printf("Min/Max Tone Curve AGC (ISP): frame=%u, "
-				       "RAW14 min=%u, max=%u, Tone12 min=%u, max=%u, "
-				       "%s, elapsed=%" PRIu64 " ms\n",
-				       p_stream0->agc_min_max_tone_curve_frame_count,
-				       (unsigned int)agc_tone_curve_lut.raw14_min,
-				       (unsigned int)agc_tone_curve_lut.raw14_max,
-				       (unsigned int)agc_tone_curve_lut.tone12_min,
-				       (unsigned int)agc_tone_curve_lut.tone12_max,
-				       agc_status ==
-					AGC_MIN_MAX_TONE_CURVE_STATUS_FLAT_RANGE ?
-					"flat-range zero LUT" : "manual tone LUT",
-				       (uint64_t)agc_elapsed_ms);
-			}
-		} else {
-			p_stream0->agc_min_max_tone_curve_error_count++;
-			if (p_stream0->agc_min_max_tone_curve_error_count == 1U) {
-				printf("Min/Max Tone Curve AGC (ISP) failed: "
-				       "keep previous ISP tone curve, error=%d, count=%u\n",
-				       agc_status,
-				       p_stream0->agc_min_max_tone_curve_error_count);
 			}
 		}
 	}
@@ -4436,6 +4437,7 @@ static void *raw_pipeline_thread(void *arg)
 	int shutter_calibration_result;
 	int shutter_calibration_paused;
 	int startup_ffc_pending;
+	int refresh_ffc_pending;
 	int ffc_operation;
 
 	//------ wait flow_start ------
@@ -4492,9 +4494,10 @@ static void *raw_pipeline_thread(void *arg)
 		liveview_update_temperature_tables_if_needed(
 			&nuc_sensor_temp_next_update_ms,
 			&tdc_next_update_ms);
+		refresh_ffc_pending = liveview_ffc_needs_refresh();
 
 		if (!shutter_calibration_paused &&
-		    (startup_ffc_pending ||
+		    (startup_ffc_pending || refresh_ffc_pending ||
 		     (shutter_calibration_enabled &&
 		      liveview_get_time_ms() >= g_shutter_next_calibration_ms))) {
 			shutter_calibration_result =
@@ -4502,9 +4505,11 @@ static void *raw_pipeline_thread(void *arg)
 					p_stream0,
 					&nuc_sensor_temp_next_update_ms,
 					&tdc_next_update_ms,
-					0, startup_ffc_pending);
+					0, startup_ffc_pending || refresh_ffc_pending);
 			if (shutter_calibration_result < 0) {
 				g_shutter_next_calibration_ms = 0;
+				printf("FFC calibration failed; stopping RAW pipeline\n");
+				liveview_request_fault_stop(p_stream0, 0);
 				break;
 			}
 
@@ -4770,6 +4775,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
             ret = HD_ERR_NG;
             goto exit;
         }
+
     }
 	// open video_liveview modules (main)
 	stream[0].proc_max_dim.w = VDO_SIZE_W; //assign by user
@@ -4852,7 +4858,7 @@ static int liveview_start_pipeline(LIVEVIEW_CONTEXT *ctx)
 	}
 	ctx->snapshot_writer_started = 1;
 
-	// create raw_pipeline_thread (VCAP -> TDC -> NUC -> FFC -> RAW snapshot -> selected AGC -> VideoProc)
+	// create raw_pipeline_thread (VCAP -> TDC -> NUC -> FFC -> RAW temporal -> RAW snapshot -> selected AGC -> VideoProc)
 	ret = pthread_create(&stream[0].cap_thread_id, NULL, raw_pipeline_thread, (void *)stream);
 	if (ret != 0) {
 		printf("create raw_pipeline_thread failed");
@@ -5739,6 +5745,7 @@ static int liveview_raw_type_menu_run(int selected_raw_type)
 		printf("Select RAW type\n");
 		printf(" 1. Original RAW\n");
 		printf(" 2. Corrected RAW\n");
+		printf("    Corrected includes enabled RAW temporal denoise, before AGC.\n");
 		printf(" 3. AGC output RAW\n");
 		printf(" 4. Original -> Corrected -> Original (BPR off)\n");
 		printf(" 0. Back\n");

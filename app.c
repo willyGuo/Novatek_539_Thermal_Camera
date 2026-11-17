@@ -8,7 +8,7 @@
 #include "Pipeline/menu.h"
 #include "Pipeline/liveview.h"
 
-static const char g_app_version[] = "v3.8.0";
+static const char g_app_version[] = "v3.9.0";
 
 const char *app_get_version(void)
 {

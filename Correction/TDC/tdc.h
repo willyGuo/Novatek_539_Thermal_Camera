@@ -27,6 +27,7 @@ void tdc_bind_runtime(const TDC_IMAGE_LAYOUT *layout);
 void tdc_bind_capture_callback(TDC_CAPTURE_RAW_CB capture_raw);
 void tdc_set_enabled(int enable);
 int tdc_is_enabled(void);
+UINT32 tdc_correction_generation(void);
 void tdc_set_interval_sec(UINT32 interval_sec);
 UINT32 tdc_get_interval_sec(void);
 int tdc_menu_run(void);

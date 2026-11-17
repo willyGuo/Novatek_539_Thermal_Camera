@@ -73,9 +73,9 @@ SRC += \
 	Correction/TDC/tdc.c \
 	Enhancement/AGC/agc_mode.c \
 	Enhancement/AGC/agc_weighted.c \
+	Enhancement/RAW/raw_temporal_denoise.c \
 	Enhancement/AGC/agc_fieldscale.c \
 	Enhancement/AGC/agc_histogram_p1_p99.c \
-	Enhancement/AGC/agc_min_max_tone_curve.c \
 	Enhancement/CLAHE/clahe.c \
 	Enhancement/CLAHE/clahe_frame.c \
 	Enhancement/Gamma/gamma.c \

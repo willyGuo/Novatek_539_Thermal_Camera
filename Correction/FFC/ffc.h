@@ -3,7 +3,7 @@
 
 #include "hdal.h"
 
-/* FFC unity gain and GFX shift must use the same format, independent of NUC. */
+/* FFC unity gain and correction shift must use the same format, independent of NUC. */
 #define FFC_GAIN_SHIFT 8U
 #define FFC_GAIN_ONE (1U << FFC_GAIN_SHIFT)
 
@@ -18,6 +18,11 @@ int ffc_shading_is_ready(void);
 int ffc_shading_is_active(void);
 void ffc_set_shading_input_mode(int nuc_enabled, int tdc_enabled, int dynamic_nuc);
 UINT32 ffc_shading_generation(void);
+UINT32 ffc_table_generation(void);
+/* RAW worker only, under the correction lock. Invalidates an old reference. */
+void ffc_set_upstream_state(int nuc_enabled, int tdc_enabled,
+    UINT32 nuc_generation, UINT32 tdc_generation, UINT32 calibration_generation);
+int ffc_refresh_is_required(void);
 /* Packed active-area, NUC-corrected and pre-FFC averaged RAWs. */
 int ffc_shading_calibrate(const UINT16 *open_raw, const UINT16 *shutter_raw,
     int tdc_enabled);
@@ -45,15 +50,6 @@ int ffc_compare_gfx_samples(UINTPTR input_va,
 			    UINT32 active_w,
 			    UINT32 active_h,
 			    UINT32 sample_count);
-
-/* Reference GFX sequence: the final shift pass writes its result to sum_pa. */
-HD_RESULT ffc_accumulate_frame(UINTPTR raw_pa,
-			       UINTPTR sum_pa,
-			       UINTPTR out_pa,
-			       UINTPTR zero_pa,
-			       UINT32 raw_width,
-			       UINT32 raw_height,
-			       UINT32 shift);
 
 HD_RESULT ffc_apply(HD_VIDEO_FRAME *in_frame,
 		    HD_VIDEO_FRAME *out_frame,

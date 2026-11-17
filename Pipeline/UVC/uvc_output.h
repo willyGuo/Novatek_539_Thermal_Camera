@@ -7,6 +7,9 @@
 #include "hdal.h"
 #include "../frame_trace.h"
 
+/* Application-supported UVC request range; actual throughput is board-dependent. */
+#define UVC_OUTPUT_MAX_FPS 60U
+
 typedef struct {
 	HD_PATH_ID enc_path;
 	UINT32 width;

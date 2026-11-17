@@ -36,6 +36,7 @@ void nuc_set_sensor_temp_point(UINT32 point, float temp_c);
 float nuc_get_sensor_temp_point(UINT32 point);
 void nuc_set_enabled(int enable);
 int nuc_is_enabled(void);
+UINT32 nuc_correction_generation(void);
 void nuc_set_sensor_temp_interval_sec(UINT32 interval_sec);
 UINT32 nuc_get_sensor_temp_interval_sec(void);
 

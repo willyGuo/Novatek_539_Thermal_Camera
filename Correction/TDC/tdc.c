@@ -48,6 +48,7 @@ static TDC_MEM tdc_buffer[1];
 static TDC_IMAGE_LAYOUT g_tdc_layout;
 static TDC_CAPTURE_RAW_CB g_tdc_capture_raw;
 static int g_tdc_enabled;
+static UINT32 g_tdc_correction_generation;
 static int g_tdc_sensor_table_loaded;
 static int g_tdc_lens_table_loaded;
 static UINT32 g_tdc_interval_sec = TDC_DEFAULT_INTERVAL_SEC;
@@ -306,6 +307,11 @@ void tdc_set_enabled(int enable)
 int tdc_is_enabled(void)
 {
 	return g_tdc_enabled && tdc_table_is_loaded();
+}
+
+UINT32 tdc_correction_generation(void)
+{
+	return g_tdc_correction_generation;
 }
 
 void tdc_set_interval_sec(UINT32 interval_sec)
@@ -910,6 +916,7 @@ HD_RESULT tdc_update_correction_table(void)
 	const float *lc_k_ptr;
 	int16_t *out_ptr;
 	UINT32 i;
+	int changed = 0;
 
 	if (tdc_validate_image_layout() != 0) {
 		return HD_ERR_NG;
@@ -948,11 +955,14 @@ HD_RESULT tdc_update_correction_table(void)
 		 * TDC uses K=1 and shift=0, so B stores the positive
 		 * temperature-induced ADC drift that must be removed.
 		 */
-		out_ptr[i] = tdc_clip_correction(correction);
+		int16_t value = tdc_clip_correction(correction);
+		if (out_ptr[i] != value) changed = 1;
+		out_ptr[i] = value;
 	}
 
 	hd_common_mem_flush_cache((void *)tdc_buffer->ADD_output_va,
 				  correction_table_size);
+	if (changed) ++g_tdc_correction_generation;
 	return HD_OK;
 }
 

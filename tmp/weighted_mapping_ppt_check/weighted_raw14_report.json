@@ -1,0 +1,9 @@
+{
+  "scope": "Host numerical tests; no SDK linking, board FPS or image-quality proof",
+  "sources": {
+    "agc_weighted.c": "9df0799a1181b1fef8046bd36af4483aa3b87a42b2bce03d47603b84f20e3982",
+    "agc_weighted.h": "413524d014d3baf119de2acae87161ac25821532f9a2314ee35eb5a169028b84"
+  },
+  "curve_checks": 116,
+  "workspace_bytes": 306280
+}

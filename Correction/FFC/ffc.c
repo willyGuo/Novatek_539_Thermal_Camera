@@ -55,6 +55,47 @@ static int g_shading_merged;
 static int g_shading_tdc;
 static int g_shading_input_nuc, g_shading_input_tdc, g_shading_input_dynamic;
 static UINT32 g_shading_generation;
+static UINT32 g_table_generation;
+static int g_upstream_valid, g_upstream_nuc, g_upstream_tdc;
+static UINT32 g_upstream_nuc_generation, g_upstream_tdc_generation;
+static UINT32 g_upstream_calibration_generation;
+static int g_refresh_required;
+
+void ffc_set_upstream_state(int nuc_enabled, int tdc_enabled,
+    UINT32 nuc_generation, UINT32 tdc_generation, UINT32 calibration_generation)
+{
+    pthread_mutex_lock(&g_shading_lock);
+    if (g_upstream_valid && (g_upstream_nuc != nuc_enabled ||
+        g_upstream_tdc != tdc_enabled ||
+        (nuc_enabled && g_upstream_nuc_generation != nuc_generation) ||
+        (tdc_enabled && g_upstream_tdc_generation != tdc_generation) ||
+        g_upstream_calibration_generation != calibration_generation)) {
+        if (g_ffc.table_ready) {
+            printf("FFC reference invalidated: upstream correction changed\n");
+            ++g_table_generation;
+            g_refresh_required = 1;
+        }
+        g_ffc.table_ready = 0;
+        g_shading_merged = 0;
+        g_shading_dirty = 1;
+    }
+    g_upstream_valid = 1;
+    g_upstream_nuc = nuc_enabled;
+    g_upstream_tdc = tdc_enabled;
+    g_upstream_nuc_generation = nuc_generation;
+    g_upstream_tdc_generation = tdc_generation;
+    g_upstream_calibration_generation = calibration_generation;
+    pthread_mutex_unlock(&g_shading_lock);
+}
+
+int ffc_refresh_is_required(void)
+{
+    int required;
+    pthread_mutex_lock(&g_shading_lock);
+    required = g_refresh_required;
+    pthread_mutex_unlock(&g_shading_lock);
+    return required;
+}
 
 static UINT32 ffc_shading_checksum(const INT16 *table)
 {
@@ -161,6 +202,15 @@ void ffc_set_shading_input_mode(int nuc_enabled, int tdc_enabled, int dynamic_nu
             printf("FFC shading suspended: NUC/TDC mode differs from calibration\n");
     }
     pthread_mutex_unlock(&g_shading_lock);
+}
+
+UINT32 ffc_table_generation(void)
+{
+    UINT32 value;
+    pthread_mutex_lock(&g_shading_lock);
+    value = g_table_generation;
+    pthread_mutex_unlock(&g_shading_lock);
+    return value;
 }
 
 UINT32 ffc_shading_generation(void)
@@ -302,6 +352,9 @@ void ffc_bind_runtime(UINTPTR b_va, UINT32 table_size)
 	g_shading_correction = NULL;
 	g_shading_merged = 0;
 	g_shading_dirty = 1;
+	g_upstream_valid = 0;
+	g_refresh_required = 0;
+	g_ffc.table_ready = 0;
 	if (b_va && table_size == FFC_SHADING_PIXELS * sizeof(UINT16)) {
 		g_shading_base = calloc(1, table_size);
 		loaded = malloc(table_size);
@@ -331,6 +384,9 @@ int ffc_init_table(void)
 
 	g_ffc.table_ready = 0;
 	pthread_mutex_lock(&g_shading_lock);
+	g_shading_merged = 0;
+	++g_table_generation;
+	g_refresh_required = 0;
 	g_shading_dirty = 1;
 	pthread_mutex_unlock(&g_shading_lock);
 	return 0;
@@ -391,6 +447,10 @@ int ffc_update_table_from_raw(UINTPTR raw_va,
 
 	hd_common_mem_flush_cache((void *)g_ffc.b_va, g_ffc.table_size);
 	g_ffc.table_ready = 1;
+    pthread_mutex_lock(&g_shading_lock);
+    ++g_table_generation;
+    g_refresh_required = 0;
+    pthread_mutex_unlock(&g_shading_lock);
 	if (g_shading_base) {
 		memcpy(g_shading_base, b_tbl, g_ffc.table_size);
 		pthread_mutex_lock(&g_shading_lock);
@@ -521,74 +581,6 @@ int ffc_compare_gfx_samples(UINTPTR input_va,
 	return pass_count == sample_count ? 0 : -1;
 }
 
-HD_RESULT ffc_accumulate_frame(UINTPTR raw_pa,
-			       UINTPTR sum_pa,
-			       UINTPTR out_pa,
-				   UINTPTR zero_pa,
-			       UINT32 raw_width,
-			       UINT32 raw_height,
-			       UINT32 shift)
-{
-	VENDOR_GFX_GRPH_TRIGGER_PARAM param = {0};
-	HD_RESULT ret;
-
-	param.command = VENDOR_GFX_GRPH_CMD_PLUS_SHF;
-	param.format = VENDOR_GFX_GRPH_FORMAT_16BITS;
-	param.property[0].en = 1;
-	param.property[0].id = VENDOR_GFX_GRPH_PROPERTY_ID_NORMAL;
-	param.property[0].data.property = VENDOR_GFX_GRPH_PLUS_PROPTY(0);
-
-	param.images[0].img_id = VENDOR_GFX_GRPH_IMG_ID_A;
-	param.images[0].dram_addr = raw_pa;
-	param.images[0].lineoffset = raw_width * 2;
-	param.images[0].width = raw_width * 2;
-	param.images[0].height = raw_height;
-
-	param.images[1].img_id = VENDOR_GFX_GRPH_IMG_ID_B;
-	param.images[1].dram_addr = sum_pa;
-	param.images[1].lineoffset = raw_width * 2;
-
-	param.images[2].img_id = VENDOR_GFX_GRPH_IMG_ID_C;
-	param.images[2].dram_addr = out_pa;
-	param.images[2].lineoffset = raw_width * 2;
-
-	ret = vendor_gfx_grph_trigger(1, &param);
-	if (ret != HD_OK) {
-		printf("FFC accumulate frame fail=%d\n", ret);
-		return ret;
-	}
-
-	// Tim FFC
-	if (shift == 2){
-		param.command = VENDOR_GFX_GRPH_CMD_PLUS_SHF;
-		param.format = VENDOR_GFX_GRPH_FORMAT_16BITS;
-		param.property[0].en = 1;
-		param.property[0].id = VENDOR_GFX_GRPH_PROPERTY_ID_NORMAL;
-		param.property[0].data.property = VENDOR_GFX_GRPH_PLUS_PROPTY(shift);
-
-		param.images[0].img_id = VENDOR_GFX_GRPH_IMG_ID_A;
-		param.images[0].dram_addr = out_pa;
-		param.images[0].lineoffset = raw_width * 2;
-		param.images[0].width = raw_width * 2;
-		param.images[0].height = raw_height;
-
-		param.images[1].img_id = VENDOR_GFX_GRPH_IMG_ID_B;
-		param.images[1].dram_addr = zero_pa;
-		param.images[1].lineoffset = raw_width * 2;
-
-		param.images[2].img_id = VENDOR_GFX_GRPH_IMG_ID_C;
-		param.images[2].dram_addr = sum_pa;
-		param.images[2].lineoffset = raw_width * 2;
-
-		ret = vendor_gfx_grph_trigger(1, &param);
-		if (ret != HD_OK) {
-			printf("FFC divide 4 frame fail=%d\n", ret);
-		}
-	}
-
-	return ret;
-}
-
 int ffc_menu_run(void)
 {
 	int option;
@@ -663,6 +655,7 @@ HD_RESULT ffc_apply(HD_VIDEO_FRAME *in_frame,
 	VENDOR_GFX_GRPH_TRIGGER_PARAM param = {0};
 	HD_RESULT ret;
 
+	if (!g_ffc.table_ready) return HD_ERR_NG;
 	ffc_refresh_shading();
 	memcpy(out_frame, in_frame, sizeof(HD_VIDEO_FRAME));
 

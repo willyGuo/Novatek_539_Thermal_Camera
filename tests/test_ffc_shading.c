@@ -25,6 +25,17 @@ HD_RESULT vendor_gfx_grph_trigger(VENDOR_GFX_ENG_ID id,
     UINT16 *y = (UINT16 *)p->images[2].dram_addr;
     INT16 *b = (INT16 *)p->images[3].dram_addr;
     (void)id;
+    if (p->command == VENDOR_GFX_GRPH_CMD_PLUS_SHF) {
+        const UINT16 *a = (const UINT16 *)p->images[0].dram_addr;
+        const UINT16 *src_b = (const UINT16 *)p->images[1].dram_addr;
+        unsigned shift = p->property[0].data.property & 3U;
+        assert(p->format == VENDOR_GFX_GRPH_FORMAT_16BITS);
+        for (i = 0; i < n; ++i) {
+            UINT32 sum = a[i] + (src_b[i] >> shift);
+            y[i] = (UINT16)(sum > 65535U ? 65535U : sum);
+        }
+        return HD_OK;
+    }
     assert(p->command == VENDOR_GRPH_CMD_Non_uni_correction);
     assert(p->property[0].data.property == FFC_GAIN_SHIFT);
     for (i = 0; i < n; ++i)
@@ -55,9 +66,12 @@ int main(void)
     ffc_bind_runtime((UINTPTR)b, (UINT32)bytes);
     assert(ffc_init_table() == 0);
     assert(!ffc_is_shading_enabled() && !ffc_shading_is_ready());
+    ffc_set_upstream_state(1, 0, 1, 1, 0);
     ffc_set_shading_input_mode(1, 0, 0);
+    generation = ffc_table_generation();
     assert(ffc_update_table_from_raw((UINTPTR)s, THERMAL_SENSOR_WIDTH * 2,
         0, 0, THERMAL_SENSOR_WIDTH, THERMAL_SENSOR_HEIGHT) == 0);
+    assert(ffc_table_generation() != generation);
     assert((INT16)b[0] == 10 && (INT16)b[n - 1] == -10);
     assert(ffc_shading_calibrate(o, s, 0) == 0);
     assert(ffc_shading_is_ready());
@@ -84,6 +98,36 @@ int main(void)
     ffc_set_shading_input_mode(1, 0, 1); ffc_refresh_shading(); assert((INT16)b[0] == 10);
     ffc_set_shading_input_mode(1, 0, 0); ffc_refresh_shading(); assert(b[0] == 0);
     puts("PASS: repeated FFC, immediate toggle and NUC/TDC mode gates");
+    /* No-op checks preserve the table. Any changed upstream epoch/mode
+     * invalidates it, and toggling FFC cannot resurrect the old reference. */
+    generation = ffc_table_generation();
+    ffc_set_upstream_state(1, 0, 1, 1, 0);
+    assert(ffc_table_is_ready() && ffc_table_generation() == generation);
+    {
+        const UINT32 states[][5] = {
+            {1, 0, 2, 1, 0}, /* NUC reload, same master enable */
+            {0, 0, 2, 1, 0}, /* NUC disabled */
+            {1, 0, 3, 1, 0}, /* NUC enabled */
+            {1, 1, 3, 2, 0}, /* TDC enabled */
+            {1, 1, 3, 3, 0}, /* TDC correction changed */
+            {1, 1, 3, 3, 1}, /* Manual calibration completed */
+        };
+        size_t j;
+        for (j = 0; j < sizeof(states) / sizeof(states[0]); ++j) {
+            ffc_set_upstream_state(states[j][0], states[j][1],
+                states[j][2], states[j][3], states[j][4]);
+            assert(!ffc_table_is_ready() && ffc_refresh_is_required());
+            assert(!ffc_shading_is_active());
+            ffc_set_enabled(0); ffc_set_enabled(1);
+            assert(!ffc_table_is_ready());
+            assert(ffc_apply(&in, &output, (UINTPTR)k, (UINTPTR)b,
+                (UINTPTR)out, 0, THERMAL_SENSOR_WIDTH, THERMAL_SENSOR_HEIGHT) != HD_OK);
+            assert(ffc_update_table_from_raw((UINTPTR)s, THERMAL_SENSOR_WIDTH * 2,
+                0, 0, THERMAL_SENSOR_WIDTH, THERMAL_SENSOR_HEIGHT) == 0);
+            assert(ffc_table_is_ready() && !ffc_refresh_is_required());
+        }
+    }
+    puts("PASS: upstream NUC/TDC/calibration changes block stale FFC until rebuild");
     /* Atomic replacement of an existing table and restart load. */
     assert(ffc_shading_calibrate(o, s, 0) == 0);
     ffc_bind_runtime(0, 0);

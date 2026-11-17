@@ -1,0 +1,43 @@
+{
+  "scope": "Current production C table builder versus independent NumPy reference. Historical calibration inputs; NOT current SD K/B or GFX hardware execution. Generated tables are audit-only, not deployment artifacts.",
+  "historical_input_dir": "D:\\01_Project\\02_Loewe\\01_Report\\20261029\\ATTO640_1\u865f\\thermal_op\\sensor_temp_q14",
+  "pixels": 307200,
+  "K_exact_matches": 307200,
+  "B_exact_matches": 307200,
+  "q8_K_minmax": [
+    231,
+    342
+  ],
+  "q8_B_minmax": [
+    -3101,
+    6031
+  ],
+  "calibration_forward_model": {
+    "low": {
+      "target": 9213,
+      "mean": 9212.961982421875,
+      "spatial_sd_dn": 0.4921883025955035,
+      "error_minmax": [
+        -1,
+        1
+      ],
+      "divisible_by_4_fraction": 0.14085611979166668
+    },
+    "high": {
+      "target": 11173,
+      "mean": 11169.2493359375,
+      "spatial_sd_dn": 2.263269511555719,
+      "error_minmax": [
+        -9,
+        1
+      ],
+      "divisible_by_4_fraction": 0.266923828125
+    }
+  },
+  "unity_ramp_identity": true,
+  "source_sha256": {
+    "Correction\\NUC\\nuc.c": "121ce9483071418c20de02ce97d15c6f038956836e209fe333ff44757e1dc7c8",
+    "Correction\\NUC\\nuc_gain_format.h": "93162a3cf2fe80735be9275a58e34dc004ead5bcca1576e64bdd6e23a3e6072a"
+  },
+  "historical_q14_table_passes_q8_range_check": true
+}

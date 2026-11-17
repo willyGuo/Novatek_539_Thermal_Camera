@@ -1,4 +1,5 @@
 #include "gpio_control.h"
+#include "../../Config/hardware_config.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -10,8 +11,6 @@
 
 #define GPIO_CHIP "/dev/gpiochip0"
 #define GPIO_SHUTTER_LINE P_GPIO(0)
-#define GPIO_SHUTTER_OPEN_VALUE 0
-#define GPIO_SHUTTER_CLOSE_VALUE 1
 #define GPIO_SHUTTER_RETRY_COUNT 3U
 #define GPIO_SHUTTER_RETRY_DELAY_US 20000U
 
@@ -81,14 +80,15 @@ int gpio_shutter_init(void)
 	}
 
 	gpio_shutter_fd = gpio_open_output(GPIO_SHUTTER_LINE,
-		GPIO_SHUTTER_OPEN_VALUE);
+		THERMAL_SHUTTER_OPEN_VALUE);
 	if (gpio_shutter_fd < 0) {
 		printf("shutter gpio init fail: P_GPIO(0)\r\n");
 		return -1;
 	}
 
-	if (gpio_set_value(gpio_shutter_fd, GPIO_SHUTTER_OPEN_VALUE) != 0) {
-		printf("shutter gpio initial low fail\r\n");
+	if (gpio_set_value(gpio_shutter_fd, THERMAL_SHUTTER_OPEN_VALUE) != 0) {
+		printf("shutter gpio initial open (%s) fail\r\n",
+		       THERMAL_SHUTTER_OPEN_VALUE ? "high" : "low");
 		gpio_close(gpio_shutter_fd);
 		gpio_shutter_fd = -1;
 		return -1;
@@ -103,10 +103,11 @@ int gpio_shutter_open(void)
 
 	for (attempt = 1; attempt <= GPIO_SHUTTER_RETRY_COUNT; attempt++) {
 		if (gpio_shutter_init() == 0) {
-			printf("open shutter: P_GPIO(0) low, attempt %u/%u\r\n",
+			printf("open shutter: P_GPIO(0) %s, attempt %u/%u\r\n",
+			       THERMAL_SHUTTER_OPEN_VALUE ? "high" : "low",
 			       attempt, GPIO_SHUTTER_RETRY_COUNT);
 			if (gpio_set_value(gpio_shutter_fd,
-				GPIO_SHUTTER_OPEN_VALUE) == 0) {
+				THERMAL_SHUTTER_OPEN_VALUE) == 0) {
 				return 0;
 			}
 		}
@@ -133,10 +134,11 @@ int gpio_shutter_close(void)
 
 	for (attempt = 1; attempt <= GPIO_SHUTTER_RETRY_COUNT; attempt++) {
 		if (gpio_shutter_init() == 0) {
-			printf("close shutter: P_GPIO(0) high, attempt %u/%u\r\n",
+			printf("close shutter: P_GPIO(0) %s, attempt %u/%u\r\n",
+			       THERMAL_SHUTTER_CLOSE_VALUE ? "high" : "low",
 			       attempt, GPIO_SHUTTER_RETRY_COUNT);
 			if (gpio_set_value(gpio_shutter_fd,
-				GPIO_SHUTTER_CLOSE_VALUE) == 0) {
+				THERMAL_SHUTTER_CLOSE_VALUE) == 0) {
 				return 0;
 			}
 		}

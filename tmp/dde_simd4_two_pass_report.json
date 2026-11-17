@@ -1,0 +1,49 @@
+{
+  "scope": "Host only; does not prove Novatek SDK linking, board FPS or image quality",
+  "host_machine": "AMD64",
+  "compiler": "gcc.EXE (Rev5, Built by MSYS2 project) 16.1.0",
+  "core_sha256": "549e998da46e526d49a63714455fd3cd706ab87148c5326198cc7454880c0365",
+  "build": "Production and original-formula baseline: O3; unchanged colleague reference: O2",
+  "simd_test_scope": "SIMD4 forced on host via GNU vectors; not ARM/NEON execution proof",
+  "benchmark_parameters": {
+    "sigma_s": 21,
+    "sigma_r": 51,
+    "gain": 2,
+    "warmup_rounds": 4,
+    "measured_rounds": 31,
+    "excludes": "image reset copy, HDAL mapping/cache, encoder/UVC"
+  },
+  "numeric_cases": 300,
+  "simd_vs_scalar": "exact output match in all numeric cases",
+  "optimized_vs_original": {
+    "max_error_gray": 1,
+    "changed_pixels": 18,
+    "pixels_compared": 2805980
+  },
+  "host_core_benchmark": [
+    {
+      "width": 640,
+      "height": 480,
+      "median_ms": {
+        "original_1_pass": 0.8017,
+        "original_2_pass": 1.4866,
+        "scalar_lerp_2_pass": 1.4202,
+        "simd4_2_pass": 1.5021
+      },
+      "two_pass_speedup_ratio": 0.989681113108315,
+      "simd_vs_previous_lerp_ratio": 0.9454763331336129
+    },
+    {
+      "width": 640,
+      "height": 512,
+      "median_ms": {
+        "original_1_pass": 0.8849,
+        "original_2_pass": 1.6591,
+        "scalar_lerp_2_pass": 1.5709,
+        "simd4_2_pass": 1.6894
+      },
+      "two_pass_speedup_ratio": 0.9820646383331361,
+      "simd_vs_previous_lerp_ratio": 0.9298567538771161
+    }
+  ]
+}

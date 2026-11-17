@@ -4,26 +4,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NUC_GAIN_SHIFT 14U
+#define NUC_GAIN_SHIFT 8U
 #define NUC_GAIN_ONE (1U << NUC_GAIN_SHIFT)
+/* GFX interprets K as signed INT16; reject gains that would become negative. */
 #define NUC_GAIN_MAX 32767U
-#define NUC_LEGACY_GAIN_SHIFT 8U
 
-/* Validate the whole table first: no partial conversion on invalid input.
- * B is signed DN and must never be rescaled with K. */
-static inline int nuc_gain_table_to_q14(uint16_t *table, size_t count,
-                                      unsigned int source_shift)
+/* Validate Q8 K without rescaling; B remains signed DN. */
+static inline int nuc_gain_table_validate_q8(const uint16_t *table, size_t count)
 {
     size_t i;
-    unsigned int scale;
-    if (table == NULL || count == 0 ||
-        (source_shift != NUC_GAIN_SHIFT && source_shift != NUC_LEGACY_GAIN_SHIFT))
-        return -1;
-    scale = 1U << (NUC_GAIN_SHIFT - source_shift);
+    if (table == NULL || count == 0) return -1;
     for (i = 0; i < count; i++) {
-        if (table[i] == 0 || table[i] > NUC_GAIN_MAX / scale) return -1;
+        if (table[i] == 0 || table[i] > NUC_GAIN_MAX) return -1;
     }
-    for (i = 0; i < count; i++) table[i] = (uint16_t)(table[i] * scale);
     return 0;
 }
 

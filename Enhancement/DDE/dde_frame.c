@@ -18,7 +18,7 @@ int dde_process_frame(const HD_VIDEO_FRAME *f)
     if (!f || f->pxlfmt != HD_VIDEO_PXLFMT_YUV420 || !f->phy_addr[0] ||
         !f->dim.w || !f->dim.h || f->loff[0] < f->dim.w) return -1;
     {
-        uint32_t required = dde_dt_get_workbuf_size(f->dim.w, f->dim.h);
+        uint32_t required = dde_dt_scaled_workbuf_size(f->dim.w, f->dim.h, p.base_scale);
         if (!required) return -1;
         if (capacity < required) {
             void *next = realloc(workspace, required);
@@ -38,10 +38,10 @@ int dde_process_frame(const HD_VIDEO_FRAME *f)
     if (!va || va == (UINTPTR)-1) return -1;
     result = hd_common_mem_flush_cache((void *)va, (UINT32)bytes);
     if (result == HD_OK) {
-        result = DDE_DT_Optimized((uint8_t *)(va + offset),
+        result = DDE_DT_Optimized_Scaled((uint8_t *)va + (size_t)offset,
             f->dim.w, f->dim.h, f->loff[0],
             (float)p.sigma_s, (float)p.sigma_r, p.gain_percent / 100.0f,
-            p.num_iters, 255, 0, workspace);
+            p.num_iters, 255, 0, p.base_scale, workspace);
         if (hd_common_mem_flush_cache((void *)va, (UINT32)bytes) != HD_OK) result = -1;
     }
     if (hd_common_mem_munmap((void *)va, (UINT32)bytes) != HD_OK) result = -1;
