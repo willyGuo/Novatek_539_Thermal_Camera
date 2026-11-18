@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from raw_denoise_sources import RAW_DENOISE_SOURCES
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--sdk', required=True, type=Path)
@@ -175,13 +176,81 @@ int main(void) {
         assert(runtime_raw.enable==1 && runtime_raw.threshold_dn==8 && runtime_raw.history_shift==1);
         assert(app_config_get_int("raw_temporal_denoise_threshold_dn",&n)==0 && n==8);
         assert(app_config_update_int("raw_temporal_denoise_threshold_dn",0)==-1);
+        {
+            const char *keys[] = {
+                "raw_temporal_denoise_spatial_enable",
+                "raw_temporal_denoise_spatial_threshold_dn",
+                "raw_temporal_denoise_motion_strong_threshold_dn",
+                "raw_temporal_denoise_motion_threshold_dn",
+                "raw_temporal_denoise_motion_hysteresis_dn",
+                "raw_temporal_denoise_motion_hold_frames",
+                "raw_temporal_denoise_dual_speed_enable",
+                "raw_temporal_denoise_spatial_mode"
+            };
+            const int values[] = {1,10,12,4,2,5,1,1};
+            for(i=0;i<8;++i) assert(!app_config_update_int(keys[i],values[i]));
+            initial();assert(!app_config_load());
+            for(i=0;i<8;++i) assert(!app_config_get_int(keys[i],&n) && n==values[i]);
+            raw_temporal_denoise_get_params(&runtime_raw);
+            assert(runtime_raw.spatial_enable==1 && runtime_raw.spatial_threshold_dn==10 &&
+                   runtime_raw.spatial_mode==1 && runtime_raw.dual_speed_enable==1 && runtime_raw.motion_threshold_dn==4 &&
+                   runtime_raw.motion_strong_threshold_dn==12 &&
+                   runtime_raw.motion_hysteresis_dn==2 && runtime_raw.motion_hold_frames==5);
+            assert(app_config_update_int(keys[0],2)==-1);
+            assert(app_config_update_int(keys[1],16384)==-1);
+            assert(app_config_update_int(keys[2],4)==-1);
+            assert(app_config_update_int(keys[3],12)==-1);
+            assert(app_config_update_int(keys[4],4)==-1);
+            assert(app_config_update_int(keys[5],256)==-1);
+            assert(app_config_update_int(keys[7],2)==-1);
+            fail_save=1;assert(app_config_update_int(keys[6],0)==-1);fail_save=0;
+            raw_temporal_denoise_get_params(&runtime_raw);
+            assert(runtime_raw.dual_speed_enable==1 && runtime_raw.motion_threshold_dn==4);
+        }
         fail_save=1; assert(app_config_update_int("raw_temporal_denoise_enable",0)==-1); fail_save=0;
         raw_temporal_denoise_get_params(&runtime_raw); assert(runtime_raw.enable==1 && g_app_config.raw_temporal.enable==1);
-        { FILE *fp=fopen(TEST_MENU_PATH,"w");assert(fp);fputs("4\n0\n",fp);fclose(fp); }
+        { FILE *fp=fopen(TEST_MENU_PATH,"w");assert(fp);
+          fputs("2\n1\n0\n2\n9\n3\n0\n0\n"
+                "3\n1\n21\n2\n1\n0\n"
+                "4\n1\n0\n2\n5\n3\n13\n4\n1\n5\n6\n0\n0\n",fp);fclose(fp); }
+        assert(freopen(TEST_MENU_PATH,"r",stdin)); assert(app_config_raw_preprocessing_menu_run()==0);
+        initial(); assert(!app_config_load()); raw_temporal_denoise_get_params(&runtime_raw);
+        assert(runtime_raw.enable==1 && !runtime_raw.spatial_enable && runtime_raw.spatial_threshold_dn==9 && runtime_raw.spatial_mode==0);
+        assert(runtime_raw.threshold_dn==21 && runtime_raw.history_shift==1);
+        assert(!runtime_raw.dual_speed_enable && runtime_raw.motion_threshold_dn==5 &&
+               runtime_raw.motion_strong_threshold_dn==13 && runtime_raw.motion_hysteresis_dn==1 &&
+               runtime_raw.motion_hold_frames==6);
+        { FILE *fp=fopen(TEST_MENU_PATH,"w");assert(fp);fputs("5\n0\n",fp);fclose(fp); }
         assert(freopen(TEST_MENU_PATH,"r",stdin)); assert(app_config_raw_preprocessing_menu_run()==0);
         initial(); assert(app_config_load()==0); raw_temporal_denoise_get_params(&runtime_raw);
-        assert(!runtime_raw.enable && runtime_raw.threshold_dn==12 && runtime_raw.history_shift==2);
+        assert(runtime_raw.enable==0 && runtime_raw.threshold_dn==12 && runtime_raw.history_shift==2);
+        assert(runtime_raw.spatial_enable==1 && runtime_raw.dual_speed_enable==1 &&
+               runtime_raw.spatial_threshold_dn==8 && runtime_raw.motion_threshold_dn==3 && runtime_raw.spatial_mode==1);
+        { FILE *fp=fopen(APP_CONFIG_PATH,"w");assert(fp);
+          fputs("raw_temporal_denoise_dual_speed_enable=1\n"
+                "raw_temporal_denoise_motion_threshold_dn=20\n"
+                "raw_temporal_denoise_motion_hysteresis_dn=7\n"
+                "raw_temporal_denoise_motion_strong_threshold_dn=30\n",fp);fclose(fp); }
+        assert(!app_config_load());raw_temporal_denoise_get_params(&runtime_raw);
+        assert(runtime_raw.dual_speed_enable==1 && runtime_raw.motion_threshold_dn==20 &&
+               runtime_raw.motion_strong_threshold_dn==30 && runtime_raw.motion_hysteresis_dn==7);
+        { FILE *fp=fopen(APP_CONFIG_PATH,"w");assert(fp);
+          fputs("raw_temporal_denoise_motion_hysteresis_dn=20\n",fp);fclose(fp); }
+        assert(!app_config_load());raw_temporal_denoise_get_params(&runtime_raw);
+        assert(runtime_raw.motion_hysteresis_dn==7);
+        { FILE *fp=fopen(APP_CONFIG_PATH,"w");assert(fp);
+          fputs("raw_temporal_denoise_enable=1\nraw_temporal_denoise_threshold_dn=21\n"
+                "raw_temporal_denoise_history_shift=1\n",fp);fclose(fp); }
+        initial();assert(!app_config_load());raw_temporal_denoise_get_params(&runtime_raw);
+        assert(runtime_raw.enable==1 && runtime_raw.threshold_dn==21 && runtime_raw.history_shift==1 &&
+               runtime_raw.spatial_enable==1 && runtime_raw.dual_speed_enable==1 && runtime_raw.spatial_mode==1);
+        assert(!app_config_update_int("raw_temporal_denoise_enable",0));
+        assert(!app_config_update_int("raw_temporal_denoise_spatial_enable",0));
+        assert(!app_config_update_int("raw_temporal_denoise_dual_speed_enable",0));
+        initial();assert(!app_config_load());raw_temporal_denoise_get_params(&runtime_raw);
+        assert(!runtime_raw.enable && !runtime_raw.spatial_enable && !runtime_raw.dual_speed_enable);
         puts("PASS: RAW temporal CFG validation, save/load/runtime update, save failure rollback, menu defaults");
+        puts("PASS: spatial/dual CFG round trip, legacy files, cross-field validation independent of load order");
     }
     assert(agc_weighted_set_params(&g_app_config.weighted)==0);
     {
@@ -320,7 +389,7 @@ with tempfile.TemporaryDirectory(prefix='tiffany_weighted_cfg_') as tmp:
         for inc in ['hdal/include','hdal/vendor/media/include','hdal/vendor/isp/include','hdal/vendor/cv/include','vos/drivers/include']:
             cmd+=['-I',str(args.sdk.resolve()/inc)]
         exe=work/f'test_{profile}.exe'
-        subprocess.run(cmd+[str(path),str(root/'Enhancement/AGC/agc_weighted.c'),str(root/'Enhancement/RAW/raw_temporal_denoise.c'),
+        subprocess.run(cmd+[str(path),str(root/'Enhancement/AGC/agc_weighted.c'),*RAW_DENOISE_SOURCES,
             str(root/'Enhancement/CLAHE/clahe.c'),str(root/'Enhancement/DDE/dde.c'),
             str(root/'Enhancement/DDE/dde_dt_opt.c'),*extra,'-pthread','-lm','-o',str(exe)],check=True,env=env)
         completed=subprocess.run([str(exe)],env=env,capture_output=True,text=True)

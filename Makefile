@@ -74,6 +74,8 @@ SRC += \
 	Enhancement/AGC/agc_mode.c \
 	Enhancement/AGC/agc_weighted.c \
 	Enhancement/RAW/raw_temporal_denoise.c \
+	Enhancement/RAW/Spatial/raw_spatial_denoise.c \
+	Enhancement/RAW/Temporal/raw_temporal_kernel.c \
 	Enhancement/AGC/agc_fieldscale.c \
 	Enhancement/AGC/agc_histogram_p1_p99.c \
 	Enhancement/CLAHE/clahe.c \

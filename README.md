@@ -832,8 +832,10 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 
 ### RAW Preprocessing
 
-`CFG Setting -> 14. RAW Preprocessing setting` 提供 CPU RAW 時域降噪的開關、差異門檻、平均強度與重設選項。
-流程為 `TDC -> NUC -> FFC -> RAW temporal denoise -> corrected RAW snapshot -> CPU AGC -> RAWALL -> YUV420`。
+v3.9.1 在 v3.9.0 上擴充前降噪核心與 CFG／控制選單，沿用 `Enhancement/RAW` 目錄及既有呼叫入口。
+`CFG Setting -> 14. RAW Preprocessing setting` 提供總開關、Spatial、Legacy Temporal、Dual Speed／Motion protection 與重設選項。
+流程為 `TDC -> NUC -> FFC -> Spatial / Temporal DNS -> corrected RAW snapshot -> CPU AGC -> RAWALL -> YUV420`。
+`Pipeline/liveview.c`、snapshot、錄製、診斷及 AGC 均維持純 v3.9.0；本版不含獨立 DNS RAW 選項或 DNS CSV 統計。Corrected RAW 依 v3.9.0 行為，包含已啟用的降噪結果。
 RAW 輸入使用原本的 RAWALL 路徑，不再經過獨立的 RAW14→U12 轉換與緩衝區。
 
 ### RAW14 時間降噪（CPU，AGC 前）
@@ -848,10 +850,27 @@ raw_temporal_denoise_threshold_dn=12
 raw_temporal_denoise_history_shift=2
 ```
 
-`history_shift` 為 1、2、3 時，前次濾波結果的權重分別為 50%、75%、87.5%。
+Spatial 為 5-point Selective neighbors，接受鄰居須與中心相差不超過 8 DN；權重為 `(4C+N'+S'+E'+W')/8`，不接受的鄰居以原始 C 替代；也保留 Strict 模式。Dual Speed 使用 Fast 50%／Slow 93.75% 的歷史權重，依門檻、hold 與 hysteresis 選擇 Slow／Fast／原始 RAW。總開關預設 Off，Spatial／Dual 子開關預設 On；總開關 On 後才運作。原本的 Legacy Temporal 僅在 Dual Speed Off 時使用。
+
+新增 CFG 鍵預設值如下，既有總開關仍為 `raw_temporal_denoise_enable=0`：
+
+```ini
+raw_temporal_denoise_spatial_enable=1
+raw_temporal_denoise_spatial_threshold_dn=8
+raw_temporal_denoise_spatial_mode=1
+raw_temporal_denoise_dual_speed_enable=1
+raw_temporal_denoise_motion_threshold_dn=3
+raw_temporal_denoise_motion_strong_threshold_dn=8
+raw_temporal_denoise_motion_hysteresis_dn=1
+raw_temporal_denoise_motion_hold_frames=3
+```
+
+要沿用已試過的 6／16 DN，在 Dual Speed 子選單調整 Fast／RAW 門檻，或載入對應 CFG。先測 master Off，再測 On；因參數結構與來源檔案有擴充，務必 `make clean` 後重新編譯。
+
+以下為 Legacy Temporal：`history_shift` 為 1、2、3 時，前次濾波結果的權重分別為 50%、75%、87.5%。
 與前次濾波結果的差異不超過門檻時才混合，否則直接使用目前像素。
 中等候選設定為 12 DN / 2；小幅真實移動仍可能被平均掉，必須檢查拖影。
-內部使用 UINT32 Q8 歷史，輸出保留原生 RAW DN，不做 RAW shift、遮罩、截斷或空間模糊。
+內部使用 UINT32 Q8 歷史，輸出保留原生 RAW DN，不做 RAW shift、遮罩或截斷；空間平滑只由 Spatial 子開關控制。
 感測器名義值域為 RAW14，但 NUC／FFC 校正後可能超過 `16383`；時間降噪接受完整 UINT16 `0..65535`，不再因單一校正像素超過 `16383` 而停止 Liveview。`12 DN` 仍代表原生 DN 差值，平均權重不變；後續 AGC 的 RAW14 映射規則也不變。
 參數變更、停用、重啟、FFC/校正狀態變更、時間戳倒退/重複或中斷超過 250 ms 會重設歷史。
 

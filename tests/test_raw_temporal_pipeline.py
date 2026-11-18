@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from raw_denoise_sources import RAW_DENOISE_SOURCES
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--sdk', type=Path, required=True)
@@ -76,7 +77,7 @@ release_vcap_frame:
 }
 int main(void) {
     VIDEO_LIVEVIEW s = {0}; HD_VIDEO_FRAME f = {0};
-    RAW_TEMPORAL_DENOISE_PARAMS p = {0,12,2};
+    RAW_TEMPORAL_DENOISE_PARAMS p = {.enable=0,.threshold_dn=12,.history_shift=2};
     size_t n = (size_t)RAW_SIZE_W * RAW_SIZE_H, i;
     UINT16 *input = malloc(n * 2), *dest = malloc(n * 2);
     assert(input && dest);
@@ -115,6 +116,21 @@ int main(void) {
     assert(run(&s,&f,0,0)==65535 && input[0]==65535);
     input[0]=65531; f.timestamp+=33000;
     assert(run(&s,&f,0,0)==65534 && input[0]==65531);
+    p=(RAW_TEMPORAL_DENOISE_PARAMS)RAW_TEMPORAL_DENOISE_DEFAULTS;
+    assert(!p.enable);p.enable=1;
+    assert(!raw_temporal_denoise_set_params(&p));
+    for(i=0;i<n;++i) input[i]=1000;
+    f.timestamp+=33000;assert(run(&s,&f,0,0)==1000);
+    for(i=0;i<n;++i) input[i]=1004;
+    f.timestamp+=33000;assert(run(&s,&f,0,0)==1000 && input[0]==1004);
+    for(i=0;i<n;++i) input[i]=1008;
+    f.timestamp+=33000;assert(run(&s,&f,0,0)==1005 && input[0]==1008);
+    for(i=0;i<n;++i) input[i]=1020;
+    f.timestamp+=33000;assert(run(&s,&f,0,0)==1020 && input[0]==1020);
+    p.enable=0;assert(!raw_temporal_denoise_set_params(&p));
+    {int before=copy_calls;assert(run(&s,&f,0,0)==1020 && before==copy_calls);}
+    p.enable=1;assert(!raw_temporal_denoise_set_params(&p));
+    puts("PASS: existing v3.9.0 wrapper: Spatial/Dual Slow/Fast/RAW, source unchanged, master OFF skips processing");
     assert(!stopped && !cancelled);
     puts("PASS: corrected values above 16383 preserve DN/precision and continue to AGC");
     copy_fail=1;
@@ -140,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix='raw_temporal_stage_') as tmp:
         cmd=[cc,'-std=gnu99','-O2','-Wall','-Wextra','-Werror','-D__LINUX',f'-DTHERMAL_SENSOR={profile}','-I',str(root)]
         for inc in ['hdal/include','vos/drivers/include']:
             cmd+=['-I',str(args.sdk/inc)]
-        subprocess.run(cmd+[str(src),str(root/'Enhancement/RAW/raw_temporal_denoise.c'),'-pthread','-o',str(exe)],check=True,env=env)
+        subprocess.run(cmd+[str(src),*RAW_DENOISE_SOURCES,'-pthread','-o',str(exe)],check=True,env=env)
         subprocess.run([str(exe)],check=True,env=env)
 order=pipeline[pipeline.index('static void liveview_process_live_frame('):]
 assert order.index('ffc_apply(') < order.index('liveview_apply_raw_temporal(') < order.index('snapshot_final_frame = current_frame') < order.index('liveview_apply_agc_weighted(')

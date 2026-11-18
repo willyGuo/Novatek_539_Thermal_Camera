@@ -77,11 +77,38 @@ typedef struct {
 
 static APP_CONFIG_VALUES g_app_config;
 
+typedef struct {
+    const char *key;
+    const char *label;
+    size_t offset;
+    int minimum, maximum;
+} RAW_CFG_ITEM;
+
+static const RAW_CFG_ITEM raw_items[] = {
+    {"raw_temporal_denoise_enable", "RAW denoise master", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, enable), 0, 1},
+    {"raw_temporal_denoise_threshold_dn", "Legacy difference threshold (DN)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, threshold_dn), 1, 16383},
+    {"raw_temporal_denoise_history_shift", "Legacy history shift", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, history_shift), 1, 3},
+    {"raw_temporal_denoise_spatial_enable", "5-point spatial enable", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, spatial_enable), 0, 1},
+    {"raw_temporal_denoise_spatial_threshold_dn", "Spatial edge threshold (DN)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, spatial_threshold_dn), 0, 16383},
+    {"raw_temporal_denoise_spatial_mode", "Spatial mode (0: strict, 1: selective neighbors)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, spatial_mode), 0, 1},
+    {"raw_temporal_denoise_dual_speed_enable", "Dual speed enable (50% / 93.75% history)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, dual_speed_enable), 0, 1},
+    {"raw_temporal_denoise_motion_threshold_dn", "Motion fast-entry threshold (DN)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, motion_threshold_dn), 1, 16383},
+    {"raw_temporal_denoise_motion_strong_threshold_dn", "Motion RAW-entry threshold (DN)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, motion_strong_threshold_dn), 2, 16383},
+    {"raw_temporal_denoise_motion_hysteresis_dn", "Motion hysteresis (DN)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, motion_hysteresis_dn), 0, 16383},
+    {"raw_temporal_denoise_motion_hold_frames", "Motion hold (following frames)", offsetof(RAW_TEMPORAL_DENOISE_PARAMS, motion_hold_frames), 0, 255}
+};
+#define RAW_CFG_COUNT (sizeof(raw_items) / sizeof(raw_items[0]))
+
+static uint32_t *cfg_raw_value(RAW_TEMPORAL_DENOISE_PARAMS *p, unsigned int index)
+{
+    return (uint32_t *)((unsigned char *)p + raw_items[index].offset);
+}
+
 static int cfg_raw_temporal_key(const char *key)
 {
-    if (!strcmp(key, "raw_temporal_denoise_enable")) return 0;
-    if (!strcmp(key, "raw_temporal_denoise_threshold_dn")) return 1;
-    if (!strcmp(key, "raw_temporal_denoise_history_shift")) return 2;
+    unsigned int i;
+    for (i = 0; i < RAW_CFG_COUNT; ++i)
+        if (!strcmp(key, raw_items[i].key)) return (int)i;
     return -1;
 }
 
@@ -371,14 +398,11 @@ static int cfg_store_pair(APP_CONFIG_VALUES *config,
         return 0;
     }
     if (cfg_raw_temporal_key(key) >= 0) {
-        RAW_TEMPORAL_DENOISE_PARAMS p = config->raw_temporal;
         int index = cfg_raw_temporal_key(key);
-        if (cfg_parse_long(value, &int_value) || int_value < 0 || int_value > 16383) return -1;
-        if (index == 0) p.enable = (uint32_t)int_value;
-        if (index == 1) p.threshold_dn = (uint32_t)int_value;
-        if (index == 2) p.history_shift = (uint32_t)int_value;
-        if (raw_temporal_denoise_validate(&p)) return -1;
-        config->raw_temporal = p;
+        if (cfg_parse_long(value, &int_value) || int_value < raw_items[index].minimum ||
+            int_value > raw_items[index].maximum) return -1;
+        /* Cross-field constraints are checked after load or before live save. */
+        *cfg_raw_value(&config->raw_temporal, (unsigned int)index) = (uint32_t)int_value;
         return 0;
     }
     if (strcmp(key, "agc_weighted_enable") == 0) {
@@ -676,6 +700,10 @@ int app_config_load(void)
 	}
 	fclose(fp);
 
+    if (raw_temporal_denoise_validate(&loaded_config.raw_temporal)) {
+        printf("Invalid RAW denoise settings: require hysteresis < fast threshold < RAW threshold; keep previous RAW settings\n");
+        loaded_config.raw_temporal = previous_config.raw_temporal;
+    }
     /* One-shot reset overrides all Weighted values, independent of key order. */
     reset_requested = loaded_config.weighted_reset_defaults;
     cfg_weighted_finish_reset(&loaded_config);
@@ -797,8 +825,7 @@ int app_config_get_int(const char *key, int *value)
 
 	} else if (cfg_raw_temporal_key(key) >= 0) {
         int index = cfg_raw_temporal_key(key);
-        *value = (int)(index == 0 ? g_app_config.raw_temporal.enable :
-            index == 1 ? g_app_config.raw_temporal.threshold_dn : g_app_config.raw_temporal.history_shift);
+        *value = (int)*cfg_raw_value(&g_app_config.raw_temporal, (unsigned int)index);
 	} else if (strcmp(key, "agc_fieldscale_enable") == 0) {
 		*value = g_app_config.agc_fieldscale_enable;
 	} else if (strcmp(key, "videoproc_af_enable") == 0) {
@@ -842,6 +869,7 @@ int app_config_update_int(const char *key, int value)
         cfg_weighted_finish_reset(&g_app_config);
     }
 	if (ret != 0 ||
+        raw_temporal_denoise_validate(&g_app_config.raw_temporal) != 0 ||
 	    agc_weighted_validate_params(&g_app_config.weighted) != 0 ||
 	    agc_histogram_p1_p99_validate_params(&g_app_config.histogram_p1_p99) != 0) {
 		printf("invalid CFG setting %s=%s\n", key, value_text);
@@ -1066,6 +1094,11 @@ static int app_config_show_file(void)
     printf("raw_temporal_denoise_enable=%u (CPU, native RAW DN, before AGC; next frame)\n", g_app_config.raw_temporal.enable);
     printf("raw_temporal_denoise_threshold_dn=%u\n", g_app_config.raw_temporal.threshold_dn);
     printf("raw_temporal_denoise_history_shift=%u (1=50%%, 2=75%%, 3=87.5%% previous)\n", g_app_config.raw_temporal.history_shift);
+    {
+        unsigned int i;
+        for (i = 3; i < RAW_CFG_COUNT; ++i)
+            printf("%s=%u\n", raw_items[i].key, *cfg_raw_value(&g_app_config.raw_temporal, i));
+    }
 	printf("\n[AGC]\n");
     printf("       * agc_histogram_p1_p99_gain_limit = %.1f\n",
         g_app_config.histogram_p1_p99.gain_limit_tenths / 10.0);
@@ -1707,31 +1740,73 @@ static int app_config_weighted_menu_run(void)
     }
 }
 
+static int app_config_raw_denoise_group_menu_run(const char *title,
+    const char *help, unsigned int first, unsigned int count)
+{
+    int option, ret = 0;
+    while (1) {
+        unsigned int i;
+        printf("----------------------------------------\n%s\n", title);
+        printf("RAW denoise master (CPU) = %u\n", g_app_config.raw_temporal.enable);
+        for (i = 0; i < count; ++i)
+            printf(" %u. %s = %u\n", i + 1U, raw_items[first + i].label,
+                *cfg_raw_value(&g_app_config.raw_temporal, first + i));
+        printf("%s\n", help);
+        printf("Parameters apply on next frame; no restart.\n 0. Back\n");
+        option = app_config_read_option();
+        if (option == 0 || option == -1) return ret;
+        if (option == MENU_OPTION_REFRESH) continue;
+        if (option < 1 || option > (int)count) {
+            printf("Invalid option\n");
+            continue;
+        }
+        i = first + (unsigned int)option - 1U;
+        if (raw_items[i].minimum == 0 && raw_items[i].maximum == 1 &&
+            raw_items[i].offset != offsetof(RAW_TEMPORAL_DENOISE_PARAMS, spatial_mode))
+            ret = app_config_prompt_bool(raw_items[i].label, raw_items[i].key,
+                *cfg_raw_value(&g_app_config.raw_temporal, i));
+        else
+            ret = app_config_prompt_int(raw_items[i].label, raw_items[i].key,
+                (int)*cfg_raw_value(&g_app_config.raw_temporal, i),
+                raw_items[i].minimum, raw_items[i].maximum, "");
+    }
+}
+
 static int app_config_raw_preprocessing_menu_run(void)
 {
     int option, ret = 0;
     while (1) {
         printf("----------------------------------------\n");
         printf("RAW Preprocessing\n");
-        printf("TDC/NUC/FFC -> RAW temporal denoise -> corrected snapshot/AGC\n");
-        printf(" 1. RAW temporal denoise (CPU) = %u; next frame, no restart\n", g_app_config.raw_temporal.enable);
-        printf(" 2. Temporal difference threshold = %u RAW DN\n", g_app_config.raw_temporal.threshold_dn);
-        printf(" 3. Average strength = %u (1: previous50%%, 2:75%%, 3:87.5%%)\n", g_app_config.raw_temporal.history_shift);
-        printf(" 4. Reset temporal denoise defaults (off, 12 DN, strength 2)\n");
-        printf("Small changes are averaged; large changes pass through. Small real motion may still leave trails.\n");
+        printf("TDC/NUC/FFC -> Spatial/Temporal DNS -> corrected snapshot/AGC\n");
+        printf(" 1. RAW denoise master (CPU) = %u; next frame, no restart\n", g_app_config.raw_temporal.enable);
+        printf(" 2. 5-point Spatial settings (enable=%u)\n", g_app_config.raw_temporal.spatial_enable);
+        printf(" 3. Legacy Temporal settings (used when Dual Speed is off)\n");
+        printf(" 4. Dual Speed / Motion protection settings (enable=%u)\n", g_app_config.raw_temporal.dual_speed_enable);
+        printf(" 5. Reset RAW denoise defaults (master off, spatial/dual on, Selective)\n");
+        printf("Master off bypasses both spatial and temporal denoise.\n");
         printf(" 0. Back\n");
         option = app_config_read_option();
         switch (option) {
         case 1:
-            ret = app_config_prompt_bool("RAW temporal denoise", "raw_temporal_denoise_enable", g_app_config.raw_temporal.enable);
+            ret = app_config_prompt_bool("RAW denoise master (CPU)", "raw_temporal_denoise_enable", g_app_config.raw_temporal.enable);
             break;
         case 2:
-            ret = app_config_prompt_int("Temporal difference threshold", "raw_temporal_denoise_threshold_dn", (int)g_app_config.raw_temporal.threshold_dn, 1, 16383, " RAW DN");
+            ret = app_config_raw_denoise_group_menu_run("5-point Spatial settings",
+                "Spatial runs before temporal. Mode 0: all neighbors must pass; mode 1: filter with accepted neighbors only.", 3U, 3U);
             break;
         case 3:
-            ret = app_config_prompt_int("Average strength (1=50%, 2=75%, 3=87.5% previous)", "raw_temporal_denoise_history_shift", (int)g_app_config.raw_temporal.history_shift, 1, 3, "");
+            ret = app_config_raw_denoise_group_menu_run("Legacy Temporal settings",
+                "Used only when master is on and Dual Speed is off.\n"
+                "History shift: 1=50%, 2=75%, 3=87.5% previous.\n"
+                "Small changes are averaged; large changes pass through. Small real motion may still leave trails.", 1U, 2U);
             break;
-        case 4: {
+        case 4:
+            ret = app_config_raw_denoise_group_menu_run("Dual Speed / Motion protection settings",
+                "Dual Speed ignores legacy threshold/strength; requires master on.\n"
+                "Require hysteresis < fast < RAW threshold.", 6U, (unsigned int)RAW_CFG_COUNT - 6U);
+            break;
+        case 5: {
             RAW_TEMPORAL_DENOISE_PARAMS old = g_app_config.raw_temporal;
             RAW_TEMPORAL_DENOISE_PARAMS defaults = RAW_TEMPORAL_DENOISE_DEFAULTS;
             g_app_config.raw_temporal = defaults;
@@ -2191,10 +2266,13 @@ int app_config_save(void)
 		g_app_config.tdc_interval_sec);
     fprintf(fp, "# RAW Preprocessing: after corrections, before AGC\n");
     fprintf(fp, "# Hardware PRE RAW-to-RAW BNR before CPU AGC; restart Liveview to apply\n");
-    fprintf(fp, "# CPU temporal denoise: after corrections, before corrected snapshot and AGC; next frame applies\n");
-    fprintf(fp, "raw_temporal_denoise_enable=%u\n", g_app_config.raw_temporal.enable);
-    fprintf(fp, "raw_temporal_denoise_threshold_dn=%u\n", g_app_config.raw_temporal.threshold_dn);
-    fprintf(fp, "raw_temporal_denoise_history_shift=%u\n", g_app_config.raw_temporal.history_shift);
+    fprintf(fp, "# CPU spatial/temporal denoise: master enable; next frame applies before snapshot/AGC\n");
+    fprintf(fp, "# Dual speed: fixed 50%%/93.75%% history; hysteresis < fast < RAW threshold\n");
+    {
+        unsigned int i;
+        for (i = 0; i < RAW_CFG_COUNT; ++i)
+            fprintf(fp, "%s=%u\n", raw_items[i].key, *cfg_raw_value(&g_app_config.raw_temporal, i));
+    }
     fprintf(fp, "agc_weighted_enable=%d\n", g_app_config.agc_weighted_enable);
     fprintf(fp, "# One-shot reset of Weighted Mapping parameters; 1 overrides values on load. Saved as 0.\n");
     fprintf(fp, "agc_weighted_reset_defaults=0\n");
