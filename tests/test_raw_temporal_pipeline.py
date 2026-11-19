@@ -15,7 +15,8 @@ root = Path(__file__).resolve().parents[1]
 cc = shutil.which(args.cc); assert cc
 env = os.environ.copy(); env['PATH'] = str(Path(cc).parent) + os.pathsep + env.get('PATH', '')
 pipeline = (root/'Pipeline/liveview.c').read_text(encoding='utf-8')
-helper = pipeline[pipeline.index('static int liveview_apply_raw_temporal('):pipeline.index('static int liveview_update_ffc_table_from_average(')]
+helper_start = pipeline.index('typedef struct {\n\tUINTPTR base_va, data_va;')
+helper = pipeline[helper_start:pipeline.index('static int liveview_update_ffc_table_from_average(')]
 assert 'RAW temporal denoise (CPU): threshold=' not in helper
 assert 'raw_temporal_total_us' not in pipeline
 assert 'raw_nlm' not in pipeline and 'thermal_nlm' not in pipeline
@@ -25,6 +26,7 @@ code = r'''
 #include "Enhancement/RAW/raw_temporal_denoise.h"
 #include "Config/hardware_config.h"
 #include <assert.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +43,9 @@ typedef struct {
     int cap_exit, proc_exit;
 } VIDEO_LIVEVIEW;
 static pthread_mutex_t g_manual_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_manual_calibration_active, cancelled, stopped, copy_fail, copy_calls, flush_fail;
+static int g_manual_calibration_active, cancelled, stopped, map_fail, map_calls, unmap_calls, flush_fail;
+static UINTPTR input_base_va;
+static UINT32 input_bytes;
 static UINT32 g_weighted_calibration_generation, ffc_generation, shading;
 static UINT32 g_manual_shutter_open_generation;
 static int tdc_is_enabled(void) { return 0; }
@@ -52,9 +56,17 @@ static UINT32 ffc_shading_generation(void) { return shading; }
 static UINT32 ffc_table_generation(void) { return ffc_generation; }
 static void snapshot_writer_cancel_request(void) { ++cancelled; }
 static void liveview_request_fault_stop(VIDEO_LIVEVIEW *s, int n) { (void)s;(void)n;++stopped; }
-HD_RESULT hd_common_mem_flush_cache(void *va, unsigned int size) { assert(va && size); return flush_fail ? HD_ERR_NG : HD_OK; }
-static int copy_videoframe_raw(HD_VIDEO_FRAME *f, UINTPTR va, UINT32 size)
-{ ++copy_calls; if (copy_fail) return -1; memcpy((void *)va, (void *)f->phy_addr[0], size); return 0; }
+HD_RESULT hd_common_mem_flush_cache(void *va, unsigned int size)
+{ assert(va && size); return flush_fail && (UINTPTR)va != input_base_va ? HD_ERR_NG : HD_OK; }
+UINTPTR hd_common_mem_blk2pa(HD_COMMON_MEM_VB_BLK blk) { assert(blk==321); return input_base_va; }
+void *hd_common_mem_mmap(HD_COMMON_MEM_MEM_TYPE type, UINTPTR pa, UINT32 size)
+{
+    assert(type==HD_COMMON_MEM_MEM_TYPE_CACHE && pa==input_base_va && size==input_bytes);
+    ++map_calls;
+    return map_fail ? NULL : (void *)pa;
+}
+HD_RESULT hd_common_mem_munmap(void *va, unsigned int size)
+{ assert((UINTPTR)va==input_base_va && size==input_bytes); ++unmap_calls; return HD_OK; }
 '''
 code += helper
 code += r'''
@@ -78,19 +90,29 @@ release_vcap_frame:
 int main(void) {
     VIDEO_LIVEVIEW s = {0}; HD_VIDEO_FRAME f = {0};
     RAW_TEMPORAL_DENOISE_PARAMS p = {.enable=0,.threshold_dn=12,.history_shift=2};
-    size_t n = (size_t)RAW_SIZE_W * RAW_SIZE_H, i;
-    UINT16 *input = malloc(n * 2), *dest = malloc(n * 2);
-    assert(input && dest);
-    for(i=0;i<n;++i) input[i] = 9400;
+    const unsigned pitch = RAW_SIZE_W + 8U;
+    size_t n = (size_t)RAW_SIZE_W * RAW_SIZE_H, i, y;
+    UINT16 *storage = malloc((4 + (size_t)pitch * RAW_SIZE_H) * 2), *dest = malloc(n * 2);
+    UINT16 *input;
+    assert(storage && dest);
+    input = storage + 4;
+    input_base_va = (UINTPTR)storage;
+    input_bytes = (UINT32)((4 + (size_t)pitch * RAW_SIZE_H) * 2);
+    for(y=0;y<RAW_SIZE_H;++y) for(i=0;i<pitch;++i) input[y*pitch+i] = i<RAW_SIZE_W ? 9400 : 65535;
     s.thermal_raw_temporal_va = s.thermal_raw_temporal_pa = (UINTPTR)dest;
     s.thermal_raw_temporal_blk = 123;
     f.phy_addr[0] = (UINTPTR)input; f.blk = 321;
     f.pxlfmt = HD_VIDEO_PXLFMT_RAW16 | HD_VIDEO_PIX_PACK_LSB;
-    f.dim.w = RAW_SIZE_W; f.dim.h = RAW_SIZE_H; f.timestamp = 1000; f.count = 5;
+    f.dim.w = RAW_SIZE_W; f.dim.h = RAW_SIZE_H; f.loff[0] = pitch * 2U;
+    f.timestamp = 1000; f.count = 5;
+    assert(copy_videoframe_raw(&f,(UINTPTR)dest,(UINT32)(n*2))==0);
+    assert(dest[n-1]==9400 && map_calls==1 && unmap_calls==1);
+    map_calls=unmap_calls=0;
     assert(!raw_temporal_denoise_set_params(&p));
-    assert(run(&s,&f,0,0)==9400 && !copy_calls && !s.raw_temporal.history_q8);
+    assert(run(&s,&f,0,0)==9400 && !map_calls && !s.raw_temporal.history_q8);
     p.enable=1; assert(!raw_temporal_denoise_set_params(&p));
-    assert(run(&s,&f,0,0)==9400 && copy_calls==1);
+    assert(run(&s,&f,0,0)==9400 && dest[n-1]==9400 && map_calls==1 && unmap_calls==1);
+    f.loff[0] = pitch; /* Some frames report the stride in pixels. */
     input[0]=9404; f.timestamp+=33000;
     assert(run(&s,&f,0,0)==9401 && input[0]==9404);
     ffc_generation++; input[0]=9408; f.timestamp+=33000;
@@ -119,23 +141,24 @@ int main(void) {
     p=(RAW_TEMPORAL_DENOISE_PARAMS)RAW_TEMPORAL_DENOISE_DEFAULTS;
     assert(!p.enable);p.enable=1;
     assert(!raw_temporal_denoise_set_params(&p));
-    for(i=0;i<n;++i) input[i]=1000;
+    for(y=0;y<RAW_SIZE_H;++y) for(i=0;i<RAW_SIZE_W;++i) input[y*pitch+i]=1000;
     f.timestamp+=33000;assert(run(&s,&f,0,0)==1000);
-    for(i=0;i<n;++i) input[i]=1004;
+    for(y=0;y<RAW_SIZE_H;++y) for(i=0;i<RAW_SIZE_W;++i) input[y*pitch+i]=1004;
     f.timestamp+=33000;assert(run(&s,&f,0,0)==1000 && input[0]==1004);
-    for(i=0;i<n;++i) input[i]=1008;
+    for(y=0;y<RAW_SIZE_H;++y) for(i=0;i<RAW_SIZE_W;++i) input[y*pitch+i]=1008;
     f.timestamp+=33000;assert(run(&s,&f,0,0)==1005 && input[0]==1008);
-    for(i=0;i<n;++i) input[i]=1020;
+    for(y=0;y<RAW_SIZE_H;++y) for(i=0;i<RAW_SIZE_W;++i) input[y*pitch+i]=1020;
     f.timestamp+=33000;assert(run(&s,&f,0,0)==1020 && input[0]==1020);
     p.enable=0;assert(!raw_temporal_denoise_set_params(&p));
-    {int before=copy_calls;assert(run(&s,&f,0,0)==1020 && before==copy_calls);}
+    {int before=map_calls;assert(run(&s,&f,0,0)==1020 && before==map_calls);}
     p.enable=1;assert(!raw_temporal_denoise_set_params(&p));
-    puts("PASS: existing v3.9.0 wrapper: Spatial/Dual Slow/Fast/RAW, source unchanged, master OFF skips processing");
+    assert(dest[n-1]==1020 && input[RAW_SIZE_W]==65535 && map_calls==unmap_calls);
+    puts("PASS: mapped Spatial/Dual Slow/Fast/RAW, padded source unchanged, master OFF skips processing");
     assert(!stopped && !cancelled);
     puts("PASS: corrected values above 16383 preserve DN/precision and continue to AGC");
-    copy_fail=1;
+    map_fail=1;
     assert(run(&s,&f,0,1)==-1 && cancelled==1 && stopped==1 && s.cap_exit && s.proc_exit);
-    copy_fail=0; f.pxlfmt=HD_VIDEO_PXLFMT_RAW12;
+    map_fail=0; f.pxlfmt=HD_VIDEO_PXLFMT_RAW12;
     assert(run(&s,&f,0,0)==-1);
     f.pxlfmt=HD_VIDEO_PXLFMT_RAW16;
     assert(run(&s,&f,0,0)==-1); /* Missing LSB flag stays a format error. */
@@ -144,8 +167,9 @@ int main(void) {
     assert(run(&s,&f,0,0)==-1);
     flush_fail=0; s.thermal_raw_temporal_blk=HD_COMMON_MEM_VB_INVALID_BLK;
     assert(run(&s,&f,0,0)==-1);
-    raw_temporal_denoise_destroy(&s.raw_temporal);free(input);free(dest);
-    puts("PASS: production temporal wrapper: native corrected UINT16, bypass/reset, metadata, format/copy/cache/buffer diagnostics and cleanup");
+    assert(map_calls==unmap_calls+1); /* Only the failed mmap has no matching unmap. */
+    raw_temporal_denoise_destroy(&s.raw_temporal);free(storage);free(dest);
+    puts("PASS: production temporal wrapper: corrected UINT16, bypass/reset, metadata, format/map/cache/buffer diagnostics and cleanup");
     return 0;
 }
 '''

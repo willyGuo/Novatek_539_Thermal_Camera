@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class Params(ct.Structure):
     _fields_ = [(n, ct.c_double if n == 'bright' else ct.c_uint32) for n in
-                ('clip','redistribute','bright','percentile','gain','smooth','balanced')]
+                ('clip','redistribute','bright','percentile','gain','smooth','simple')]
 
 def rnd(v, divisor=1):
     v = np.asarray(v, dtype=np.int64)
@@ -195,7 +195,7 @@ void lut(AGC_WEIGHTED_WORKSPACE *p,void *out){memcpy(out,p->lut,sizeof(p->lut));
         first_frame,second_frame=cases[5],cases[6]
         q8,history,offset=limited(classic(first_frame,p),first_frame,p)
         apply(first_frame,p)
-        tail=Params.balanced.offset+ct.sizeof(ct.c_uint32)
+        tail=Params.simple.offset+ct.sizeof(ct.c_uint32)
         if ct.sizeof(p)>tail:
             ct.memset(ct.addressof(p)+tail,0xA5,ct.sizeof(p)-tail)
         q8,_,_=limited(classic(second_frame,p),second_frame,p,history,offset)

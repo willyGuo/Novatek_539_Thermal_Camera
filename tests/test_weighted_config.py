@@ -255,24 +255,32 @@ int main(void) {
     assert(agc_weighted_set_params(&g_app_config.weighted)==0);
     {
         int enabled;
-        assert(!g_app_config.weighted.balanced_background);
-        assert(app_config_update_int("agc_weighted_balanced_background",1)==0);
-        agc_weighted_get_params(&runtime); assert(runtime.balanced_background==1);
-        assert(app_config_get_int("agc_weighted_balanced_background",&enabled)==0 && enabled==1);
-        initial(); assert(app_config_load()==0); assert(g_app_config.weighted.balanced_background==1);
-        agc_weighted_get_params(&runtime); assert(runtime.balanced_background==1);
-        assert(cfg_store_pair(&g_app_config,"agc_weighted_balanced_background","0.5")==-1);
-        assert(app_config_update_int("agc_weighted_balanced_background",2)==-1);
-        assert(app_config_update_int("agc_weighted_balanced_background",-1)==-1);
-        fail_save=1; assert(app_config_update_int("agc_weighted_balanced_background",0)==-1);
-        agc_weighted_get_params(&runtime); assert(runtime.balanced_background==1 && g_app_config.weighted.balanced_background==1);
+        assert(!g_app_config.weighted.simple_mode);
+        assert(app_config_update_int("agc_weighted_simple_mode",1)==0);
+        agc_weighted_get_params(&runtime); assert(runtime.simple_mode==1);
+        assert(app_config_get_int("agc_weighted_simple_mode",&enabled)==0 && enabled==1);
+        initial(); assert(app_config_load()==0); assert(g_app_config.weighted.simple_mode==1);
+        agc_weighted_get_params(&runtime); assert(runtime.simple_mode==1);
+        assert(cfg_store_pair(&g_app_config,"agc_weighted_simple_mode","0.5")==-1);
+        assert(app_config_update_int("agc_weighted_simple_mode",6)==-1);
+        assert(app_config_update_int("agc_weighted_simple_mode",-1)==-1);
+        fail_save=1; assert(app_config_update_int("agc_weighted_simple_mode",0)==-1);
+        agc_weighted_get_params(&runtime); assert(runtime.simple_mode==1 && g_app_config.weighted.simple_mode==1);
         fail_save=0;
+        assert(cfg_weighted_index("agc_weighted_simple_mode")==6); /* Menu item 8. */
+        { int mode; for(mode=0;mode<=5;mode++) {
+            assert(app_config_update_int("agc_weighted_simple_mode",mode)==0);
+            initial();assert(app_config_load()==0);
+            agc_weighted_get_params(&runtime);
+            assert(runtime.simple_mode==(uint32_t)mode &&
+                   g_app_config.weighted.simple_mode==(uint32_t)mode);
+        } }
         { FILE *fp=fopen(TEST_MENU_PATH,"w");assert(fp);
-          fprintf(fp,"%u\n0\n0\n",(unsigned int)cfg_weighted_index("agc_weighted_balanced_background")+2U);fclose(fp); }
+          fprintf(fp,"%u\n0\n0\n",(unsigned int)cfg_weighted_index("agc_weighted_simple_mode")+2U);fclose(fp); }
         assert(freopen(TEST_MENU_PATH,"r",stdin)); assert(app_config_weighted_menu_run()==0);
-        agc_weighted_get_params(&runtime); assert(!runtime.balanced_background);
-        initial(); assert(app_config_load()==0); assert(!g_app_config.weighted.balanced_background);
-        puts("PASS: Balanced Background CFG/menu switch, save/load/live apply/validation/rollback");
+        agc_weighted_get_params(&runtime); assert(!runtime.simple_mode);
+        initial(); assert(app_config_load()==0); assert(!g_app_config.weighted.simple_mode);
+        puts("PASS: Brightness/local CFG/menu modes, save/load/live apply/validation/rollback");
     }
     {
         const char *weights[]={"1.001","12.3456","1000","1e100","1.7976931348623157e308"};
@@ -308,7 +316,7 @@ int main(void) {
     assert(memcmp(&before,&g_app_config.weighted,sizeof(before))==0);
     for(i=0;i<2;i++) {
         FILE *fp=fopen(APP_CONFIG_PATH,"w"); assert(fp);
-        fprintf(fp,"agc_weighted_reset_defaults=%u\nagc_weighted_gain_limit=0.1\nagc_weighted_balanced_background=1\nagc_weighted_bright_percentile=21\nagc_weighted_reset_defaults=1\n",i);
+        fprintf(fp,"agc_weighted_reset_defaults=%u\nagc_weighted_gain_limit=0.1\nagc_weighted_simple_mode=1\nagc_weighted_bright_percentile=21\nagc_weighted_reset_defaults=1\n",i);
         fclose(fp); assert(app_config_load()==0); check_defaults();
         fp=fopen(APP_CONFIG_PATH,"r"); assert(fp);
         { char text[16384]; size_t n=fread(text,1,sizeof(text)-1,fp); text[n]=0;
@@ -336,7 +344,7 @@ int main(void) {
     {FILE *fp=fopen(APP_CONFIG_PATH,"w");assert(fp);
      fputs("cfg_boot_load=1\npre_bnr_enable=1\nagc_weighted_enable=1\nagc_weighted_mode=1\nagc_v3_denoise_enable=1\nagc_min_max_tone_curve_enable=1\nraw_nlm_enable=1\nraw_nlm_h_dn=8\nraw_nlm_search_window=5\nagc_weighted_background_enable=1\nagc_weighted_background_low_percentile=10\nagc_weighted_background_high_percentile=90\nagc_weighted_background_target_gray=128\nagc_weighted_background_output_span=120\nagc_weighted_background_max_gain=1\nagc_weighted_large_scale_gain=8\n",fp);fclose(fp);}
     initial();assert(app_config_load()==0 && current_mode==AGC_MODE_WEIGHTED_CPU);
-    assert(!g_app_config.weighted.balanced_background); /* Old CFG has no new key. */
+    assert(!g_app_config.weighted.simple_mode); /* Old CFG has no new key. */
     assert(app_config_save()==0);
     {FILE *fp=fopen(APP_CONFIG_PATH,"r");char text[16384];size_t n;assert(fp);
      n=fread(text,1,sizeof(text)-1,fp);text[n]=0;fclose(fp);
@@ -398,11 +406,11 @@ with tempfile.TemporaryDirectory(prefix='tiffany_weighted_cfg_') as tmp:
             print(completed.stderr)
             completed.check_returncode()
         assert 'PASS: RAW temporal CFG validation' in completed.stdout
-        assert 'PASS: Balanced Background CFG/menu switch' in completed.stdout
+        assert 'PASS: Brightness/local CFG/menu modes' in completed.stdout
         assert 'PASS: Standard display matches reference CFG' in completed.stdout
         assert 'PASS: DDE base scale CFG/menu' in completed.stdout
         print(f'Profile {profile}: PASS: DDE base scale CFG/menu, persistence/live apply/rollback')
         print(f'Profile {profile}: PASS: Standard snapshot, save/load/runtime/rollback; removed menu options')
         print(f'Profile {profile}: PASS: RAW temporal CFG save/load/live apply, validation, rollback and menu reset')
-        print(f'Profile {profile}: PASS: Balanced Background switch, CFG/menu persistence, validation/reset and rollback')
+        print(f'Profile {profile}: PASS: Brightness/local modes, CFG/menu persistence, validation/reset and rollback')
         print(f'Profile {profile}: '+completed.stdout.splitlines()[-1])

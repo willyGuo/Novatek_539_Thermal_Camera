@@ -272,6 +272,8 @@ VCAP、RAWALL 與 VPE 各自保存成功 pull 的原始 frame descriptor；relea
 
 `Pipeline/frame_diagnostics.h` 的 `FRAME_DIAGNOSTICS_ENABLED` 預設為 `0`，暫停 `FRAME_TRACE`、正常 ownership 計數、RAW_INPUT_SYNC 成功計數與 Weighted 定期耗時輸出；buffer 釋放、RAW 輸入同步保護與錯誤訊息仍保留。需要恢復追蹤時，以 `-DFRAME_DIAGNOSTICS_ENABLED=1` 編譯。以下影格時序追蹤說明適用於開啟診斷輸出時。
 
+若只需比較 RAW pipeline 耗時，清除舊物件後使用 `make RAW_STAGE_TIMING=1`。串口每 60 次取幀嘗試取樣一次，只在抽樣幀成功完成時印出 `RAW_STAGE_US`。`weighted_mode` 是該幀實際套用的模式（`-1` 為未套用），`denoise` 表示該幀是否完成 RAW 降噪，`skip` 是設定的 runtime skip 數。`cap` 為 VCAP 取幀耗時，`denoise_us`／`weighted_us` 含各階段的 buffer/cache 操作，`rawall` 含送入 VideoProc 並等待對應 RAWALL 完成，`total` 包含其他 RAW worker 工作但不含 runtime skip 或後段編碼／UVC。所有耗時均為微秒；比較模式時建議設 `runtime_skip_frames=0`，同一場景各取數行。正式版不帶 `RAW_STAGE_TIMING=1` 重新編譯即可關閉。
+
 UVC 在複製 cacheable encoder bitstream 前執行 DMA-from-device cache 同步。`UVAC_WaitStrmDone()` 失敗時停止送流，保留 MJPEG 傳輸 buffer，直到 Stop join worker 並關閉 UVAC 後才允許回收；編碼輸出的 release 失敗也保留 descriptor 供 Stop 重試。上板時需在出流期間連續擷取 `cat /proc/hdal/*/info`，對照應用程式計數及錯誤訊息，另驗證長時間播放、UVC 開關、Stop／Restart 與畫面異常。
 
 影格時序追蹤使用 `FRAME_TRACE` 前綴，記錄 `VCAP`、`RAWALL_IN`、`RAWALL_OUT`、`VPE_OUT`（鏡像啟用時）、`ENC_IN`、`ENC_OUT`、`USB_SUBMIT` 與 `USB_DONE`。各階段第一幀及約每 300 幀印一次，各階段錯開輸出以降低 UART 集中印字的影響；時間戳倒退／重複、非零序號倒退、到達間隔超過 200 ms，或相對首幀的延遲增量超過 200 ms 時印出 event，異常輸出最多每階段每秒一行。累計數不受日誌限速影響。`wall` 是板端 monotonic 時間，`pts` 是 SDK frame timestamp，皆以微秒表示；`back`／`dup` 是時間戳倒退／重複次數，`cback` 是非零序號倒退次數。`lag_growth_us`／`maxlag_us` 是該階段相對首幀的延遲增量／最大增量，不是絕對端到端延遲；時間戳為 0 時累計 `zero`，不能據此判斷重播。FFC、手動校正、負載或 UART 印字也可能造成間隔增加，event 是調查線索。USB_DONE 只表示 UVAC 等待完成，不代表電腦螢幕已顯示。追蹤不改寫時間戳、不額外複製影像、不丟棄影格；新時間戳搭配舊像素仍需另查內容與 buffer 使用時序。
@@ -395,11 +397,11 @@ Histogram P1/P99 的設定選單新增 `5. Gain Limit`，CFG 為 `agc_histogram_
 | `agc_weighted_bright_weight` | 1.0 | 有限數值 ≥ 1，無固定上限；1 為 Off；double 儲存並保留小數 |
 | `agc_weighted_bright_percentile` | 70.0 | 0..100，步進 0.1；從 Clip／Redistribution 後的直方圖重算亮部門檻 |
 | `agc_weighted_gain_limit` | 2.0 | 0 關閉；0.1..4.0，步進 0.1；單位為 8-bit Gray／原始 RAW DN |
-| `agc_weighted_temporal_previous_percent` | 90 | LUT／Classic Gain 補償的歷史權重 0..99%；平衡模式同時保護背景追蹤；0 關閉 Smooth 與追蹤 |
-| `agc_weighted_balanced_background` | 0 | 0 保留 Classic；1 開啟平衡背景／高溫分段 LUT，不含 DDE |
+| `agc_weighted_temporal_previous_percent` | 90 | LUT與Gain補償的歷史權重0..99%；0停用；不是影像時間降噪 |
+| `agc_weighted_simple_mode` | 0 | 0 Off；1 Brightness Only；2 Mild；3 Strong；4 Fast Local；5 Local Mean，接在 Smooth／Gain Limit 後 |
 | `agc_weighted_reset_defaults` | 0 | 設 1：載入完成後重設所有 Weighted Mapping 參數，成功儲存後此鍵回到 0 |
 
-Weighted CFG 選單第 8 項為 Balanced Background 開關，第 9 項重設 Weighted Mapping 參數（包含關閉 Balanced Background），預設值統一使用 `AGC_WEIGHTED_DEFAULT_PARAMS`；不更動 AGC 開關與其他功能。已移除功能的舊 CFG 鍵會被忽略，後續儲存不再寫出。
+Weighted CFG 選單第8項為 Brightness + Local Contrast，第9項重設全部Weighted參數。預設Off；不改AGC開關。舊功能鍵由一般未知鍵機制忽略，儲存後不再寫出。
 
 Weighted Mapping 直接建立 `0..16383` 的 RAW14 LUT，輸入與輸出皆為 UINT16 容器中的 RAW14 數值，不再先量化成 256 階。AGC／2DNR 順序維持原狀。
 
@@ -412,48 +414,63 @@ Smooth 在 RAW14 DN 的 Q8 精度下混合 LUT，不平均影像像素。Classic
 
 目前流程為 `Clip／Redistribution → Bright Weight → RAW14 LUT → Smooth → Gain Limit → 輸出`，Gain Limit 是最後的映射調整。尺寸、參數、AGC 模式、FFC／校正及 Restart 會重設 LUT 與亮度補償歷史。
 
-Balanced Background（`agc_weighted_balanced_background=1`）為 Otsu Weighted R6：
+### Brightness + Local Contrast
 
-1. 以原始 RAW Histogram 做一次 Otsu，最大化兩群的群間變異；同分取最低分界 DN。
-2. 分界兩側平均差至少 70 RAW DN 才啟用高溫段。Otsu 仍可為狹窄分布找出 T，
-   但這個單一條件避免把小幅雜訊拆成兩個增強區；常數影像沒有有效雙群。
-3. 有效分群時取低溫群中位數 C，否則取全圖中位數。C 固定對應 96 Gray。
-   背景斜率 g=min(1.2, Gain Limit)，Gain Limit=0 時 g=1.2，單位 Gray/RAW DN。
-4. 背景為 clamp(96+g*(DN-C),16,160)。高溫區 DN>T 共用 Classic 的
-   Clip／Redistribution／Bright Weight 建表函式。Clip 以高溫像素數／有效 DN 數計算，
-   Redistribution 只回填原本有高溫像素的 bin。P 由處理後保留的高溫直方圖重新計算，
-   使用整數逆 CDF，再套用 Bright Weight；其累積權重從分界灰階 YT 映射至 245 Gray。
-   只有單一高溫 DN 時沒有可重新分配的細節，保留線性銜接。未啟用高溫段時，
-   整張使用 clamp(96+g*(DN-C),16,245)，不另外拉伸窄幅雜訊。
-5. 保留原生 RAW14 LUT（Gray 僅為說明單位），再做一次既有 Q8 LUT Smooth，
-   最後一次 Gain Limit；不做全圖平均亮度補償，最後才對像素查表。
+流程：RAW直方圖 → Clip／Redistribution → Bright Weight → RAW14 LUT → LUT Smooth →
+Gain Limit／均值補償 → 可選亮度曲線 → 可選單尺度Local Contrast → RAW14輸出 → 後段DDE／ISP。
+Bright Weight=1 時略過亮部百分位與加權和掃描；固定亮度曲線首次使用時建成 RAW14 查表，
+後續每幀直接查表。這些簡化不改變 LUT、平滑或局部對比的結果。
 
-Clip／Redistribution／Bright Weight／P 在本模式調整高溫細節，不更動 Otsu 分界或
-背景曲線；Gain Limit、Smooth 仍處理完整 LUT。任一參數改變時重置 LUT 歷史，
-於下一個影格套用新參數。沒有有效高溫段時，高溫參數自然不影響當張結果。
-CFG 選單／狀態顯示已標示，持久化鍵與開關保持不變。
+`agc_weighted_simple_mode=0` 完全保留既有Weighted行為。
+`1` 僅把Weighted亮度從0..255 Gray縮到5..211，再套Medium暗部／中灰階曲線；
+曲線輸入節點 `[0,12,28,60,90,130,170,200,255]`，對應
+`[0,22,48,89,115,143,170,200,255]`，合成到LUT內，沒有空間濾波配置。
+`2` Mild、`3` Strong另加入原始輸入RAW的單次Guided Filter殘差。
 
-沒有多群選擇、歷史中心匹配、熱源比例目標、指數暗部、局部 Gain Limit、
-中心限速、暖機與額外恢復狀態；Clip／Bright Weight 只在高溫區執行一次。
-兩種模式共用同一個 Weighted 建表函式，沒有逐幀配置或增加工作區。
-FFC、Shading、手動校正與手動開快門成功時，只重置既有 LUT／Gain 歷史。
-手動快門通知不修改 FFC 表、不執行 FFC；無 GPIO 通知的實體遮鏡仍受設定的
-LUT Smooth 影響，不保證立即恢復。UART 第一個平衡影格標示 `Balanced Otsu Weighted R6`。
+半徑24像素，邊界BORDER_REFLECT_101。S=max(原始直方圖P99-P1,32 DN)，
+Epsilon=max(2 DN,0.12*S)，濾波器內使用Epsilon平方。
+Mild增益=min(0.8,510/S) Gray/DN，補償限幅±32 Gray；
+Strong增益=min(1.2,765/S)，限幅±44 Gray。最後限制3..246 Gray，再存回RAW14。
+Gray數值只是控制單位，並未先量化成8-bit；沒有額外tanh、coring、局部能量gate、
+人物遮罩、tile或像素歷史。Gain Limit只管前段LUT，不能限制後面局部補償的斜率。
 
-單靠 Otsu 無法保證較低溫群就是真正背景。最終 Gain Limit 可能讓最高輸出低於
-245 Gray，增益限制也可能減弱其他高溫參數的視覺差異。
-Toolkit 的靜態 v2 尚未改為此算法，不能再把兩者視為相同參考。
+本選項不覆寫Clip、Redistribution、Bright Weight、Gain Limit與Smooth。
+若要與Toolkit離線單尺度圖比較，使用Clip=2、Redistribution=1、Bright Weight=1、
+P70、Gain Limit=0、Smooth=0；Toolkit另須停用Automatic Clip與Linear Mixing。
+韌體與Toolkit的既有LUT、Gain補償與量化規則有差異，不能把任意同名參數視為逐像素相同。
 
-主機檢查：`python tests/test_weighted_balanced.py`，可加
-`--raw-dir <RAW目錄> --output-dir <結果目錄>` 產生 RAW14／PNG 與數值參考報告；
-`--before-dir <修改前agc_weighted.c/.h目錄>` 可驗證 Classic 保持逐位元一致。
-測試包含 Otsu 與分段映射的獨立 NumPy 參考、均勻／窄幅雜訊、熱源占比 1..99%、
-Smooth=0/50/90/99、開鏡延遲與校正重置、原圖保存、in-place、四個高溫參數的效果、
-背景保持一致、參數變更重置及極大 Bright Weight。
+Mild／Strong首次啟用時配置4張float工作平面，以滑動加總做4次Box Filter，之後重用；
+垂直方向分欄段連續讀寫，欄段不會截斷濾波視窗；水平方向僅在畫面邊界計算反射索引。
+640×480需4,915,200 bytes（約4.69 MiB）、640×512需5 MiB。
+Off／Brightness不會觸發此配置；曾經配置的緩衝保留至串流關閉釋放。
+尺寸改變按需擴充，配置失敗不覆寫輸出或LUT歷史；串流結束由
+`agc_weighted_workspace_release()`釋放後再free workspace。
+RAW輸入保持不變，亦支援相同stride的in-place；CPU輸出仍經既有cache flush交給VideoProc。
+Mild／Strong 仍為純量實作，尚需板端確認畫質、記憶體峰值及每幀時間。
 
-Weighted 工作區為 229,432 bytes（主機 GCC 對齊），開始出流前配置、停止時釋放。
-沿用既有 RAW snapshot、輸出 block 與 RAW_INPUT_SYNC。主機驗證不代表 SDK link、
-上板畫質或板端 FPS 已通過。
+若 Mild／Strong 的板端 FPS 不足，選 `4 Fast Local`。它沿用 Mild 的增益與限幅，
+以 4×4 RAW 區塊的一、二階矩在 1/4 寬、1/4 高的網格上計算係數（網格半徑 6），
+再雙線性插值並用全解析度 RAW 求殘差。輸出維持 RAW14 原解析度，但局部補償是近似，
+細小邊緣的對比可能不同。只使用 Fast Local 時，640×480 的空間工作區為 307,200 bytes；
+若先前已使用 Mild／Strong，較大的工作區保留至串流關閉。
+Fast Local 在支援 ARM NEON 的編譯目標上同時計算兩個相鄰 4×4 區塊的統計量，
+並以四像素一組套用補償；不足一組的邊界及非 NEON 目標使用純量。
+不改分析網格、濾波半徑或補償限幅。
+Box Filter 共用第一個視窗的反射索引；只需反射一次時不做整數取餘，邊界結果不變。
+
+`5 Local Mean` 是較低成本的局部對比選項：在同一個 4×4 網格上只做一次均值 Box Filter，
+雙線性插值後，以定點運算將原始 RAW 與局部背景的差套回全解析度 RAW14。
+沿用 Mild 的增益與限幅，但沒有 Guided Filter 的邊緣保護；強反差邊緣可能有較明顯的亮／暗邊。
+既有模式與預設值不變。
+
+主機測試：
+
+- `python tests/test_weighted_raw14.py`：116組Classic LUT、Q8 Smooth、Gain補償、stride與精度。
+- `python tests/test_weighted_single_scale.py --toolkit <Toolkit> --raw-dir <RAW資料夾> --raw <另一張RAW> --output-dir <輸出>`：獨立Guided參考、RAW14、三種新模式、配置失敗／重用／釋放、in-place、stride、切換重置與非法值；可用 `--before-dir <修改前c/h>` 比較Off。
+- `python tests/test_weighted_pipeline.py`：640×480／640×512的實際RAW派送函式與cache／描述符mock。
+- `python tests/test_weighted_config.py --sdk <SDK/code>`：TY640／ATTO640的CFG、選單第8項、儲存讀回、runtime、Reset及儲存失敗rollback。
+
+以上為主機source／C reference檢查，不代表完整SDK連結、燒錄、板端FPS或實機影片已驗證。
 
 
 ## BPR／DPC
@@ -835,7 +852,7 @@ GPIO 初始化後輸出為 low，讓 shutter 維持開啟。開啟或關閉 shut
 v3.9.1 在 v3.9.0 上擴充前降噪核心與 CFG／控制選單，沿用 `Enhancement/RAW` 目錄及既有呼叫入口。
 `CFG Setting -> 14. RAW Preprocessing setting` 提供總開關、Spatial、Legacy Temporal、Dual Speed／Motion protection 與重設選項。
 流程為 `TDC -> NUC -> FFC -> Spatial / Temporal DNS -> corrected RAW snapshot -> CPU AGC -> RAWALL -> YUV420`。
-`Pipeline/liveview.c`、snapshot、錄製、診斷及 AGC 均維持純 v3.9.0；本版不含獨立 DNS RAW 選項或 DNS CSV 統計。Corrected RAW 依 v3.9.0 行為，包含已啟用的降噪結果。
+v3.9.2 調整 Liveview 前降噪的 RAW 讀取方式，並新增 Weighted Mapping 的亮度及局部對比模式。快照與錄製的 Corrected RAW 仍包含已啟用的降噪結果。
 RAW 輸入使用原本的 RAWALL 路徑，不再經過獨立的 RAW14→U12 轉換與緩衝區。
 
 ### RAW14 時間降噪（CPU，AGC 前）
@@ -876,7 +893,9 @@ raw_temporal_denoise_motion_hold_frames=3
 
 新增一個 RAW 輸出 common-pool block；啟用後才配置 Q8 歷史（640x480 約 1.2 MB），停止時釋放。
 已移除第一張及每 300 張的週期耗時輸出與計時累積，不影響 RAW temporal denoise 濾波。
-第一張另印輸入格式、尺寸、stride、DN 最小／最大值及大於 `16383` 的像素數。失敗時會在通用停止訊息前，區分輸出 buffer、輸入格式／尺寸、RAW 複製、參數／layout、歷史記憶體配置或 cache flush 錯誤；格式與記憶體錯誤仍安全停止，不假裝已完成濾波。
+Liveview 直接讀取映射後的輸入 RAW、寫入既有的獨立輸出 block，不再先複製整張影像；原始輸入不會改寫。ARM NEON 編譯時，Selective Spatial + Dual Speed 的穩定幀會使用既有的 NEON 空間濾波與純量動態保護。
+Dual Speed 若已由當前值與 Fast 歷史的差判定為強動態，直接輸出原始 RAW 並重設兩組像素歷史，省去不會使用的 IIR 運算；門檻、hysteresis 與 hold 規則不變。
+第一張另印輸入格式、尺寸、stride、DN 最小／最大值及大於 `16383` 的像素數。失敗時會在通用停止訊息前，區分輸出 buffer、輸入格式／尺寸、RAW 映射、參數／layout、歷史記憶體配置或 cache 同步錯誤；格式與記憶體錯誤仍安全停止，不假裝已完成濾波。
 主機數值與 CFG 測試不能證明 SDK 建置、板端 FPS/CPU 使用率或無拖影。
 
 

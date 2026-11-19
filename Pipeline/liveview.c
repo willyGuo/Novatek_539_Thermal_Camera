@@ -778,6 +778,9 @@ typedef struct _VIDEO_LIVEVIEW {
 	UINTPTR thermal_agc_histogram_p1_p99_out_va;
 	AGC_WEIGHTED_WORKSPACE *agc_weighted_workspace;
 	UINT32 agc_weighted_frame_count, agc_weighted_error_count;
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+	UINT32 raw_stage_sample_count;
+#endif
 	UINT32 agc_weighted_calibration_generation;
 	UINT32 agc_weighted_shading_generation;
 	UINT32 agc_weighted_shutter_generation;
@@ -2331,62 +2334,92 @@ static int queue_pipeline_snapshot(HD_VIDEO_FRAME *p_input_frame,
 	return 0;
 }
 
-static int copy_videoframe_raw(HD_VIDEO_FRAME *p_video_frame, UINTPTR dst_va, UINT32 dst_size)
+typedef struct {
+	UINTPTR base_va, data_va;
+	UINT32 size, stride;
+} LIVEVIEW_RAW_MAP;
+
+static int liveview_map_raw(const HD_VIDEO_FRAME *frame, LIVEVIEW_RAW_MAP *map)
 {
 	UINTPTR blk_pa;
-	UINTPTR map_va;
-	UINTPTR src_va;
-	UINT32 stride;
+	UINT64 stride, offset, plane_size;
 	UINT32 plane_height;
-	UINT32 map_size;
-	UINT32 row_bytes = RAW_SIZE_W * sizeof(UINT16);
-	UINT32 required_size = row_bytes * RAW_SIZE_H;
-	UINT32 y;
+	HD_RESULT ret;
 
-	if (p_video_frame == NULL || p_video_frame->blk == 0 ||
-	    dst_va == 0 || dst_size < required_size) {
-		printf("copy full raw invalid argument\n");
+	if (frame == NULL || frame->blk == 0 || frame->blk == HD_COMMON_MEM_VB_INVALID_BLK) {
+		printf("RAW input map: invalid frame/block\n");
 		return -1;
 	}
-	stride = p_video_frame->loff[0];
-	if (stride < p_video_frame->dim.w * sizeof(UINT16)) {
+	stride = frame->loff[0];
+	if (stride < (UINT64)frame->dim.w * sizeof(UINT16)) {
 		stride *= sizeof(UINT16);
 	}
-	if (stride < row_bytes) {
-		printf("copy full raw invalid line offset: %u\n", stride);
+	if (stride < RAW_SIZE_W * sizeof(UINT16) || stride > UINT_MAX) {
+		printf("RAW input map: invalid line offset: %u\n", (unsigned)frame->loff[0]);
 		return -1;
 	}
 
-	blk_pa = hd_common_mem_blk2pa(p_video_frame->blk);
-	if (blk_pa == 0 || p_video_frame->phy_addr[0] < blk_pa) {
-		printf("copy raw blk2pa error !!\r\n\r\n");
+	blk_pa = hd_common_mem_blk2pa(frame->blk);
+	if (blk_pa == 0 || frame->phy_addr[0] < blk_pa) {
+		printf("RAW input map: invalid block/plane physical address\n");
 		return -1;
 	}
 
-	plane_height = p_video_frame->ph[0] != 0 ?
-		p_video_frame->ph[0] : p_video_frame->dim.h;
+	plane_height = frame->ph[0] != 0 ? frame->ph[0] : frame->dim.h;
 	if (plane_height < RAW_SIZE_H) {
-		printf("copy full raw plane is too short: %u\n", plane_height);
+		printf("RAW input map: plane is too short: %u\n", plane_height);
 		return -1;
 	}
-	map_size = (UINT32)(p_video_frame->phy_addr[0] - blk_pa) +
-		stride * plane_height;
-	map_va = (UINTPTR)hd_common_mem_mmap(
-		HD_COMMON_MEM_MEM_TYPE_CACHE, blk_pa, map_size);
-	if (map_va == 0) {
-		printf("copy raw mmap error !!\r\n\r\n");
+	offset = frame->phy_addr[0] - blk_pa;
+	plane_size = stride * plane_height;
+	if (plane_size > UINT_MAX || offset > UINT_MAX - plane_size) {
+		printf("RAW input map: plane size exceeds mapping limit\n");
 		return -1;
 	}
+	map->stride = (UINT32)stride;
+	map->size = (UINT32)(offset + plane_size);
+	map->base_va = (UINTPTR)hd_common_mem_mmap(
+		HD_COMMON_MEM_MEM_TYPE_CACHE, blk_pa, map->size);
+	if (map->base_va == 0) {
+		printf("RAW input map: mmap failed\n");
+		return -1;
+	}
+	ret = hd_common_mem_flush_cache((void *)map->base_va, map->size);
+	if (ret != HD_OK) {
+		printf("RAW input map: cache sync failed=%d\n", ret);
+		ret = hd_common_mem_munmap((void *)map->base_va, map->size);
+		if (ret != HD_OK) printf("RAW input map: munmap failed=%d\n", ret);
+		return -1;
+	}
+	map->data_va = map->base_va + (UINTPTR)offset;
+	return 0;
+}
 
-	hd_common_mem_flush_cache((void *)map_va, map_size);
-	src_va = map_va + (p_video_frame->phy_addr[0] - blk_pa);
+static int liveview_unmap_raw(const LIVEVIEW_RAW_MAP *map)
+{
+	HD_RESULT ret = hd_common_mem_munmap((void *)map->base_va, map->size);
+	if (ret != HD_OK) {
+		printf("RAW input map: munmap failed=%d\n", ret);
+		return -1;
+	}
+	return 0;
+}
+
+static int copy_videoframe_raw(HD_VIDEO_FRAME *p_video_frame, UINTPTR dst_va, UINT32 dst_size)
+{
+	LIVEVIEW_RAW_MAP map;
+	UINT32 row_bytes = RAW_SIZE_W * sizeof(UINT16);
+	UINT32 y;
+	if (dst_va == 0 || dst_size < row_bytes * RAW_SIZE_H) {
+		printf("copy full raw invalid destination\n");
+		return -1;
+	}
+	if (liveview_map_raw(p_video_frame, &map)) return -1;
 	for (y = 0; y < RAW_SIZE_H; y++) {
 		memcpy((void *)(dst_va + y * row_bytes),
-		       (void *)(src_va + y * stride), row_bytes);
+		       (const void *)(map.data_va + (size_t)y * map.stride), row_bytes);
 	}
-	hd_common_mem_munmap((void *)map_va, map_size);
-
-	return 0;
+	return liveview_unmap_raw(&map);
 }
 
 static int liveview_apply_raw_temporal(VIDEO_LIVEVIEW *s, HD_VIDEO_FRAME *in,
@@ -2394,7 +2427,8 @@ static int liveview_apply_raw_temporal(VIDEO_LIVEVIEW *s, HD_VIDEO_FRAME *in,
 {
     UINT32 size = RAW_SIZE_W * RAW_SIZE_H * sizeof(UINT16);
     UINT32 storage_mask = HD_VIDEO_PXLFMT_CLASS_MASK | HD_VIDEO_PXLFMT_PLANE_MASK | HD_VIDEO_PXLFMT_BPP_MASK;
-    int result;
+    LIVEVIEW_RAW_MAP map;
+    int result, unmap_result;
     HD_RESULT cache_ret;
     if (!s || !in || !out || !params) {
         printf("RAW temporal: null state/frame/parameters\n");
@@ -2418,28 +2452,36 @@ static int liveview_apply_raw_temporal(VIDEO_LIVEVIEW *s, HD_VIDEO_FRAME *in,
             (unsigned)in->loff[0], (unsigned)in->ph[0], RAW_SIZE_W, RAW_SIZE_H);
         return -1;
     }
-    if (copy_videoframe_raw(in, s->thermal_raw_temporal_va, size)) {
-        printf("RAW temporal: input staging copy failed, size=%u block=0x%llx pa=0x%llx stride=%u plane_h=%u\n",
-            size, (unsigned long long)in->blk, (unsigned long long)in->phy_addr[0],
+    if (liveview_map_raw(in, &map)) {
+        printf("RAW temporal: input map failed, block=0x%llx pa=0x%llx stride=%u plane_h=%u\n",
+            (unsigned long long)in->blk, (unsigned long long)in->phy_addr[0],
             (unsigned)in->loff[0], (unsigned)in->ph[0]);
         return -1;
     }
+    if ((map.data_va | map.stride) & 1U) {
+        printf("RAW temporal: input is not aligned for UINT16\n");
+        liveview_unmap_raw(&map);
+        return -1;
+    }
     if (!s->raw_temporal_input_reported) {
-        const uint16_t *raw = (const uint16_t *)s->thermal_raw_temporal_va;
-        UINT32 i, count = RAW_SIZE_W * RAW_SIZE_H, above_raw14 = 0;
+        UINT32 x, y, above_raw14 = 0;
         UINT32 min_dn = UINT16_MAX, max_dn = 0;
-        for (i = 0; i < count; ++i) {
-            if (raw[i] < min_dn) min_dn = raw[i];
-            if (raw[i] > max_dn) max_dn = raw[i];
-            if (raw[i] > 16383U) ++above_raw14;
+        for (y = 0; y < RAW_SIZE_H; ++y) {
+            const uint16_t *raw = (const uint16_t *)(map.data_va + (size_t)y * map.stride);
+            for (x = 0; x < RAW_SIZE_W; ++x) {
+                if (raw[x] < min_dn) min_dn = raw[x];
+                if (raw[x] > max_dn) max_dn = raw[x];
+                if (raw[x] > 16383U) ++above_raw14;
+            }
         }
         printf("RAW temporal first input: fmt=0x%08x size=%ux%u source_stride=%u DN=%u..%u above16383=%u (preserved)\n",
-            (unsigned)in->pxlfmt, RAW_SIZE_W, RAW_SIZE_H,
-            (unsigned)in->loff[0], min_dn, max_dn, above_raw14);
+            (unsigned)in->pxlfmt, RAW_SIZE_W, RAW_SIZE_H, map.stride, min_dn, max_dn, above_raw14);
     }
-    result = raw_temporal_denoise_process(&s->raw_temporal,
+    result = raw_temporal_denoise_process_to(&s->raw_temporal,
+        (const uint16_t *)map.data_va, map.stride,
         (uint16_t *)s->thermal_raw_temporal_va, RAW_SIZE_W * sizeof(UINT16),
         RAW_SIZE_W, RAW_SIZE_H, in->timestamp, params);
+    unmap_result = liveview_unmap_raw(&map);
     if (result < 0) {
         printf("RAW temporal: filter failed=%d (%s), threshold=%u DN strength=%u history=%p capacity=%llu need=%llu bytes\n",
             result, result == RAW_TEMPORAL_ERROR_MEMORY ? "history allocation" :
@@ -2449,6 +2491,7 @@ static int liveview_apply_raw_temporal(VIDEO_LIVEVIEW *s, HD_VIDEO_FRAME *in,
             (unsigned long long)RAW_SIZE_W * RAW_SIZE_H * sizeof(uint32_t));
         return -1;
     }
+    if (unmap_result) return -1;
     cache_ret = hd_common_mem_flush_cache((void *)s->thermal_raw_temporal_va, size);
     if (cache_ret != HD_OK) {
         printf("RAW temporal: output cache flush failed=%d size=%u\n", cache_ret, size);
@@ -2914,6 +2957,7 @@ static HD_RESULT exit_thermal_frame(VIDEO_LIVEVIEW *p_stream)
 	p_stream->thermal_ffc_sum_pa = 0;
 	p_stream->thermal_agc_histogram_p1_p99_out_pa = 0;
 	p_stream->thermal_isp_step_test_pa = 0;
+	agc_weighted_workspace_release(p_stream->agc_weighted_workspace);
 	free(p_stream->agc_weighted_workspace);
 	p_stream->agc_weighted_workspace = NULL;
 	free(p_stream->agc_histogram_p1_p99_workspace);
@@ -3954,6 +3998,16 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 	UINT64 agc_elapsed_ms;
 	HD_RESULT ret;
 	HD_RESULT push_ret;
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+	int sample = ++p_stream0->raw_stage_sample_count == 60U;
+	UINT64 frame_start = 0, cap_done = 0, stage_start = 0;
+	UINT64 denoise_us = 0, weighted_us = 0;
+	int denoise = 0, weighted_mode = -1;
+	if (sample) {
+		p_stream0->raw_stage_sample_count = 0;
+		frame_start = liveview_get_time_us();
+	}
+#endif
 
 	ret = liveview_cap_pull(p_stream0, &vcap_video_frame, 100);
 	if (ret != HD_OK) {
@@ -3962,6 +4016,9 @@ static void liveview_process_live_frame(VIDEO_LIVEVIEW *p_stream0)
 		}
 		return;
 	}
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+	if (sample) cap_done = liveview_get_time_us();
+#endif
 	if (clock_gettime(CLOCK_REALTIME, &capture_wall_time) == 0)
 		capture_unix_ms = (int64_t)capture_wall_time.tv_sec * 1000 +
 			capture_wall_time.tv_nsec / 1000000;
@@ -4137,6 +4194,9 @@ after_corrections:
             p_stream0->raw_temporal_ffc_generation = generation;
             p_stream0->raw_temporal_shutter_generation = g_manual_shutter_open_generation;
             p_stream0->raw_temporal_calibration = g_weighted_calibration_generation;
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+            if (sample) stage_start = liveview_get_time_us();
+#endif
             if (liveview_apply_raw_temporal(p_stream0, current_frame, &raw_temporal_video_frame, &params) < 0) {
                 pthread_mutex_unlock(&g_manual_calibration_lock);
                 if (snapshot_requested) snapshot_writer_cancel_request();
@@ -4145,6 +4205,12 @@ after_corrections:
                 liveview_request_fault_stop(p_stream0, 0);
                 goto release_vcap_frame;
             }
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+            if (sample) {
+                denoise_us = liveview_get_time_us() - stage_start;
+                denoise = 1;
+            }
+#endif
             current_frame = &raw_temporal_video_frame;
             current_frame_is_vcap = 0;
         }
@@ -4208,8 +4274,18 @@ after_corrections:
         UINT32 *frames = &p_stream0->agc_weighted_frame_count;
         UINT32 *errors = &p_stream0->agc_weighted_error_count;
         agc_start_ms = liveview_get_time_ms();
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+        if (sample) stage_start = liveview_get_time_us();
+#endif
         agc_status = liveview_apply_agc_weighted(p_stream0, current_frame,
             &agc_histogram_p1_p99_video_frame);
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+        if (sample) {
+            weighted_us = liveview_get_time_us() - stage_start;
+            if (agc_status == 0)
+                weighted_mode = (int)p_stream0->agc_weighted_workspace->last_params.simple_mode;
+        }
+#endif
         agc_elapsed_ms = liveview_get_time_ms() - agc_start_ms;
         if (agc_status == 0) {
             (*frames)++;
@@ -4309,6 +4385,9 @@ after_corrections:
 	}
 	/* Track every input, including direct VCAP, so the next AGC/tone
 	 * change cannot affect a previous RAWALL input still in flight. */
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+	if (sample) stage_start = liveview_get_time_us();
+#endif
 	raw_input_begin(p_stream0, current_frame);
 	push_ret = hd_videoproc_push_in_buf(
 		p_stream0->proc_path, current_frame, NULL, 0);
@@ -4342,6 +4421,18 @@ after_corrections:
 		return;
 	}
 
+#if defined(RAW_STAGE_TIMING) && RAW_STAGE_TIMING
+	if (sample && !isp_step_test_requested) {
+		UINT64 end = liveview_get_time_us();
+		printf("RAW_STAGE_US count=%u weighted_mode=%d denoise=%d skip=%u cap=%" PRIu64
+		       " denoise_us=%" PRIu64 " weighted_us=%" PRIu64 " rawall=%" PRIu64
+		       " total=%" PRIu64 "\n",
+		       (unsigned)current_frame->count, weighted_mode, denoise, (unsigned)g_runtime_skip_frames,
+		       (uint64_t)(cap_done - frame_start),
+		       (uint64_t)denoise_us, (uint64_t)weighted_us, (uint64_t)(end - stage_start),
+		       (uint64_t)(end - frame_start));
+	}
+#endif
 	/* Do not delay the next calibration RAW request with runtime skipping. */
 	if (!raw_copy_handled && g_runtime_skip_frames > 0) {
 		skip_vcap_frame(p_stream0, g_runtime_skip_frames);

@@ -22,21 +22,24 @@ static inline uint32_t raw_dual_speed(uint32_t current, uint32_t original,
     uint32_t *fast, uint32_t *slow, uint16_t *motion,
     const RAW_KERNEL_PARAMS *p)
 {
-    uint32_t jump = raw_difference(current, *fast);
-    uint32_t f = raw_iir(current, *fast, 1U);
-    uint32_t s = raw_iir(current, *slow, 4U);
-    uint32_t difference = raw_difference(f, s);
-    uint32_t previous_mode = *motion >> 8, hold = *motion & 255U;
-    uint32_t low = p->low;
-    uint32_t high = p->high;
-    uint32_t hysteresis = p->hysteresis;
-    uint32_t mode;
-    if (previous_mode == 2U) high -= hysteresis;
-    if (previous_mode != 0U) low -= hysteresis;
-    mode = difference >= high || jump >= high ? 2U : difference >= low ? 1U : 0U;
-    if (mode && mode >= previous_mode) {
-        hold = p->hold;
-    } else if (mode < previous_mode && hold) {
+    uint32_t previous_fast = *fast, state = *motion;
+    uint32_t previous_mode = state >> 8, hold = state & 255U;
+    uint32_t high = p->high - (previous_mode == 2U ? p->hysteresis : 0U);
+    uint32_t f, s, difference, mode;
+
+    /* A strong jump chooses RAW and overwrites both histories regardless of IIR. */
+    if (raw_difference(current, previous_fast) >= high) {
+        *fast = *slow = current;
+        *motion = (uint16_t)(0x200U | p->hold);
+        return original;
+    }
+
+    f = raw_iir(current, previous_fast, 1U);
+    s = raw_iir(current, *slow, 4U);
+    difference = raw_difference(f, s);
+    mode = difference >= high ? 2U :
+        difference >= p->low - (previous_mode != 0U ? p->hysteresis : 0U) ? 1U : 0U;
+    if (mode < previous_mode && hold) {
         mode = previous_mode;
         --hold;
     } else {

@@ -143,7 +143,7 @@ int main(void) {
     assert(out.count==in.count&&out.loff[0]==RAW_SIZE_W*2&&out.ph[0]==RAW_SIZE_H);
     assert(map_calls==1&&flush_calls==2&&unmap_calls==1);
     /* New branch uses the same production RAW frame dispatch and history resets. */
-    p.balanced_background=1;assert(agc_weighted_set_params(&p)==0);
+    p.simple_mode=2;assert(agc_weighted_set_params(&p)==0);
     assert(liveview_apply_agc_weighted(&s,&in,&out)==0);
     agc_weighted_state_reset(expected_shared);
     assert(agc_weighted_apply_u14(raw,RAW_SIZE_W*2,expected,RAW_SIZE_W*2,
@@ -191,7 +191,7 @@ int main(void) {
     assert(agc_mode_get()==AGC_MODE_WEIGHTED_CPU&&shared->temporal_valid&&applied_tone==0);
     agc_mode_request(AGC_MODE_OFF);liveview_apply_agc_request(&s);
     assert(agc_mode_get()==AGC_MODE_OFF&&applied_tone==1);
-    free(raw);free(dest);free(expected);free(shared);free(expected_shared);
+    free(raw);free(dest);free(expected);agc_weighted_workspace_release(shared);free(shared);agc_weighted_workspace_release(expected_shared);free(expected_shared);
     puts("PASS: actual AGC selection/request + RAW dispatch/cache/frame metadata, missing workspace/ISP failure rollback and calibration/shading resets");
     return 0;
 }

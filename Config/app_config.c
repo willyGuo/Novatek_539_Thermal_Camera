@@ -324,8 +324,8 @@ static const WEIGHTED_CFG_ITEM weighted_items[] = {
     {"agc_weighted_bright_weight", "Bright Weight (finite >= 1; no fixed upper limit)", offsetof(AGC_WEIGHTED_PARAMS, bright_weight), 0, 0},
     {"agc_weighted_bright_percentile", "Bright Percentile (0..100, after Clip/Redistribution)", offsetof(AGC_WEIGHTED_PARAMS, bright_percentile_tenths), 10, 1000},
     {"agc_weighted_gain_limit", "Gain Limit (0 off; 0.1..4.0 Gray/RAW DN)", offsetof(AGC_WEIGHTED_PARAMS, gain_limit_tenths), 10, 40},
-    {"agc_weighted_temporal_previous_percent", "LUT / Background / Gain Smooth (previous %, 0 disables tracking)", offsetof(AGC_WEIGHTED_PARAMS, temporal_previous_percent), 1, 99},
-    {"agc_weighted_balanced_background", "Balanced Background Otsu (0 off, 1 on; no DDE)", offsetof(AGC_WEIGHTED_PARAMS, balanced_background), 1, 1}
+    {"agc_weighted_temporal_previous_percent", "LUT / Gain Smooth (previous %, 0 off)", offsetof(AGC_WEIGHTED_PARAMS, temporal_previous_percent), 1, 99},
+    {"agc_weighted_simple_mode", "Brightness + Local Contrast (0 Off, 1 Brightness, 2 Mild, 3 Strong, 4 Fast Local, 5 Local Mean)", offsetof(AGC_WEIGHTED_PARAMS, simple_mode), 1, AGC_WEIGHTED_LOCAL_MEAN}
 };
 #define WEIGHTED_CFG_COUNT (sizeof(weighted_items) / sizeof(weighted_items[0]))
 static int cfg_weighted_index(const char *key)
@@ -1128,8 +1128,6 @@ static int app_config_show_file(void)
 	}
 
     printf("Weighted Mapping: pending=%s (global 1x1)\n", g_app_config.agc_weighted_enable ? "on" : "off");
-    if (g_app_config.weighted.balanced_background)
-        printf("  Balanced Otsu Weighted: background96 Gray; Clip/Redistribution/Bright Weight/P adjust hot detail.\n");
     {
         unsigned int i;
         for (i = 0; i < WEIGHTED_CFG_COUNT; i++)
@@ -1703,8 +1701,6 @@ static int app_config_weighted_menu_run(void)
         int option;
         printf("Weighted Mapping AGC (CPU), global 1x1\n");
         printf(" Native RAW14 mapping/output; Gray parameters retain their existing units.\n");
-        if (g_app_config.weighted.balanced_background)
-            printf(" Balanced Otsu Weighted: fixed background96 Gray; Clip/Redistribution/Bright Weight/P adjust hot detail.\n");
         printf(" 1. Weighted Mapping on/off (pending=%s, runtime=%s)\n",
             g_app_config.agc_weighted_enable ? "on" : "off", agc_weighted_is_enabled() ? "on" : "off");
         for (i = 0; i < WEIGHTED_CFG_COUNT; i++)

@@ -35,6 +35,9 @@ EXTRA_INCLUDE += \
 ###############################################################################
 ifeq ($(NVT_PRJCFG_CFG),Linux)
 EXTRA_CFLAGS += $(NVT_ASAN)
+ifeq ($(RAW_STAGE_TIMING),1)
+EXTRA_CFLAGS += -DRAW_STAGE_TIMING=1
+endif
 EXTRA_LDFLAGS = \
 	$(NVT_ASAN) \
 	-L$(HDAL_LIB_PATH) -lhdal -lm -lpthread \
